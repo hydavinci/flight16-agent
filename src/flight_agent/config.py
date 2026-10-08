@@ -1,0 +1,57 @@
+import math
+import os
+from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
+
+
+@dataclass(frozen=True)
+class ModelSettings:
+    model: str
+    base_url: str
+    api_key: SecretStr
+    timeout_seconds: float
+
+    @classmethod
+    def from_environment(cls) -> "ModelSettings":
+        values = {}
+        for name in ("LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"):
+            value = os.environ.get(name, "").strip()
+            if not value:
+                raise ValueError(f"Set {name} in the project .env or environment")
+            values[name] = value
+        endpoint = urlsplit(values["LLM_BASE_URL"])
+        if (
+            endpoint.scheme not in ("http", "https")
+            or not endpoint.hostname
+            or endpoint.username is not None
+            or endpoint.password is not None
+            or endpoint.query
+            or endpoint.fragment
+        ):
+            raise ValueError(
+                "LLM_BASE_URL must be an HTTP(S) URL without credentials/query/fragment"
+            )
+        timeout = float(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("LLM_TIMEOUT_SECONDS must be finite and greater than zero")
+        return cls(
+            model=values["LLM_MODEL"],
+            base_url=values["LLM_BASE_URL"],
+            api_key=SecretStr(values["LLM_API_KEY"]),
+            timeout_seconds=timeout,
+        )
+
+
+def create_model() -> ChatOpenAI:
+    settings = ModelSettings.from_environment()
+    return ChatOpenAI(
+        model=settings.model,
+        base_url=settings.base_url,
+        api_key=settings.api_key,
+        timeout=settings.timeout_seconds,
+        max_retries=0,
+        use_responses_api=False,
+    )

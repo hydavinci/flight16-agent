@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MATLAB 分析工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <div>
+        <div class="eyebrow">FLIGHT AGENT / WORKSPACE</div>
+        <h1>MATLAB 分析工作台</h1>
+        <p class="subtitle">上传程序，运行计算，在一个页面查看结果与分析依据。</p>
+      </div>
+      <span class="pill">本机 Web · 远程执行</span>
+    </header>
+    <section class="connections" aria-label="运行环境">
+      <div><span class="dot"></span><strong>MATLAB worker</strong>
+        <span id="worker-state">正在读取配置…</span></div>
+      <div><span class="dot secondary"></span><strong>Agent 模型</strong>
+        <span id="model-state">正在读取配置…</span></div>
+    </section>
+    <div id="config-help" class="config-help" hidden></div>
+    <div id="notice" class="notice" role="alert" hidden></div>
+    <div class="workspace">
+      <section class="panel input-panel">
+        <div class="section-heading"><span class="step">01</span><h2>提交分析</h2></div>
+        <form id="run-form">
+          <label for="file">MATLAB 程序</label>
+          <div class="upload-box">
+            <span class="file-icon">.m</span>
+            <strong>选择一个脚本或函数文件</strong>
+            <span class="muted">单个 UTF-8 文件，最大 1 MB</span>
+            <input id="file" type="file" accept=".m" aria-label="上传 MATLAB 文件">
+          </div>
+          <div class="example-row">
+            <select id="example" aria-label="示例程序">
+              <option value="web_script.m">波形脚本示例</option>
+              <option value="web_function.m">波形函数示例</option>
+              <option value="web_metrics.m">Agent 指标演示</option>
+            </select>
+            <button id="load-example" type="button" class="button subtle">载入示例</button>
+          </div>
+          <p id="filename" class="hint">尚未选择文件。示例也需要连接真实 worker 才能运行。</p>
+          <div class="field-grid">
+            <div><label for="kind">程序类型</label>
+              <select id="kind"><option value="script">脚本</option><option value="function">函数</option></select>
+            </div>
+            <div><label for="timeout">运行超时 / 秒</label>
+              <input id="timeout" type="number" value="120" min="1" max="600" required>
+            </div>
+          </div>
+          <label for="parameters">输入参数 <span class="muted">JSON 对象</span></label>
+          <textarea id="parameters" rows="9" spellcheck="false" aria-label="JSON 参数">{}</textarea>
+          <p class="hint">脚本读取 <code>params</code> 并赋值 <code>result</code>；函数使用
+            <code>result = 函数名(params)</code>。</p>
+          <label class="consent" for="trusted">
+            <input id="trusted" type="checkbox" required>
+            <span>我已检查并信任这份代码，允许其在 worker 上执行。
+              <small>上传程序具有 worker 账户权限。此服务不是安全沙箱。</small>
+            </span>
+          </label>
+          <button id="run-button" type="submit" class="button primary full">运行 MATLAB</button>
+          <p class="hint centered">计算不依赖大模型。关闭网页不会取消远程任务。</p>
+        </form>
+      </section>
+      <div class="output-column">
+        <section class="panel">
+          <div class="section-heading">
+            <span class="step">02</span><h2>执行结果</h2>
+            <span id="execution-status" class="badge">等待提交</span>
+          </div>
+          <div id="job-meta" class="job-meta">执行后显示任务 ID、MATLAB 版本和远程任务信息。</div>
+          <div id="execution-error" class="notice" hidden></div>
+          <div class="result-toolbar"><h3>返回数据</h3>
+            <button id="download-result" type="button" class="button subtle small" disabled>下载 JSON</button>
+          </div>
+          <pre id="result-data" class="code-block empty">尚无结果。这里展示 MATLAB 实际返回的 result。</pre>
+          <div id="figures" class="figures" aria-label="MATLAB 图表"></div>
+          <details class="log-details" open>
+            <summary>运行日志</summary>
+            <pre id="execution-log" class="log">尚无日志。</pre>
+          </details>
+        </section>
+        <section class="panel">
+          <div class="section-heading"><span class="step">03</span><h2>Agent 分析</h2>
+            <span id="agent-status" class="badge">可选步骤</span></div>
+          <p class="hint">复用已完成的计算，不重复执行程序。只有符合现有指标与参数格式的结果
+            才能检查规则；通用数据会明确标记为“无法判定”。</p>
+          <label for="request">分析需求</label>
+          <textarea id="request" rows="2">检查所有适用要求，检索知识依据并解释结果，明确未覆盖项。</textarea>
+          <div class="action-row">
+            <button id="analyze-button" type="button" class="button primary" disabled>Agent 分析</button>
+            <button id="download-report" type="button" class="button subtle" disabled>下载报告</button>
+          </div>
+          <div id="agent-error" class="notice" hidden></div>
+          <div id="assessment" class="assessment"></div>
+          <pre id="report" class="report" hidden></pre>
+        </section>
+      </div>
+    </div>
+    <section class="panel history-panel">
+      <div class="section-heading"><h2>最近任务</h2>
+        <button id="refresh-history" type="button" class="button subtle small">刷新任务</button></div>
+      <div id="history" class="history"><p class="muted">暂无任务。</p></div>
+    </section>
+    <footer>仅用于可信程序的工程辅助分析 · 自带规则仅作软件演示，不构成适航或放飞结论。</footer>
+  </main>
+</body>
+</html>

@@ -1,0 +1,51 @@
+{
+  "version": "demo-rules-v1",
+  "model_version": "demo-static-v1",
+  "demo_only": true,
+  "rules": [
+    {
+      "id": "DEMO-WL",
+      "metric": "wing_loading",
+      "operator": "<=",
+      "threshold": 180.0,
+      "unit": "N/m^2",
+      "aircraft_type": "demo_fixed_wing",
+      "condition": "demo_cruise",
+      "source_id": "demo.md",
+      "source_section": "演示判据"
+    },
+    {
+      "id": "DEMO-Q",
+      "metric": "dynamic_pressure",
+      "operator": ">=",
+      "threshold": 100.0,
+      "unit": "Pa",
+      "aircraft_type": "demo_fixed_wing",
+      "condition": "demo_cruise",
+      "source_id": "demo.md",
+      "source_section": "演示判据"
+    },
+    {
+      "id": "DEMO-CL",
+      "metric": "required_lift_coefficient",
+      "operator": "<=",
+      "threshold": 1.2,
+      "unit": "1",
+      "aircraft_type": "demo_fixed_wing",
+      "condition": "demo_cruise",
+      "source_id": "demo.md",
+      "source_section": "演示判据"
+    },
+    {
+      "id": "DEMO-TW",
+      "metric": "thrust_to_weight",
+      "operator": ">=",
+      "threshold": 0.25,
+      "unit": "1",
+      "aircraft_type": "demo_fixed_wing",
+      "condition": "demo_cruise",
+      "source_id": "demo.md",
+      "source_section": "演示判据"
+    }
+  ]
+}
