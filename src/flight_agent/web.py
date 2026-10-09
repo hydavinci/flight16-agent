@@ -1,3 +1,4 @@
+import json
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -162,6 +163,17 @@ def create_web_app(root: Path) -> FastAPI:
             return store.get(job_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Unknown job") from exc
+
+    @app.get("/api/jobs/{job_id}/result", dependencies=auth)
+    def result_json(job_id: str) -> Response:
+        record = status(job_id)
+        if record.status != "completed":
+            raise HTTPException(status_code=409, detail="Wait for successful MATLAB execution")
+        return Response(
+            content=json.dumps(record.result, ensure_ascii=False, indent=2, allow_nan=False),
+            media_type="application/json",
+            headers={"Content-Disposition": 'attachment; filename="result.json"'},
+        )
 
     @app.get("/api/jobs/{job_id}/artifacts/{name}", dependencies=auth)
     def artifact(job_id: str, name: str) -> FileResponse:

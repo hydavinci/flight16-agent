@@ -53,7 +53,7 @@ class AnalysisSession:
         self.knowledge.validate_sources(self.rules)
         self.result: AnalysisResult | None = None
         self.assessment: Assessment | None = None
-        self.evidence: dict[str, Evidence] = {}
+        self.evidence: dict[str, list[Evidence]] = {}
         self.error: str | None = None
         self._lock = threading.RLock()
         run_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:12]
@@ -113,10 +113,13 @@ class AnalysisSession:
     def search_knowledge(self, query: str, limit: int = 3) -> list[dict[str, object]]:
         with self._lock:
             hits = self.knowledge.search(query, limit)
-            self.evidence.update((item.source_id, item) for item in hits)
+            for item in hits:
+                excerpts = self.evidence.setdefault(item.source_id, [])
+                if item not in excerpts:
+                    excerpts.append(item)
             _write_json(
                 self.run_dir / "evidence.json",
-                [item.model_dump() for item in self.evidence.values()],
+                [item.model_dump() for excerpts in self.evidence.values() for item in excerpts],
             )
             return [item.model_dump() for item in hits]
 
@@ -176,17 +179,18 @@ class AnalysisSession:
                     "",
                 ]
             )
-            for evidence in self.evidence.values():
+            for source_id, excerpts in self.evidence.items():
                 lines.extend(
                     [
-                        f"### [KB:{evidence.source_id}]",
+                        f"### [KB:{source_id}]",
                         "",
-                        f"原文 SHA-256: `{evidence.sha256}`",
-                        "",
-                        *["> " + line for line in evidence.content.splitlines()],
+                        f"原文 SHA-256: `{excerpts[0].sha256}`",
                         "",
                     ]
                 )
+                for evidence in excerpts:
+                    lines.extend("> " + line for line in evidence.content.splitlines())
+                    lines.append("")
             path = self.run_dir / "report.md"
             path.write_text("\n".join(lines), encoding="utf-8")
             self.metadata.update(

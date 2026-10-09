@@ -120,6 +120,7 @@ def test_browser_submission_snapshots_file_and_kind_before_reading(project):
                     "buffer": b"result=1;",
                 }
             )
+            page.locator("#parameters").fill('{"value":9007199254740993}')
             page.locator("#trusted").check()
             page.get_by_role("button", name="运行 MATLAB", exact=True).click()
             page.wait_for_function("typeof window.releaseRead === 'function'")
@@ -131,11 +132,51 @@ def test_browser_submission_snapshots_file_and_kind_before_reading(project):
                 }
             )
             page.locator("#kind").select_option("function")
+            page.locator("#parameters").fill('{"value":2}')
             page.evaluate("window.releaseRead()")
             expect(page.locator("#notice")).to_contain_text("Captured test request")
             assert captured[-1]["filename"] == "first.m"
             assert captured[-1]["source"] == "result=1;"
             assert captured[-1]["kind"] == "script"
+            assert captured[-1]["parameters"] == {"value": 9007199254740993}
+        finally:
+            browser.close()
+
+
+@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
+def test_browser_submits_raw_parameter_numbers(project):
+    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        captured = []
+
+        def capture(route):
+            if route.request.method == "POST":
+                captured.append(json.loads(route.request.post_data))
+                route.fulfill(status=503, json={"detail": "Captured test request"})
+            else:
+                route.continue_()
+
+        page.route("**/api/jobs", capture)
+        try:
+            page.goto(url)
+            page.locator("#file").set_input_files(
+                {"name": "calculation.m", "mimeType": "text/plain", "buffer": b"result=params;"}
+            )
+            page.locator("#parameters").fill(
+                ' \n{"value":9007199254740993,"nested":[-9007199254740993,'
+                '9007199254740991,1e300,null,true],'
+                '"text":"中文 \\"parameters\\":{}, \\"trusted\\":false"}\n '
+            )
+            page.locator("#trusted").check()
+            page.locator("#run-button").click()
+            expect(page.locator("#notice")).to_contain_text("Captured test request")
+            assert captured[-1]["parameters"] == {
+                "value": 9007199254740993,
+                "nested": [-9007199254740993, 9007199254740991, 1e300, None, True],
+                "text": '中文 "parameters":{}, "trusted":false',
+            }
+            assert captured[-1]["trusted"] is True
         finally:
             browser.close()
 
@@ -168,6 +209,65 @@ def completed_image_jobs(project):
         )
         records.append(record)
     return records
+
+
+@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
+def test_browser_displays_and_downloads_exact_result_numbers(project):
+    from flight_agent.jobs import JobStore
+
+    records = completed_image_jobs(project)
+    result = {"value": 9007199254740993, "nested": [-9007199254740993, "中文", None]}
+    JobStore(project / "runs" / "web").update(records[0].id, result=result)
+    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.goto(url)
+            page.locator("#history button").filter(has_text="first.m").click()
+            expect(page.locator("#result-data")).to_contain_text('"value": 9007199254740993')
+            with page.expect_download() as pending:
+                page.locator("#download-result").click()
+            download = pending.value
+            assert download.suggested_filename == "result.json"
+            path = project / "downloaded.json"
+            download.save_as(path)
+            assert json.loads(path.read_text("utf-8")) == result
+        finally:
+            browser.close()
+
+
+@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
+def test_browser_discards_superseded_result_response(project):
+    records = completed_image_jobs(project)
+    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        delayed = []
+        page.route(f"**/api/jobs/{records[0].id}/result", lambda route: delayed.append(route))
+        try:
+            page.goto(url)
+            with page.expect_request(f"**/api/jobs/{records[0].id}/result"):
+                page.locator("#history button").filter(has_text="first.m").click()
+            expect(page.locator("#download-result")).to_be_disabled()
+            page.locator("#history button").filter(has_text="second.m").click()
+            expect(page.locator("#job-meta")).to_contain_text("second.m")
+            expect(page.locator("#download-result")).to_be_enabled()
+            with page.expect_response(f"**/api/jobs/{records[0].id}/result") as response:
+                delayed[0].fulfill(status=200, body='{"stale":9007199254740993}')
+            response.value.body()
+            page.evaluate(
+                "() => new Promise(resolve => requestAnimationFrame("
+                "() => requestAnimationFrame(resolve)))"
+            )
+            expect(page.locator("#job-meta")).to_contain_text("second.m")
+            expect(page.locator("#result-data")).to_have_text("1")
+            with page.expect_download() as pending:
+                page.locator("#download-result").click()
+            path = project / "downloaded.json"
+            pending.value.save_as(path)
+            assert json.loads(path.read_text()) == 1
+        finally:
+            browser.close()
 
 
 @pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")

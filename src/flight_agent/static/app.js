@@ -4,6 +4,7 @@ let token = "";
 let selectedFile = null;
 let activeId = null;
 let activeRecord = null;
+let activeResultJson = null;
 let pollTimer = null;
 let figureKey = "";
 let imageUrls = [];
@@ -117,7 +118,13 @@ function renderAssessment(assessment) {
 }
 
 async function render(record, revision) {
+  let resultJson = activeResultJson;
+  if (record.status === "completed" && resultJson === null) {
+    resultJson = await (await api(`/api/jobs/${record.id}/result`, {}, true)).text();
+  }
+  if (revision !== viewRevision) return;
   activeRecord = record;
+  activeResultJson = record.status === "completed" ? resultJson : null;
   badge("execution-status", executionLabels[record.status], record.status);
   badge("agent-status", agentLabels[record.agent_status], record.agent_status);
   $("job-meta").textContent = `任务 ${record.id} · ${record.filename}` +
@@ -125,15 +132,14 @@ async function render(record, revision) {
     (record.remote_id ? ` · 远程 ${record.remote_id}` : "");
   $("execution-error").textContent = record.error || "";
   $("execution-error").hidden = !record.error;
-  $("result-data").textContent = record.status === "completed"
-    ? JSON.stringify(record.result, null, 2) : "尚无完成的 MATLAB 结果。";
+  $("result-data").textContent = activeResultJson ?? "尚无完成的 MATLAB 结果。";
   $("result-data").classList.toggle("empty", record.status !== "completed");
   $("execution-log").textContent = record.log || "尚无日志。";
   $("agent-error").textContent = record.agent_error || "";
   $("agent-error").hidden = !record.agent_error;
   $("report").textContent = record.report || "";
   $("report").hidden = !record.report;
-  $("download-result").disabled = record.status !== "completed";
+  $("download-result").disabled = activeResultJson === null;
   $("download-report").disabled = !record.report;
   $("analyze-button").disabled = record.status !== "completed" ||
     ["running", "completed"].includes(record.agent_status);
@@ -145,6 +151,8 @@ async function render(record, revision) {
 
 function selectJob(jobId) {
   activeId = jobId;
+  activeResultJson = null;
+  $("download-result").disabled = true;
   viewRevision += 1;
   figureKey = "";
   clearFigures();
@@ -247,9 +255,10 @@ $("run-form").addEventListener("submit", async (event) => {
     if (!file.name.endsWith(".m") || file.size > 1000000) {
       throw new Error("请选择不超过 1 MB 的 .m 文件。");
     }
+    const parametersJson = $("parameters").value;
     let parameters;
     try {
-      parameters = JSON.parse($("parameters").value, (_key, value) => {
+      parameters = JSON.parse(parametersJson, (_key, value) => {
         if (typeof value === "number" && !Number.isFinite(value)) {
           throw new Error("参数中的数字必须是有限数值，请检查数值是否过大。");
         }
@@ -267,12 +276,14 @@ $("run-form").addEventListener("submit", async (event) => {
     if (!$("trusted").checked) throw new Error("请先确认上传代码可信。");
     $("run-button").disabled = true;
     const source = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
+    const metadata = JSON.stringify({
+      filename: file.name, source, kind,
+      trusted: true, timeout_seconds: timeoutSeconds,
+    });
     const record = await api("/api/jobs", {
       method: "POST",
-      body: JSON.stringify({
-        filename: file.name, source, kind, parameters,
-        trusted: true, timeout_seconds: timeoutSeconds,
-      }),
+      // Keep validated numeric tokens intact instead of serializing rounded JS numbers.
+      body: `${metadata.slice(0, -1)},"parameters":${parametersJson}}`,
     });
     await selectJob(record.id);
   } catch (error) {
@@ -300,7 +311,7 @@ $("analyze-button").addEventListener("click", async () => {
 });
 $("refresh-history").addEventListener("click", () => history().catch((e) => notice(e.message)));
 $("download-result").addEventListener("click", () => {
-  if (activeRecord) download("result.json", JSON.stringify(activeRecord.result, null, 2), "application/json");
+  if (activeResultJson !== null) download("result.json", activeResultJson, "application/json");
 });
 $("download-report").addEventListener("click", () => {
   if (activeRecord?.report) download("report.md", activeRecord.report, "text/markdown;charset=utf-8");

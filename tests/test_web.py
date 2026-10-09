@@ -54,6 +54,35 @@ def test_web_bootstrap_never_returns_worker_or_model_secret(project, monkeypatch
         assert "test-hidden-model-key" not in text
 
 
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"value": 9007199254740993, "nested": [-9007199254740993, "中文", None]},
+        9007199254740993,
+        None,
+    ],
+)
+def test_web_result_json_preserves_saved_numbers(project, result):
+    from flight_agent.jobs import JobStore
+    from flight_agent.upload_models import UploadRequest
+
+    store = JobStore(project / "runs" / "web")
+    record = store.create(UploadRequest.model_validate(payload()))
+    store.update(record.id, status="completed", result=result)
+    path = f"/api/jobs/{record.id}/result"
+    with TestClient(web_module().create_web_app(project), base_url="http://127.0.0.1") as client:
+        assert client.get(path).status_code == 403
+        auth = headers(client)
+        response = client.get(path, headers=auth)
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/json"
+        assert response.headers["content-disposition"] == 'attachment; filename="result.json"'
+        assert json.loads(response.content) == result
+        assert client.get(f"/api/jobs/{'a' * 32}/result", headers=auth).status_code == 404
+        store.update(record.id, status="running")
+        assert client.get(path, headers=auth).status_code == 409
+
+
 def test_unconfigured_worker_fails_without_fake_results(project, monkeypatch):
     monkeypatch.delenv("MATLAB_WORKER_URL", raising=False)
     monkeypatch.delenv("MATLAB_WORKER_TOKEN", raising=False)

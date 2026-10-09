@@ -93,3 +93,28 @@ def test_mismatched_run_context_cannot_be_assessed(project, parameter_data, resu
     with pytest.raises(ValueError, match="condition"):
         session.analyze()
     assert not (session.run_dir / "result.json").exists()
+
+
+def test_retrieval_preserves_distinct_excerpts_from_same_document(
+    project, parameter_data, result_data
+):
+    (project / "knowledge" / "demo.md").write_text(
+        "# 演示判据\n\nalpha threshold 1.2. " + "A" * 3100
+        + "\n\nbeta explanation. " + "B" * 3100,
+        encoding="utf-8",
+    )
+    session = make_session(project, parameter_data, result_data)
+    session.analyze()
+    session.check_requirements()
+    first = session.search_knowledge("alpha")[0]
+    second = session.search_knowledge("beta")[0]
+    session.search_knowledge("alpha")
+    session.search_knowledge("beta")
+
+    saved = json.loads((session.run_dir / "evidence.json").read_text())
+    assert saved == [first, second]
+    report = session.complete("参考 [KB:demo.md]。").read_text()
+    assert "> alpha threshold 1.2." in report
+    assert "> beta explanation." in report
+    assert report.count("> alpha threshold 1.2.") == 1
+    assert report.count("> beta explanation.") == 1
