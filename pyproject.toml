@@ -32,7 +32,7 @@ flight-agent = "flight_agent.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-flight_agent = ["static/*", "resources/*.m"]
+flight_agent = ["static/*", "matlab_support/*.m"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

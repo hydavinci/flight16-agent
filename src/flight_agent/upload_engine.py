@@ -43,6 +43,8 @@ def execute_upload(job_dir: Path, request: UploadRequest) -> ExecutionOutput:
     (job_dir / "request.json").write_text(request.model_dump_json(), encoding="utf-8")
     log_path = job_dir / "matlab.log"
     result_path = job_dir / "output.json"
+    failure: MatlabError | OSError | None = None
+    cleanup_error: str | None = None
     with log_path.open("w", encoding="utf-8") as log:
         environment = os.environ.copy()
         for key in list(environment):
@@ -70,9 +72,18 @@ def execute_upload(job_dir: Path, request: UploadRequest) -> ExecutionOutput:
                 if result_path.exists() and result_path.stat().st_size > MAX_RESULT:
                     raise MatlabError("MATLAB result exceeds the output limit")
                 time.sleep(0.05)
+        except (MatlabError, OSError) as exc:
+            failure = exc
         finally:
             if process.poll() != 0:
-                _stop_worker(process)
+                cleanup = _stop_worker(process)
+                cleanup_error = cleanup.error
+                if cleanup_error:
+                    log.write("\n" + cleanup_error + "\n")
+    if failure is not None:
+        if cleanup_error:
+            raise MatlabError(f"{failure}\n{cleanup_error}") from failure
+        raise failure
     text = log_path.read_bytes()[:MAX_LOG].decode("utf-8", errors="replace")
     if process.returncode != 0:
         raise MatlabError(f"MATLAB execution failed: {text[-4000:]}")
@@ -102,7 +113,7 @@ def _child(job_dir: Path) -> None:
     engine = None
     try:
         engine = engine_module.start_matlab()
-        wrapper_dir = Path(__file__).parent / "resources"
+        wrapper_dir = Path(__file__).parent / "matlab_support"
         engine.cd(str(wrapper_dir), nargout=0)
         engine.addpath(str(wrapper_dir), nargout=0)
         engine.feval(

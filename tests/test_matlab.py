@@ -1,8 +1,10 @@
+import errno
 import importlib
 import os
 import signal
 import subprocess
 import time
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -164,6 +166,135 @@ def test_failed_worker_cleans_up_owned_descendants(
                 os.kill(int(marker.read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+@pytest.mark.parametrize("adapter", ["cli", "upload"])
+@pytest.mark.parametrize("denied_signal", [signal.SIGTERM, signal.SIGKILL])
+def test_cleanup_permission_error_preserves_engine_failure(
+    project, parameter_data, fake_engine, monkeypatch, caplog, adapter, denied_signal
+):
+    from flight_agent.upload_engine import execute_upload
+    from flight_agent.upload_models import UploadRequest
+
+    module = matlab_module()
+    original = os.killpg
+    groups = []
+
+    def deny_signal(group, sig):
+        if sig == denied_signal:
+            groups.append(group)
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        original(group, sig)
+
+    monkeypatch.setenv("TEST_ENGINE_MODE", "startup_error")
+    monkeypatch.setattr(module.os, "killpg", deny_signal)
+    runner = module.MatlabRunner(project, timeout_seconds=10)
+    with pytest.raises(module.MatlabError, match="license unavailable") as caught:
+        if adapter == "cli":
+            runner.run(Parameters.model_validate(parameter_data))
+        else:
+            execute_upload(
+                project / "upload-job",
+                UploadRequest(
+                    filename="calculation.m",
+                    source="result=1;",
+                    kind="script",
+                    parameters={},
+                    trusted=True,
+                ),
+            )
+    log = runner.log if adapter == "cli" else (project / "upload-job/matlab.log").read_text()
+    assert "license unavailable" in log
+    assert "cleanup incomplete" in str(caught.value)
+    assert "Operation not permitted" in str(caught.value)
+    assert str(groups[0]) in str(caught.value)
+    assert "cleanup incomplete" in log
+    assert str(groups[0]) in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+@pytest.mark.parametrize("adapter", ["cli", "upload"])
+def test_cleanup_permission_error_preserves_timeout(
+    project, parameter_data, fake_engine, monkeypatch, adapter
+):
+    from flight_agent.upload_engine import execute_upload
+    from flight_agent.upload_models import UploadRequest
+
+    module = matlab_module()
+    original = os.killpg
+
+    def deny_kill(group, sig):
+        if sig == signal.SIGKILL:
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        original(group, sig)
+
+    monkeypatch.setenv("TEST_ENGINE_MODE", "upload_block" if adapter == "upload" else "block")
+    monkeypatch.setenv("TEST_CHILD_PID_FILE", str(project / "child.pid"))
+    monkeypatch.setattr(module.os, "killpg", deny_kill)
+    runner = module.MatlabRunner(project, timeout_seconds=1)
+    with pytest.raises(module.MatlabError, match="timed out") as caught:
+        if adapter == "cli":
+            runner.run(Parameters.model_validate(parameter_data))
+        else:
+            execute_upload(
+                project / "upload-job",
+                UploadRequest(
+                    filename="calculation.m",
+                    source="result=1;",
+                    kind="script",
+                    parameters={},
+                    trusted=True,
+                    timeout_seconds=1,
+                ),
+            )
+    assert "cleanup incomplete" in str(caught.value)
+    assert "Operation not permitted" in str(caught.value)
+    log = runner.log if adapter == "cli" else (project / "upload-job/matlab.log").read_text()
+    assert "cleanup incomplete" in log
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+def test_cleanup_returns_output_and_explicit_failure_when_signals_are_denied(monkeypatch, caplog):
+    module = matlab_module()
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("partial result", "original engine error")
+
+    def deny_signal(group, sig):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(module.os, "killpg", deny_signal)
+    result = module._stop_worker(process)
+    assert result.stdout == "partial result"
+    assert result.stderr == "original engine error"
+    assert "cleanup incomplete" in result.error
+    assert "43210" in result.error
+    assert "Operation not permitted" in result.error
+    assert "43210" in caplog.text
+    process.communicate.assert_called_once_with(timeout=2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+def test_cleanup_reports_unterminated_worker_after_bounded_waits(monkeypatch):
+    module = matlab_module()
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.side_effect = subprocess.TimeoutExpired(
+        "test-worker", 2, output=b"partial result", stderr=b"original engine error"
+    )
+
+    def deny_signal(group, sig):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(module.os, "killpg", deny_signal)
+    result = module._stop_worker(process)
+    assert result.stdout == "partial result"
+    assert result.stderr == "original engine error"
+    assert "43210" in result.error
+    assert "did not exit" in result.error
+    assert "Check" in result.error
+    assert process.communicate.call_args_list == [call(timeout=2), call(timeout=2)]
 
 
 @pytest.mark.matlab

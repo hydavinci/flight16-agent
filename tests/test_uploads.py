@@ -153,3 +153,21 @@ def test_live_uploaded_matlab(tmp_path, kind):
     assert output.result == {"value": 6}
     assert output.figures == ["figure-1.png"]
     assert output.matlab_version != "test-engine"
+
+
+@pytest.mark.matlab
+@pytest.mark.skipif(os.environ.get("RUN_MATLAB_TESTS") != "1", reason="Live MATLAB is opt-in")
+def test_live_upload_preserves_original_matlab_error(tmp_path):
+    request = module("upload_models").UploadRequest(
+        filename="calculation.m",
+        source="disp('Before expected failure'); error('Expected upload failure');",
+        kind="script",
+        parameters={},
+        trusted=True,
+        timeout_seconds=120,
+    )
+    with pytest.raises(module("matlab").MatlabError, match="Expected upload failure"):
+        module("upload_engine").execute_upload(tmp_path / "job", request)
+    log = (tmp_path / "job/matlab.log").read_text()
+    assert "Before expected failure" in log
+    assert "Expected upload failure" in log

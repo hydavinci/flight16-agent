@@ -344,6 +344,9 @@ MATLAB 子进程只调用可信的 `matlab/analyze_demo.m`，以 JSON 字符串�
 正常退出会执行 `engine.quit()`。超时或 worker 异常退出后，清理本次 worker 及同进程组后代。
 这不是操作系统安全沙箱，无法保证清理由 MATLAB 自行脱离该进程组的进程；
 异常超时后应检查 MATLAB 是否仍在占用许可，再决定是否重新运行。
+系统拒绝发送清理信号或 worker 在有限等待后仍未退出时，原始执行失败/超时原因会保留，
+错误和日志同时报告 `MATLAB cleanup incomplete` 及进程组 ID。此时需人工核查相关进程，
+不能把该提示当作清理成功；服务不会提权或无限等待。
 
 ## 6. 结果与判据
 
@@ -466,7 +469,7 @@ flight16-agent/
 |   |-- knowledge.py            # 本地知识检索
 |   |-- config.py               # 模型连接配置
 |   |-- service.py              # HTTP 校验、鉴权和产物访问
-|   |-- resources/             # 受控 MATLAB 上传执行封装
+|   |-- matlab_support/        # 受控 MATLAB 上传执行封装，避免保留目录名 resources
 |   `-- static/                # 原生 HTML / CSS / JavaScript，无需 Node 构建
 |-- matlab/                    # CLI 固定演示函数
 |-- examples/                  # Web 程序和参数示例

@@ -35,16 +35,28 @@ def start_matlab():
 
 
 class Engine:
+    def __init__(self):
+        self.directory = Path.cwd()
+        self.paths = []
+
     def cd(self, path, **kwargs):
         if not Path(path).is_dir():
             raise MatlabExecutionError("entry missing")
+        self.directory = Path(path)
 
     def addpath(self, path, **kwargs):
         if not Path(path).is_dir():
             raise MatlabExecutionError("path missing")
+        if Path(path).name != "resources":
+            self.paths.append(Path(path))
 
     def feval(self, name, payload, *args, **kwargs):
         if name == "flight_agent_execute_upload":
+            if not any(
+                path.name != "resources" and (path / f"{name}.m").is_file()
+                for path in [self.directory, *self.paths]
+            ):
+                raise MatlabExecutionError(f"Unrecognized function '{name}'")
             return self.upload(payload, *args, **kwargs)
         if name != "analyze_demo":
             raise MatlabExecutionError("unapproved function")
