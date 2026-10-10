@@ -32,6 +32,7 @@ def _check(result: AnalysisResult, rules: RuleSet, rule: Rule) -> Check:
         metric=rule.metric,
         status=status,
         value=value,
+        value_unit=metric.unit if metric is not None else None,
         operator=rule.operator,
         threshold=rule.threshold,
         unit=rule.unit,

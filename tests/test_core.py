@@ -101,6 +101,33 @@ def test_untrustworthy_results_are_undetermined(result_data, rule_data, problem)
     assert report.checks[0].reason
 
 
+@pytest.mark.parametrize("unit,status", [("1", "pass"), ("N", "undetermined")])
+def test_assessment_preserves_measurement_unit(result_data, rule_data, unit, status):
+    models = core()
+    result_data["metrics"]["required_lift_coefficient"] = {"value": 0.5, "unit": unit}
+    report = rules_module().assess(
+        models.AnalysisResult.model_validate(result_data), models.RuleSet.model_validate(rule_data)
+    )
+    check = report.model_dump()["checks"][0]
+    assert check["value"] == 0.5
+    assert check.get("value_unit") == unit
+    assert check["unit"] == "1"
+    assert check["status"] == status
+
+
+def test_missing_metric_has_no_measurement_unit(result_data, rule_data):
+    models = core()
+    del result_data["metrics"]["required_lift_coefficient"]
+    report = rules_module().assess(
+        models.AnalysisResult.model_validate(result_data), models.RuleSet.model_validate(rule_data)
+    )
+    check = report.model_dump()["checks"][0]
+    assert check["value"] is None
+    assert check.get("value_unit", "missing") is None
+    assert check["unit"] == "1"
+    assert check["status"] == "undetermined"
+
+
 def test_inapplicable_requirements_are_not_passes(result_data, rule_data):
     models = core()
     rule_data["rules"][0]["condition"] = "another-condition"

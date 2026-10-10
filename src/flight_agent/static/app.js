@@ -104,9 +104,11 @@ function renderAssessment(assessment) {
   table.append(header);
   for (const check of assessment.checks) {
     const row = document.createElement("tr");
+    const measurement = check.value == null
+      ? "—" : `${check.value} ${check.value_unit ?? "单位未知"}`;
     for (const text of [
-      check.rule_id, `${check.value ?? "—"} ${check.unit}`,
-      `${check.operator} ${check.threshold}`, check.status,
+      check.rule_id, measurement,
+      `${check.operator} ${check.threshold} ${check.unit}`, check.status,
     ]) {
       const cell = document.createElement("td");
       cell.textContent = text;
@@ -151,8 +153,23 @@ async function render(record, revision) {
 
 function selectJob(jobId) {
   activeId = jobId;
+  activeRecord = null;
   activeResultJson = null;
+  $("analyze-button").disabled = true;
   $("download-result").disabled = true;
+  $("download-report").disabled = true;
+  $("run-button").disabled = true;
+  badge("execution-status", "正在加载", "queued");
+  badge("agent-status", "等待加载", "");
+  $("job-meta").textContent = `任务 ${jobId} · 正在加载…`;
+  $("result-data").textContent = "正在加载任务结果。";
+  $("result-data").classList.add("empty");
+  $("execution-log").textContent = "尚无日志。";
+  for (const id of ["execution-error", "agent-error", "report"]) {
+    $(id).textContent = "";
+    $(id).hidden = true;
+  }
+  renderAssessment(null);
   viewRevision += 1;
   figureKey = "";
   clearFigures();
@@ -165,6 +182,7 @@ async function poll(jobId, revision = viewRevision) {
   try {
     const record = await api(`/api/jobs/${jobId}`);
     if (revision !== viewRevision) return;
+    if (record.id !== jobId) throw new Error("服务器返回的任务 ID 不匹配");
     await render(record, revision);
     if (revision !== viewRevision) return;
     if (["queued", "running"].includes(record.status) || record.agent_status === "running") {
@@ -175,6 +193,12 @@ async function poll(jobId, revision = viewRevision) {
   } catch (error) {
     if (revision !== viewRevision) return;
     notice(`${error.message}。未自动重试执行；可在“最近任务”中重新查看状态。`);
+    if (!activeRecord) {
+      badge("execution-status", "加载失败", "failed");
+      badge("agent-status", "未加载", "");
+      $("job-meta").textContent = `任务 ${jobId} · 加载失败`;
+      $("result-data").textContent = "未能加载任务结果。";
+    }
     $("run-button").disabled = false;
   }
 }
@@ -293,8 +317,9 @@ $("run-form").addEventListener("submit", async (event) => {
 });
 
 $("analyze-button").addEventListener("click", async () => {
-  if (!activeId) return;
-  const jobId = activeId;
+  if (!activeRecord || activeRecord.id !== activeId || activeRecord.status !== "completed" ||
+      $("analyze-button").disabled) return;
+  const jobId = activeRecord.id;
   const revision = viewRevision;
   try {
     notice("");
@@ -311,10 +336,14 @@ $("analyze-button").addEventListener("click", async () => {
 });
 $("refresh-history").addEventListener("click", () => history().catch((e) => notice(e.message)));
 $("download-result").addEventListener("click", () => {
-  if (activeResultJson !== null) download("result.json", activeResultJson, "application/json");
+  if (activeRecord?.id === activeId && activeResultJson !== null) {
+    download("result.json", activeResultJson, "application/json");
+  }
 });
 $("download-report").addEventListener("click", () => {
-  if (activeRecord?.report) download("report.md", activeRecord.report, "text/markdown;charset=utf-8");
+  if (activeRecord?.id === activeId && activeRecord.report) {
+    download("report.md", activeRecord.report, "text/markdown;charset=utf-8");
+  }
 });
 
 async function init() {

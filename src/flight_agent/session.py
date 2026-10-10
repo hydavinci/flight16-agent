@@ -158,9 +158,12 @@ class AnalysisSession:
                 "|---|---|---|---|---|---|",
             ]
             for check in assessment.checks:
-                value = "-" if check.value is None else f"{check.value:.8g}"
+                value = (
+                    "-" if check.value is None
+                    else f"{check.value:.8g} {check.value_unit or '单位未知'}"
+                )
                 lines.append(
-                    f"| {check.rule_id} | {check.metric} | {value} {check.unit} | "
+                    f"| {check.rule_id} | {check.metric} | {value} | "
                     f"{check.operator} {check.threshold:g} {check.unit} | {check.status} | "
                     f"{check.source_id} / {check.source_section} |"
                 )

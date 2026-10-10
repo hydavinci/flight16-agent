@@ -94,6 +94,7 @@ class Check(Contract):
     metric: str
     status: Status
     value: float | None
+    value_unit: Nonempty | None = None
     operator: str
     threshold: float
     unit: str

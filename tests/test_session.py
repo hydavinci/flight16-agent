@@ -118,3 +118,33 @@ def test_retrieval_preserves_distinct_excerpts_from_same_document(
     assert "> beta explanation." in report
     assert report.count("> alpha threshold 1.2.") == 1
     assert report.count("> beta explanation.") == 1
+
+
+def test_report_keeps_measurement_and_requirement_units_separate(
+    project, parameter_data, result_data
+):
+    result_data["metrics"]["required_lift_coefficient"] = {"value": 0.5, "unit": "N"}
+    session = make_session(project, parameter_data, result_data)
+    session.analyze()
+    session.check_requirements()
+    report = session.complete("仅软件演示。").read_text()
+    assert "| 0.5 N | <= 1.2 1 | undetermined |" in report
+    saved = json.loads((session.run_dir / "assessment.json").read_text())
+    assert saved["checks"][0]["value_unit"] == "N"
+    assert saved["checks"][0]["unit"] == "1"
+
+
+def test_report_does_not_guess_measurement_unit_for_legacy_assessment(
+    project, parameter_data, result_data
+):
+    from flight_agent.models import Assessment
+
+    result_data["metrics"]["required_lift_coefficient"] = {"value": 0.5, "unit": "N"}
+    session = make_session(project, parameter_data, result_data)
+    session.analyze()
+    data = session.check_requirements()
+    for check in data["checks"]:
+        check.pop("value_unit", None)
+    session.assessment = Assessment.model_validate(data)
+    report = session.complete("仅软件演示。").read_text()
+    assert "| 0.5 单位未知 | <= 1.2 1 | undetermined |" in report

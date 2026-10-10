@@ -484,3 +484,164 @@ def test_browser_ignores_errors_from_superseded_example_requests(project):
             expect(page.locator("#filename")).to_contain_text("newest.m")
         finally:
             browser.close()
+
+
+@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
+@pytest.mark.parametrize(
+    "unit,measurement,status",
+    [("1", "0.5 1", "pass"), ("N", "0.5 N", "undetermined"), (None, "0.5 单位未知", "pass")],
+)
+def test_browser_keeps_measurement_and_requirement_units_separate(
+    project, result_data, rule_data, unit, measurement, status
+):
+    from flight_agent.jobs import JobStore
+    from flight_agent.models import AnalysisResult, RuleSet
+    from flight_agent.rules import assess
+
+    first, _ = completed_image_jobs(project)
+    result_data["metrics"]["required_lift_coefficient"] = {"value": 0.5, "unit": unit or "1"}
+    assessment = assess(
+        AnalysisResult.model_validate(result_data), RuleSet.model_validate(rule_data)
+    ).model_dump()
+    if unit is None:
+        assessment["checks"][0].pop("value_unit", None)
+    JobStore(project / "runs" / "web").update(
+        first.id, agent_status="completed", assessment=assessment
+    )
+    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.goto(url)
+            page.locator("#history button").filter(has_text="first.m").click()
+            expect(page.locator("#assessment tr").nth(1).locator("td")).to_have_text(
+                ["DEMO-CL", measurement, "<= 1.2 1", status]
+            )
+        finally:
+            browser.close()
+
+
+@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
+@pytest.mark.parametrize("stage", ["status", "result"])
+@pytest.mark.parametrize("outcome", ["success", "failure"])
+def test_browser_disables_job_actions_until_selection_loads(project, stage, outcome):
+    from flight_agent.jobs import JobStore
+
+    first, second = completed_image_jobs(project)
+    store = JobStore(project / "runs" / "web")
+    store.update(first.id, result={"first": 1}, log="First job log")
+    store.update(second.id, result={"second": 2})
+    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        delayed, submitted = [], []
+        path = f"**/api/jobs/{second.id}" + ("/result" if stage == "result" else "")
+        page.route(path, lambda route: delayed.append(route), times=1)
+        page.on(
+            "request",
+            lambda request: (
+                submitted.append(request.url) if request.url.endswith("/analyze") else None
+            ),
+        )
+        try:
+            page.goto(url)
+            page.locator("#history button").filter(has_text="first.m").click()
+            expect(page.locator("#analyze-button")).to_be_enabled()
+            expect(page.locator("#result-data")).to_contain_text('"first": 1')
+            with page.expect_request(path):
+                page.locator("#history button").filter(has_text="second.m").click()
+            expect(page.locator("#analyze-button")).to_be_disabled()
+            expect(page.locator("#download-result")).to_be_disabled()
+            expect(page.locator("#download-report")).to_be_disabled()
+            expect(page.locator("#job-meta")).not_to_contain_text("first.m")
+            expect(page.locator("#result-data")).not_to_contain_text('"first": 1')
+            expect(page.locator("#execution-log")).not_to_contain_text("First job log")
+            expect(page.locator("#figures img")).to_have_count(0)
+            page.locator("#analyze-button").dispatch_event("click")
+            assert submitted == []
+
+            if outcome == "failure":
+                delayed.pop().fulfill(status=503, json={"detail": "Selection unavailable"})
+                expect(page.locator("#notice")).to_contain_text("Selection unavailable")
+                expect(page.locator("#execution-status")).to_have_text("加载失败")
+                expect(page.locator("#analyze-button")).to_be_disabled()
+                expect(page.locator("#download-result")).to_be_disabled()
+                page.locator("#analyze-button").dispatch_event("click")
+                assert submitted == []
+                assert store.get(second.id).agent_status == "not_requested"
+            else:
+                delayed.pop().continue_()
+                expect(page.locator("#job-meta")).to_contain_text("second.m")
+                expect(page.locator("#result-data")).to_contain_text('"second": 2')
+                expect(page.locator("#analyze-button")).to_be_enabled()
+                expect(page.locator("#download-result")).to_be_enabled()
+                page.locator("#analyze-button").click()
+                expect(page.locator("#agent-status")).to_have_text("无法按当前规则判定")
+                assert submitted == [f"{url}/api/jobs/{second.id}/analyze"]
+                assert store.get(second.id).agent_status == "undetermined"
+            assert store.get(first.id).agent_status == "not_requested"
+        finally:
+            for route in delayed:
+                route.abort()
+            browser.close()
+
+
+@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
+def test_browser_clears_previous_report_when_selection_fails(project):
+    from flight_agent.jobs import JobStore
+
+    first, second = completed_image_jobs(project)
+    JobStore(project / "runs" / "web").update(
+        first.id,
+        agent_status="completed",
+        report="First job report",
+        assessment={"status": "pass"},
+    )
+    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        downloads = []
+        page.on("download", lambda download: downloads.append(download))
+        page.route(
+            f"**/api/jobs/{second.id}",
+            lambda route: route.fulfill(status=503, json={"detail": "Selection unavailable"}),
+        )
+        try:
+            page.goto(url)
+            page.locator("#history button").filter(has_text="first.m").click()
+            expect(page.locator("#report")).to_have_text("First job report")
+            expect(page.locator("#download-report")).to_be_enabled()
+            page.locator("#history button").filter(has_text="second.m").click()
+            expect(page.locator("#notice")).to_contain_text("Selection unavailable")
+            expect(page.locator("#download-report")).to_be_disabled()
+            expect(page.locator("#report")).to_be_hidden()
+            expect(page.locator("#report")).to_have_text("")
+            expect(page.locator("#assessment")).to_have_text("")
+            page.locator("#download-report").dispatch_event("click")
+            assert downloads == []
+        finally:
+            browser.close()
+
+
+@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
+def test_browser_rejects_mismatched_job_status(project):
+    from flight_agent.jobs import JobStore
+
+    first, second = completed_image_jobs(project)
+    wrong_record = JobStore(project / "runs" / "web").get(first.id).model_dump()
+    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.route(
+            f"**/api/jobs/{second.id}",
+            lambda route: route.fulfill(status=200, json=wrong_record),
+        )
+        try:
+            page.goto(url)
+            page.locator("#history button").filter(has_text="second.m").click()
+            expect(page.locator("#notice")).to_contain_text("任务 ID 不匹配")
+            expect(page.locator("#job-meta")).not_to_contain_text("first.m")
+            expect(page.locator("#analyze-button")).to_be_disabled()
+            expect(page.locator("#download-result")).to_be_disabled()
+        finally:
+            browser.close()
