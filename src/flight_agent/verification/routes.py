@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from ..jobs import BusyError, JobManager
 from .artifacts import verify_artifact
-from .contracts import Conversation, PendingDecision
+from .contracts import Conversation, PendingDecision, VerificationTask
 from .runtime import VerificationRuntime
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,7 @@ class MessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     project_root: str | None = Field(default=None, max_length=4096)
     output_root: str | None = Field(default=None, max_length=4096)
+    scenario: Literal["d1", "d2"] | None = None
 
     @field_validator("message")
     @classmethod
@@ -102,6 +103,7 @@ class ConversationManager:
                 request.message,
                 request.project_root,
                 output_root=request.output_root,
+                scenario=request.scenario,
             )
             if record.status == "planning":
                 self._schedule(record, lambda: self.runtime.continue_submission(record.id))
@@ -145,6 +147,7 @@ class ConversationManager:
             elif action == "replan":
                 if (
                     request is None
+                    or not isinstance(task, VerificationTask)
                     or record.pending_decision is None
                     or record.pending_decision.kind != "confirm_replan"
                     or task.failure_proposal is None
@@ -164,6 +167,7 @@ class ConversationManager:
             else:
                 if (
                     request is None
+                    or not isinstance(task, VerificationTask)
                     or not task.baseline.confirmed
                     or task.pending_request is None
                     or task.worker_run is None
@@ -214,6 +218,7 @@ def verification_router(
                 {
                     "id": record.id,
                     "status": record.status,
+                    "scenario": record.scenario,
                     "project_root": record.project_root,
                     "output_root": record.output_root,
                     "updated_at": record.updated_at,

@@ -1,9 +1,10 @@
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 
+from ..directories import DirectoryListing, browse_directories
 from ..jobs import BusyError, JobManager
 from ..service import safe_log
 from .artifacts import verify_artifact
@@ -25,6 +26,13 @@ def project_routes(root: Path, manager: JobManager, enabled: bool) -> APIRouter:
             )
 
     router = APIRouter(prefix="/verification", dependencies=[Depends(authorize_projects)])
+
+    @router.get("/directories")
+    def directories(path: str = Query(default="", max_length=4096)) -> DirectoryListing:
+        try:
+            return browse_directories(path)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @router.post("/projects/inspect")
     def inspect(request: InspectProjectRequest) -> ProjectDescriptor:

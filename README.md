@@ -1,12 +1,14 @@
 # Flight16 Agent
 
-基于 **LangChain + MATLAB Engine for Python + FastAPI** 的目录式飞控验证 Agent，
+基于 **LangChain + MATLAB Engine for Python + FastAPI** 的目录式飞控验证与诊断 Agent，
 提供 Web 和 CLI 入口。核心分工是：**大模型理解请求、提出计划和解释证据，
-MATLAB 负责计算，Python 规则程序负责判定。**
+已注册适配器负责计算，Python 程序负责权限、证据校验和 D1 判据比较。**
 
-Web 首页接受 MATLAB worker 可见的工程目录和自然语言请求，先只读发现工程，
+Web 首页默认使用 **D1 验证**：接受 MATLAB worker 可见的工程目录和自然语言请求，先只读发现工程，
 再由用户确认版本化判据与可信代码授权，执行已注册的 Simulink 阶跃响应和稳定裕度分析，
 交付 Word 报告及 PNG、MAT、JSON 证据。改阈值或拆分报告复用已有数值结果。
+新会话也可选择 **D2 诊断**：读取 Agent 主机上已登记的时序/频响 JSON 数据，
+确认假设、分析范围和预算后，逐轮分析、审查证据并决定下一步或明确停止。
 原单文件 `.m` 上传工作台保留在 `/workbench`；CLI `analyze` 保留固定 MATLAB 入口、
 规则检查和知识检索。大模型没有任意代码执行、模型编辑或参数优化工具。
 
@@ -14,14 +16,19 @@ Web 首页接受 MATLAB worker 可见的工程目录和自然语言请求，先�
 > 自带算例只演示数据、计算、规则和报告链路，不能用于适航、放飞或真实飞行器合格判断。
 > 目录工作流已用真实 MATLAB/Simulink 合成模型跑通，但该集成中的规划模型是测试替身。
 > 真实模型服务仍需部署联调；真实 F-16 还需要平台兼容的原生依赖、独立参考结果和约定容差。
+> D2 自带数据也是合成夹具；可引用的诊断证据不等于已证明唯一根因，仍需真实标注案例验收。
 
 ## 功能与边界
 
 | 能力 | 当前实现 |
 |---|---|
-| Web 首页 | 表单或聊天指定 Worker 工程目录、Agent 成果根目录；确认前显示实际任务目录 |
+| Web 首页 | 新会话选择 D1 / D2；区分 Worker 工程目录与 Agent 数据/成果目录，确认前显示实际任务目录 |
 | D1 数值分析 | 已准备的 Simulink 工程、配平点 1、阶跃响应和开环稳定裕度 |
-| 判定与交付 | PASS / FAIL / UNDETERMINED、版本化 DOCX、PNG、MAT、JSON 和证据索引 |
+| D2 只读分析 | 窗口统计、显式对齐信号比较、已记录参数敏感性、局部环路裕度；不调用 MATLAB worker |
+| D2 证据循环 | 已确认范围内逐轮更新假设和计划，引用不可变分析记录；预算、缺项或未知执行状态明确停止 |
+| D1 判定与交付 | PASS / FAIL / UNDETERMINED、版本化 DOCX、PNG、MAT、JSON 和证据索引 |
+| D2 诊断交付 | DOCX、诊断 JSON、执行记录与证据索引；结论关联分析 ID 和指标，不作航空合格判定 |
+| 共享证据内核 | 设计版本引用、效果权限、完整分析规格指纹；数值、评估和报告缓存分层 |
 | 会话与复用 | 追问保留任务状态；显式续接同一远程运行；已知失败可修复重试，仅补跑缺失分析 |
 | 失败重规划 | 每个基线最多一次自动提出恢复方案；用户采纳后仍须确认新基线，不自动执行 |
 | 受控工具扩展 | 开发者注册带输入/输出 schema 和能力依赖的只读工具，不开放模型动态导入或任意执行 |
@@ -31,23 +38,33 @@ Web 首页接受 MATLAB worker 可见的工程目录和自然语言请求，先�
 | CLI / 上传后分析 | LangChain 工具调用、演示判据、带知识来源的中文解释 |
 | 模型接口 | OpenAI 兼容 Chat Completions，必须支持工具调用 |
 | CLI 知识库 | 本地 Markdown 的中文双字词项与英文词项检索，不是向量数据库 |
-| 暂不提供 | 自动配平、根因诊断、优化、模型编辑、Simate 执行、多用户登录或安全沙箱 |
+| 暂不提供 | 自动配平、唯一根因证明、优化、模型编辑、Simate 执行、多用户登录或安全沙箱 |
+
+当前交付范围是 **D1 验证 + D2 诊断**。D3-D6 仅预留设计版本、能力效果、
+候选写入与采纳的共享契约，尚未实现优化、拓扑编辑或设计候选采纳工作流。
 
 目录 Agent 的规划需要大模型；旧工作台的普通 MATLAB 计算不依赖大模型。
 Web 所在机器无需安装 MATLAB，
 **worker 所在机器仍须安装并许可 MATLAB**；同一台机器可以同时运行 Web 和 worker。
+D2 的已登记 JSON 数据分析只需要 Web/Agent 和模型服务，不要求 MATLAB 或 worker。
 项目不附带 MATLAB、模型权重或可直接使用的 API 凭据。
 
 ## 整体架构
 
 ```text
-浏览器：Worker 工程目录 + 请求
+浏览器 / directory-task CLI：场景 + 目录 + 请求
               |
               v
 本地 Web 服务（FastAPI，默认 127.0.0.1:8000）
-  只读发现 -> LLM 类型化计划 -> 等待用户确认基线与可信代码
+  只读发现 -> LLM 类型化计划 -> 等待用户确认基线、范围与预算
               |
-  注册工具 Runtime：分析 -> 确定性评估 -> 本地报告
+  共享契约 / 权限 / 不可变证据 / 版本化会话
+              |
+              +-> D2：Agent 主机上的已登记 JSON 数据
+              |       只读分析 -> 引用证据的审查 -> 下一轮或明确停止
+              |       -> 诊断 DOCX / JSON / 证据索引
+              |
+  D1 注册工具 Runtime：分析 -> 确定性评估 -> 本地报告
               |
               | 本机 HTTP / SSH 隧道 / 已部署的 HTTPS
               v
@@ -99,11 +116,14 @@ flight-agent web --port 8000
 
 在浏览器打开 `http://127.0.0.1:8000`，进入目录会话；单文件上传入口为 `/workbench`。
 未配置 worker 或模型服务时仍可查看页面，但目录任务会明确报错，不会生成模拟结果。
+D2 不依赖 worker；模型服务仍需配置，数据必须满足 `docs/d2-agent.md` 的登记契约。
 旧工作台可以选择本地文件，其普通 MATLAB 执行不需要模型配置。
 `.env.example` 中的模型名称、地址和 Key 都是占位内容，不代表已经连接模型服务。
 已有 `.env` 时不要再次复制覆盖，应保留自己的配置并按需编辑。
 
 ### B. 在有 MATLAB 的执行机器启动 worker
+
+本节用于 D1 和旧上传工作台；只使用 D2 时无需配置 worker，可直接按 C2 节操作。
 
 真实 Simulink 集成已在 macOS 运行。目录执行包含 Windows 专用进程清理路径，
 但尚未在 Windows 实机验证；旧上传和 CLI 执行仍要求 macOS/Linux。
@@ -150,6 +170,16 @@ MATLAB_WORKER_TOKEN=与执行机器完全相同的随机令牌
 两个终端都需进入项目根目录并激活各自虚拟环境；worker 必须使用兼容 Engine 的 Python。
 Web 端还需按第 3 节配置实际模型服务。两个可信执行开关独立；
 只有需要旧上传工作台时才另设 `MATLAB_ALLOW_TRUSTED_UPLOADS=1`。
+
+若浏览器、Web 和 Worker 都在**同一台带桌面的 macOS** 上，可将 Web 启动命令替换为：
+
+```bash
+flight-agent web --native-directory-picker --port 8000
+```
+
+两个「浏览…」按钮会直接弹出系统目录选择窗口；确认后只回填绝对路径，取消不改原值，
+不会自动提交任务或授权执行。该模式不适用于远程 Worker，即使它通过 SSH 隧道使用
+`127.0.0.1` 地址；远程、无桌面及其他系统部署继续使用默认的网页目录浏览器。
 
 修改配置后重启 Web 服务。也可连接已正确部署的 HTTPS worker；
 客户端拒绝非回环地址的明文 HTTP，不跟随重定向，不自动重试任务提交。
@@ -201,6 +231,8 @@ Agent 会先澄清，不扫描猜测的目录。可在后续聊天中切换工�
 不重新提交仿真。只有已核实失败/中断的远程运行才能在再次确认后以新 ID 重试；
 修复此类失败工程后也可重新发现并建立待确认基线。
 远程状态不明时不能用重试、换工程或采纳重规划方案绕过原运行的续接。
+续接保留该次运行记录的适配器版本；旧记录未保存版本时明确标记 `unrecorded`，
+不会把历史计算归属于当前适配器，也不会因命中缓存而跳过在途运行的核查。
 源文件或分析配置变更会使旧证据失效并要求新基线。
 
 执行失败后，Agent 可根据实际阶段和错误提出一次有界恢复建议：要求补充信息，
@@ -217,6 +249,50 @@ Agent 在该根目录下为任务创建唯一子目录，会话记录仍保存�
 Worker 端保存 `runs/verification-worker/<运行ID>/`，其中 `project/` 是独立工程副本。
 旧版本报告和证据保持可下载；Web 已下载的产物无需 worker 在线也可访问。
 这些目录可能包含工程副本和敏感结果，应设置账户权限及保留策略。
+
+### C2. D2 只读诊断与目录 CLI
+
+**仅运行 D2 的最短路径：**完成 A 节的项目安装，按第 3 节配置模型服务后启动 Web。
+无需安装 MATLAB、启动 worker 或设置 `MATLAB_WORKER_*`；仍需可用的工具调用模型服务。
+
+在新会话选择 **D2 诊断**，指定 **Agent/Web 主机**可见的数据目录。
+目录必须包含 `flight-diagnosis.json` 及其登记的 JSON 数据文件；不是任意 MATLAB 工程，
+也不会自动扫描或执行工程代码。示例位于 `examples/diagnosis/synthetic-read-only/`。
+目录浏览器在 D2 中使用 Agent 主机，不依赖 D1 的 Worker 凭据。
+同一会话不能切换 D1/D2；需要另建会话。
+
+先核对控制器/对象版本、输入指纹、假设、允许的只读能力、分析参数和预算，再确认基线。
+后续计划只能在该范围内变化；每轮结果都有独立分析 ID、规格指纹及指标引用。
+界面和报告保留支持/反驳/未知状态、证据不足项与停止原因。`evidence_sufficient`
+表示本次假设审查认为证据足够，**不是唯一根因证明或飞行器合格结论**。
+只读效果是可信适配器的调用契约，不是操作系统沙箱。
+
+服务重启后需显式续接：已有且校验通过的分析回执直接恢复；在途调用缺少回执时，
+以 `unknown_execution` 停止，不自动重新派发。独立只读输入快照的恢复同样校验内容与所有权，
+不会覆盖冲突文件。澄清回复可沿用经限长和脱敏的近期对话，但历史消息不能替代确认。
+
+目录 CLI 连接**已经运行的本机 Web 服务**，与网页共用会话、确认和交付，不另开离线执行器：
+
+```bash
+flight-agent directory-task --server http://127.0.0.1:8000 propose \
+  --scenario d2 --project-root "$PWD/examples/diagnosis/synthetic-read-only" \
+  --request "分析已登记的时序与频响数据，提出可检验假设并明确证据不足项。"
+
+# 用上一条输出的会话 ID 和当前基线版本替换占位值；先核对计划再确认
+flight-agent directory-task confirm CONVERSATION_ID --version 1 --trusted-project
+flight-agent directory-task status CONVERSATION_ID
+flight-agent directory-task resume CONVERSATION_ID
+```
+
+`--server` 和 `--timeout` 放在 `propose/confirm/status/resume` 之前。
+`propose --scenario d1` 使用 Worker 工程；省略新会话的场景仍为 D1。
+用 `propose --conversation CONVERSATION_ID --request "..."` 续聊；
+`--output-root` 是 Agent 成果根目录，空字符串显式恢复默认位置。
+CLI 自动获取页面令牌，只接受本机 HTTP origin，不跟随重定向或环境代理。
+等待超时不取消服务端任务；用 `status` 读取持久状态，不能据此重复确认或重新提交。
+
+D2 输入格式、能力参数、预算和恢复边界见 `docs/d2-agent.md`。
+D1 的固定计划与失败恢复保持原行为；D2 的成功后证据循环不替代 D1 的确定性判定。
 
 ### D. 兼容工作台：上传与查看结果
 
@@ -386,7 +462,7 @@ flight-agent analyze examples/parameters.json \
 ## 5. CLI 输入与流程
 
 本节说明 `flight-agent analyze`：它只接受 JSON 参数，调用固定的可信 MATLAB 入口，
-不执行用户上传的 `.m` 文件。目录会话和 `/workbench` 的流程见前面的“Web 快速开始”。
+不执行用户上传的 `.m` 文件。`directory-task` 目录会话和 `/workbench` 的流程见前面的“Web 快速开始”。
 `examples/parameters.json` 演示了明确带单位的字段：
 
 | 字段 | 单位/约束 |
@@ -512,11 +588,12 @@ RUN_MATLAB_TESTS=1 python -m pytest tests/test_verification_matlab.py -m matlab 
 ```
 
 Web 与远程 worker 的 HTTP 测试也在默认测试中，Engine 替身仅存在于测试目录。
-另可运行真实浏览器检查上传、结果、图表、错误和 Agent 页面状态：
+另可运行真实浏览器检查上传、D1/D2 目录会话、结果、图表、错误和 Agent 页面状态：
 
 ```bash
 python -m playwright install chromium --only-shell
-RUN_BROWSER_TESTS=1 python -m pytest tests/test_web_browser.py tests/test_verification_browser.py -v
+RUN_BROWSER_TESTS=1 python -m pytest \
+  tests/test_web_browser.py tests/test_verification_browser.py tests/test_diagnosis_browser.py -v
 ```
 
 在真正安装 MATLAB 的执行机器上，验证上传脚本和函数的实际运行：
@@ -536,6 +613,8 @@ CLI 模型链路另用 `analyze` 检查。2026-10-17 的本机 F-16 集成停在
 `nlplant` 原生模块编译：缺少已配置的受支持 C 编译器，Xcode 许可尚未接受。
 该失败不会被合成模型结果替代，也不会由服务自动接受许可或修改系统工具链。
 独立 F-16 参考结果和约定数值容差仍是工程验收前提。
+D2 默认测试验证已知合成数据、逐轮证据反馈、预算和重启恢复；没有真实标注的故障案例，
+不能据此声称已验证实际故障识别率、根因准确率或工程可用性。
 
 Python 包内置 Web 静态资源和受控 MATLAB 支持函数，不内置 MATLAB 产品、
 用户工程、CLI 的演示入口、知识和规则文件。完整部署仍应保留项目目录，
@@ -546,10 +625,11 @@ Python 包内置 Web 静态资源和受控 MATLAB 支持函数，不内置 MATLA
 ```text
 flight16-agent/
 |-- src/flight_agent/
-|   |-- cli.py                  # doctor / analyze / web / worker 命令
+|   |-- cli.py                  # doctor / analyze / web / worker / directory-task 命令
 |   |-- web.py                  # 目录会话首页与兼容上传工作台
 |   |-- worker.py               # 共享执行槽的可信目录 / 上传服务
-|   |-- verification/          # 工程契约、工具 Runtime、Simulink、判定和 Word 交付
+|   |-- runtime/               # 共享设计/权限契约、能力注册与不可变证据
+|   |-- verification/          # D1 验证、D2 证据循环、适配器与 Word 交付
 |   |-- remote.py               # 远程提交、轮询和产物下载
 |   |-- jobs.py                 # 单任务调度与持久化状态
 |   |-- matlab.py               # CLI 固定算例的子进程适配
@@ -571,6 +651,7 @@ flight16-agent/
 |-- knowledge/                 # Markdown 依据文档
 |-- tests/                     # 单元、HTTP、浏览器与可选真实 MATLAB 测试
 |-- docs/d1-agent.md            # 目录工程准备、接口、续接与验收边界
+|-- docs/d2-agent.md            # 只读诊断数据、证据循环、共享契约与预算边界
 |-- .env.example               # 配置模板，不含真实凭据
 |-- pyproject.toml             # 依赖、打包和开发工具配置
 `-- README.md
@@ -583,13 +664,15 @@ flight16-agent/
 
 | 现象 / 问题 | 处理方式 |
 |---|---|
-| 页面能打开，但不能运行 | 检查 worker 是否启动、URL/令牌是否匹配、SSH 隧道是否保持连接；改 `.env` 后重启服务 |
+| D1 页面能打开，但不能运行 | 检查 worker 是否启动、URL/令牌是否匹配、SSH 隧道是否保持连接；改 `.env` 后重启服务 |
+| D2 是否需要 MATLAB 或 worker？ | 不需要；配置工具调用模型服务，使用 Agent 主机上的已登记 JSON 数据目录 |
+| D2 续接后显示 `unknown_execution` | 在途调用没有可核验回执，不能确认是否执行；保留记录并人工核查，不自动补跑 |
 | 页面显示模型“已配置”，但分析失败 | 只表示配置格式完整，不代表端点可达或 Key 有效；确认真实模型服务支持工具调用 |
 | MATLAB Engine 导入或启动失败 | 检查 worker 使用的 Python、Engine 包、MATLAB 发行版及许可，不要把 MATLAB Runtime 当作替代品 |
 | 普通计算成功，Agent 显示 `undetermined` | 通用 `result` 不一定符合现有飞行器指标契约；先使用 `web_metrics.m` 和配套参数验证数据格式 |
 | HTTP 409 / Another task is running | 当前服务已有计算或分析任务，等待完成；不要启动多个实例共享同一运行目录 |
 | Web API 令牌失效 / HTTP 403 | 服务重启后刷新页面获取新的页面令牌 |
-| 网络断开后是否可以直接重试？ | 先用远程任务 ID 核查 worker；客户端超时不代表远程计算已经终止 |
+| D1 网络断开后是否可以直接重试？ | 先用远程任务 ID 核查 worker；客户端超时不代表远程计算已经终止 |
 | 可以直接使用 MATLAB Online 吗？ | 当前项目没有接入公共 MATLAB Online，执行仍需要安装 MATLAB 的 worker |
 | 可以直接上传 Simulink `.slx` 吗？ | 目前不支持；模型封装、依赖部署和结果适配需另行实现并联调 |
 | 可以直接复用 Copilot 对话吗？ | 当前没有 Copilot SDK 适配；应配置受支持的模型 API，而不是把对话地址当作接口 |

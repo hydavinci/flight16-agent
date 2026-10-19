@@ -4,14 +4,419 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import expect, sync_playwright
 
+from flight_agent.directories import NativeDirectoryError
 from tests.helpers import serve_app, tool_message
 from tests.test_verification_runtime import explanation, proposal, runtime_fixture
 from tests.test_web import web_module
+from tests.test_worker import TOKEN, worker
 from tests.verification_helpers import project_tree, verification_module
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in"
 )
+
+
+@pytest.mark.parametrize("viewport_width", [1280, 390])
+def test_browser_native_picker_fills_both_fields_without_submitting(
+    project, tmp_path, monkeypatch, viewport_width
+):
+    runtime, backend, model, root = runtime_fixture(tmp_path)
+    output = tmp_path / "chosen outputs"
+    output.mkdir()
+    calls = []
+
+    def choose(path="", *, title):
+        calls.append((path, title))
+        return str(root if title == "选择工程目录" else output)
+
+    monkeypatch.setattr(web_module(), "choose_native_directory", choose)
+    monkeypatch.setenv("MATLAB_WORKER_URL", "http://127.0.0.1:9001")
+    monkeypatch.setenv("MATLAB_WORKER_TOKEN", TOKEN)
+    with (
+        serve_app(web_module().create_web_app(
+            project, verification_runtime=runtime, native_directory_picker=True,
+        )) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page(viewport={"width": viewport_width, "height": 900})
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        try:
+            page.goto(url)
+            page.get_by_label("工程目录", exact=True).fill(str(root.parent))
+            page.get_by_label("验证需求").fill("Keep this unsent request.")
+            for target, expected_path in (("project", root), ("output", output)):
+                with page.expect_response("**/api/directories/select", timeout=3000) as response:
+                    page.locator(f"#browse-{target}").click(timeout=3000)
+                assert response.value.status == 200
+                assert response.value.request.post_data_json == {
+                    "target": target, "path": str(root.parent) if target == "project" else "",
+                }
+                expect(page.locator(f"#{target}-root")).to_have_value(str(expected_path))
+                expect(page.locator(f"#browse-{target}")).to_be_enabled()
+                expect(page.get_by_role("dialog")).not_to_be_visible()
+            expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
+            expect(page.get_by_label("验证需求")).to_have_value("Keep this unsent request.")
+            expect(page.locator("#trusted")).not_to_be_checked()
+            assert calls == [(str(root.parent), "选择工程目录"), ("", "选择输出根目录")]
+            assert not runtime.store.recent()
+            assert not model.seen
+            assert not backend.calls
+            assert errors == []
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "error", "malformed"])
+def test_browser_native_picker_cancel_and_errors_preserve_input(
+    project, tmp_path, monkeypatch, outcome
+):
+    runtime, backend, model, _ = runtime_fixture(tmp_path)
+
+    def choose(*args, **kwargs):
+        if outcome == "error":
+            raise NativeDirectoryError("controlled native failure")
+        return None
+
+    monkeypatch.setattr(web_module(), "choose_native_directory", choose)
+    with (
+        serve_app(web_module().create_web_app(
+            project, verification_runtime=runtime, native_directory_picker=True,
+        )) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        if outcome == "malformed":
+            page.route("**/api/directories/select", lambda route: route.fulfill(json={"path": 42}))
+        try:
+            page.goto(url)
+            page.get_by_label("输出根目录", exact=True).fill(str(tmp_path))
+            page.get_by_label("验证需求").fill("Keep this unsent request.")
+            with page.expect_response("**/api/directories/select", timeout=3000):
+                page.locator("#browse-output").click(timeout=3000)
+            expect(page.locator("#browse-output")).to_be_enabled()
+            expect(page.get_by_role("dialog")).not_to_be_visible()
+            expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(tmp_path))
+            expect(page.get_by_label("验证需求")).to_have_value("Keep this unsent request.")
+            expect(page.locator("#trusted")).not_to_be_checked()
+            if outcome == "cancel":
+                expect(page.locator("#notice")).not_to_be_visible()
+            else:
+                expect(page.locator("#notice")).to_contain_text("无法选择目录")
+                if outcome == "error":
+                    expect(page.locator("#notice")).to_contain_text("controlled native failure")
+            assert not runtime.store.recent()
+            assert not model.seen
+            assert not backend.calls
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("late_status", [200, 503])
+def test_browser_native_picker_ignores_previous_conversation_response(
+    project, tmp_path, late_status
+):
+    runtime, backend, model, _ = runtime_fixture(tmp_path)
+    with (
+        serve_app(web_module().create_web_app(
+            project, verification_runtime=runtime, native_directory_picker=True,
+        )) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        pending = []
+        page.route("**/api/directories/select", lambda route: pending.append(route))
+        try:
+            page.goto(url)
+            page.get_by_label("输出根目录", exact=True).fill("/old/output")
+            page.get_by_label("验证需求").fill("Do not send this request.")
+            with page.expect_request("**/api/directories/select", timeout=3000):
+                page.locator("#browse-output").click(timeout=3000)
+            for control in (
+                "send", "message", "project-root", "output-root", "trusted",
+                "confirm", "retry", "replan", "resume", "browse-project", "browse-output",
+            ):
+                expect(page.locator(f"#{control}")).to_be_disabled()
+            expect(page.locator("#browse-output")).to_have_text("正在选择…")
+            page.locator("#composer").evaluate("(form) => form.requestSubmit()")
+            page.get_by_role("button", name="新建会话", exact=True).click()
+            page.get_by_label("工程目录", exact=True).fill("/new/project")
+            page.get_by_label("输出根目录", exact=True).fill("/new/output")
+            page.get_by_label("验证需求").fill("New unsent request.")
+            with page.expect_request("**/api/directories/select"):
+                page.locator("#browse-project").click()
+            assert len(pending) == 2
+            with page.expect_request_finished():
+                pending[0].fulfill(
+                    status=late_status,
+                    json={"path": "/stale"} if late_status == 200 else {"detail": "stale error"},
+                )
+            page.evaluate("() => new Promise(requestAnimationFrame)")
+            expect(page.locator("#project-root")).to_be_disabled()
+            expect(page.locator("#browse-project")).to_have_text("正在选择…")
+            expect(page.locator("#notice")).not_to_be_visible()
+            pending[1].fulfill(json={"path": "/fresh/project"})
+            expect(page.locator("#project-root")).to_have_value("/fresh/project")
+            expect(page.locator("#project-root")).to_be_enabled()
+            expect(page.locator("#output-root")).to_have_value("/new/output")
+            expect(page.locator("#message")).to_have_value("New unsent request.")
+            expect(page.locator("#notice")).not_to_be_visible()
+            expect(page.get_by_role("dialog")).not_to_be_visible()
+            assert not runtime.store.recent()
+            assert not model.seen
+            assert not backend.calls
+        finally:
+            browser.close()
+
+
+def test_browser_native_picker_cannot_overwrite_edited_field(project, tmp_path):
+    runtime, _, _, _ = runtime_fixture(tmp_path)
+    with (
+        serve_app(web_module().create_web_app(
+            project, verification_runtime=runtime, native_directory_picker=True,
+        )) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        pending = []
+        page.route("**/api/directories/select", lambda route: pending.append(route))
+        try:
+            page.goto(url)
+            with page.expect_request("**/api/directories/select", timeout=3000):
+                page.locator("#browse-output").click(timeout=3000)
+            page.locator("#output-root").evaluate("(input) => { input.value = '/new/output'; }")
+            with page.expect_request_finished():
+                pending[0].fulfill(json={"path": "/stale"})
+            expect(page.locator("#output-root")).to_be_enabled()
+            expect(page.locator("#output-root")).to_have_value("/new/output")
+            expect(page.locator("#notice")).not_to_be_visible()
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("viewport_width", [1280, 390])
+def test_browser_browses_both_hosts_without_submitting(
+    project, tmp_path, monkeypatch, viewport_width
+):
+    runtime, backend, model, root = runtime_fixture(tmp_path)
+    home = tmp_path / "browse home"
+    output = home / "chosen outputs"
+    output.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
+    monkeypatch.setenv("MATLAB_WORKER_TOKEN", TOKEN)
+    with serve_app(worker().create_worker_app(project, TOKEN)) as worker_url:
+        monkeypatch.setenv("MATLAB_WORKER_URL", worker_url)
+        with (
+            serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
+            sync_playwright() as playwright,
+        ):
+            browser = playwright.chromium.launch()
+            page = browser.new_page(viewport={"width": viewport_width, "height": 900})
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            try:
+                page.goto(url)
+                for target in ("project", "output"):
+                    button = page.locator(f"#browse-{target}")
+                    expect(button).to_be_enabled()
+                    input_box = page.locator(f"#{target}-root").bounding_box()
+                    button_box = button.bounding_box()
+                    assert input_box and button_box
+                    assert button_box["x"] >= input_box["x"] + input_box["width"]
+                    assert abs(button_box["y"] - input_box["y"]) < 1
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+                page.get_by_label("工程目录", exact=True).fill(str(root.parent))
+                page.get_by_label("验证需求").fill("Keep this unsent request.")
+                page.get_by_role("button", name="浏览工程目录", exact=True).click(timeout=3000)
+                dialog = page.get_by_role("dialog", name="选择工程目录")
+                expect(dialog).to_be_visible()
+                expect(dialog).to_contain_text("Worker 所在机器")
+                dialog.get_by_role("button", name=root.name, exact=True).click()
+                expect(dialog.get_by_label("目录地址")).to_have_value(str(root))
+                dialog.get_by_role("button", name="上一级", exact=True).click()
+                expect(dialog.get_by_label("目录地址")).to_have_value(str(root.parent))
+                dialog.get_by_role("button", name=root.name, exact=True).click()
+                dialog.get_by_role("button", name="选择此目录", exact=True).click()
+                expect(dialog).not_to_be_visible()
+                expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
+                expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
+
+                page.get_by_role("button", name="浏览输出根目录", exact=True).click()
+                dialog = page.get_by_role("dialog", name="选择输出根目录")
+                expect(dialog).to_contain_text("Agent 所在机器")
+                expect(dialog.get_by_label("目录地址")).to_have_value(str(home))
+                dialog.get_by_role("button", name="chosen outputs", exact=True).click()
+                expect(dialog.get_by_label("目录地址")).to_have_value(str(output))
+                dialog.get_by_role("button", name="主目录", exact=True).click()
+                expect(dialog.get_by_label("目录地址")).to_have_value(str(home))
+                dialog.get_by_label("目录地址").fill(str(output))
+                expect(dialog.get_by_role("button", name="选择此目录")).to_be_disabled()
+                dialog.get_by_label("目录地址").press("Enter")
+                dialog.get_by_role("button", name="选择此目录", exact=True).click()
+                expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(output))
+                expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
+                expect(page.get_by_label("验证需求")).to_have_value("Keep this unsent request.")
+                assert not runtime.store.recent()
+                assert not model.seen
+                assert not backend.calls
+                assert errors == []
+            finally:
+                browser.close()
+
+
+def test_browser_browse_cancel_and_errors_preserve_input(project, tmp_path):
+    runtime, backend, model, _ = runtime_fixture(tmp_path)
+    root = tmp_path / "outputs"
+    root.mkdir()
+    (root / "child").mkdir()
+    with (
+        serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.goto(url)
+            page.get_by_label("输出根目录", exact=True).fill(str(root))
+            page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
+            dialog = page.get_by_role("dialog", name="选择输出根目录")
+            dialog.get_by_role("button", name="child", exact=True).click()
+            expect(dialog.get_by_label("目录地址")).to_have_value(str(root / "child"))
+            page.keyboard.press("Escape")
+            expect(dialog).not_to_be_visible()
+            expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(root))
+            page.get_by_role("button", name="浏览输出根目录", exact=True).click()
+            expect(dialog.get_by_role("button", name="选择此目录")).to_be_enabled()
+            dialog.get_by_label("目录地址").fill(str(root / "missing"))
+            dialog.get_by_role("button", name="前往", exact=True).click()
+            expect(dialog.get_by_role("alert")).to_contain_text("missing")
+            expect(dialog.get_by_role("button", name="选择此目录")).to_be_disabled()
+            expect(dialog.locator("#directory-list button")).to_have_count(0)
+            dialog.get_by_role("button", name="取消", exact=True).click()
+            expect(dialog).not_to_be_visible()
+            expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(root))
+            assert not (root / "missing").exists()
+            assert not runtime.store.recent()
+            assert not model.seen
+            assert not backend.calls
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("late_status", [200, 503])
+def test_browser_browse_ignores_late_response_after_cancel_and_reopen(
+    project, tmp_path, late_status
+):
+    runtime, _, _, _ = runtime_fixture(tmp_path)
+    with (
+        serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        pending = []
+        page.route("**/api/directories?**", lambda route: pending.append(route))
+        try:
+            page.goto(url)
+            page.get_by_label("输出根目录", exact=True).fill("/keep-output")
+            with page.expect_request("**/api/directories?**"):
+                page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
+            page.keyboard.press("Escape")
+            with page.expect_request("**/api/directories?**"):
+                page.get_by_role("button", name="浏览工程目录", exact=True).click()
+            assert len(pending) == 2
+            chosen = r"D:\worker-projects"
+            pending[1].fulfill(
+                json={"path": chosen, "parent": "D:\\", "directories": [], "truncated": False}
+            )
+            dialog = page.get_by_role("dialog", name="选择工程目录")
+            expect(dialog.get_by_label("目录地址")).to_have_value(chosen)
+            late_body = (
+                {"path": "/stale", "parent": "/", "directories": [], "truncated": False}
+                if late_status == 200 else {"detail": "stale directory error"}
+            )
+            with page.expect_request_finished(
+                lambda request: request.url == pending[0].request.url
+            ):
+                pending[0].fulfill(status=late_status, json=late_body)
+            page.evaluate("() => new Promise(requestAnimationFrame)")
+            expect(dialog.get_by_label("目录地址")).to_have_value(chosen)
+            expect(dialog.get_by_role("alert")).not_to_be_visible()
+            dialog.get_by_role("button", name="选择此目录", exact=True).click()
+            expect(page.get_by_label("工程目录", exact=True)).to_have_value(chosen)
+            expect(page.get_by_label("输出根目录", exact=True)).to_have_value("/keep-output")
+            assert not runtime.store.recent()
+        finally:
+            browser.close()
+
+
+def test_browser_browse_pending_response_cannot_overwrite_edited_address(project, tmp_path):
+    runtime, _, _, _ = runtime_fixture(tmp_path)
+    with (
+        serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        pending = []
+        page.route("**/api/directories?**", lambda route: pending.append(route))
+        try:
+            page.goto(url)
+            with page.expect_request("**/api/directories?**"):
+                page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
+            dialog = page.get_by_role("dialog", name="选择输出根目录")
+            dialog.get_by_label("目录地址").fill("/new-address")
+            with page.expect_request_finished():
+                pending[0].fulfill(
+                    json={"path": "/old", "parent": "/", "directories": [], "truncated": False}
+                )
+            page.evaluate("() => new Promise(requestAnimationFrame)")
+            expect(dialog.get_by_label("目录地址")).to_have_value("/new-address")
+            expect(dialog.get_by_role("button", name="选择此目录")).to_be_disabled()
+            page.locator("#new-conversation").evaluate("(button) => button.click()")
+            expect(dialog).not_to_be_visible()
+            expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
+        finally:
+            browser.close()
+
+
+def test_browser_browse_buttons_are_disabled_while_sending(project, tmp_path):
+    runtime, _, _, _ = runtime_fixture(tmp_path)
+    with (
+        serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        pending = []
+        page.route(
+            "**/api/conversations",
+            lambda route: pending.append(route) if route.request.method == "POST"
+            else route.continue_(),
+        )
+        try:
+            page.goto(url)
+            project_browse = page.get_by_role("button", name="浏览工程目录", exact=True)
+            output_browse = page.get_by_role("button", name="浏览输出根目录", exact=True)
+            expect(project_browse).to_be_enabled(timeout=3000)
+            expect(output_browse).to_be_enabled()
+            page.get_by_label("验证需求").fill("Plan later.")
+            with page.expect_request(lambda request: request.method == "POST"):
+                page.get_by_role("button", name="发送", exact=True).click()
+            expect(project_browse).to_be_disabled()
+            expect(output_browse).to_be_disabled()
+            page.get_by_role("button", name="新建会话", exact=True).click()
+            pending[0].fulfill(status=503, json={"detail": "old send failed"})
+            expect(project_browse).to_be_enabled()
+            expect(output_browse).to_be_enabled()
+            expect(page.get_by_role("dialog")).not_to_be_visible()
+        finally:
+            browser.close()
 
 
 def test_browser_directory_conversation_confirmation_delivery_and_history(project, tmp_path):
@@ -27,7 +432,7 @@ def test_browser_directory_conversation_confirmation_delivery_and_history(projec
         try:
             page.goto(url)
             expect(page.get_by_role("heading", name="目录验证 Agent")).to_be_visible()
-            page.get_by_label("工程目录").fill(str(root))
+            page.get_by_label("工程目录", exact=True).fill(str(root))
             page.get_by_label("验证需求").fill("Perform pitch step verification.")
             page.get_by_role("button", name="发送", exact=True).click()
             expect(page.locator("#baseline")).to_contain_text("v1", timeout=10000)
@@ -285,7 +690,7 @@ def test_browser_interrupted_execution_can_resume_without_duplicate_submission(p
         page = browser.new_page()
         try:
             page.goto(url)
-            page.get_by_label("工程目录").fill(str(root))
+            page.get_by_label("工程目录", exact=True).fill(str(root))
             page.get_by_label("验证需求").fill("Verify pitch step.")
             page.get_by_role("button", name="发送", exact=True).click()
             expect(page.locator("#baseline")).to_contain_text("v1", timeout=10000)
@@ -317,7 +722,7 @@ def test_browser_renders_model_messages_as_text_and_keeps_failed_input(project, 
         page = browser.new_page()
         try:
             page.goto(url)
-            page.get_by_label("工程目录").fill(str(root))
+            page.get_by_label("工程目录", exact=True).fill(str(root))
             page.get_by_label("验证需求").fill("Clarify the project.")
             page.get_by_role("button", name="发送", exact=True).click()
             expect(page.locator("#messages")).to_contain_text(injection, timeout=10000)

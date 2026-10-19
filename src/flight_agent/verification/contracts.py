@@ -6,7 +6,18 @@ from typing import Annotated, Literal, Self
 from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from ..models import Contract, FiniteNumber, Nonempty
+from ..runtime.contracts import AnalysisRun, AnalysisSpec
 from ..upload_models import finite_json
+from .diagnosis_contracts import (
+    DiagnosisBaseline,
+    DiagnosisPlanRevision,
+    DiagnosisProposal,
+    DiagnosisTermination,
+    DiagnosticRound,
+    HypothesisAssessment,
+    PendingAnalysis,
+)
+from .diagnostic_data import DiagnosticProject
 
 AnalysisKind = Literal["step_response", "stability_margins"]
 EvaluationStatus = Literal["pass", "fail", "undetermined"]
@@ -449,6 +460,7 @@ class ConversationMessage(Contract):
 
 
 class VerificationTask(MutableRecord):
+    scenario: Literal["d1"] = "d1"
     id: Identifier
     project: ProjectDescriptor
     baseline: EvaluationBaseline
@@ -458,6 +470,9 @@ class VerificationTask(MutableRecord):
     nodes: list[ExecutionNode]
     calls: list[ToolCall] = []
     decisions: list[Decision] = []
+    analysis_runs: list[AnalysisRun] = []
+    evaluation_runs: list[AnalysisRun] = []
+    pending_specs: dict[AnalysisKind, AnalysisSpec] = {}
     result: AnalysisResult | None = None
     evaluation: Evaluation | None = None
     artifacts: list[Artifact] = []
@@ -473,6 +488,34 @@ class VerificationTask(MutableRecord):
     replan_error: str | None = None
 
 
+class DiagnosisTask(MutableRecord):
+    scenario: Literal["d2"] = "d2"
+    id: Identifier
+    project: DiagnosticProject
+    baseline: DiagnosisBaseline
+    proposal: DiagnosisProposal
+    result_directory: Nonempty
+    output_root: str | None = None
+    stage: str = "awaiting_confirmation"
+    nodes: list[ExecutionNode] = []
+    calls: list[ToolCall] = []
+    decisions: list[Decision] = []
+    analysis_runs: list[AnalysisRun] = []
+    plan_revisions: list[DiagnosisPlanRevision] = []
+    rounds: list[DiagnosticRound] = []
+    assessments: list[HypothesisAssessment] = []
+    artifacts: list[Artifact] = []
+    input_snapshot: DiagnosticProject | None = None
+    pending_analysis: PendingAnalysis | None = None
+    termination: DiagnosisTermination | None = None
+    started_at: str | None = None
+    dispatch_count: Annotated[int, Field(strict=True, ge=0, le=40)] = 0
+    no_progress_rounds: Annotated[int, Field(strict=True, ge=0)] = 0
+
+
+Task = VerificationTask | DiagnosisTask
+
+
 ConversationStatus = Literal[
     "planning", "waiting_for_user", "running", "completed", "failed", "interrupted"
 ]
@@ -485,14 +528,15 @@ class ConversationState(Contract):
 
 
 class Conversation(MutableRecord):
+    scenario: Literal["d1", "d2"] = "d1"
     id: Identifier
     created_at: Nonempty
     updated_at: Nonempty
     status: ConversationStatus = "waiting_for_user"
     project_root: str | None = None
     output_root: str | None = None
-    task: VerificationTask | None = None
-    archived_tasks: list[VerificationTask] = []
+    task: Task | None = None
+    archived_tasks: list[Task] = []
     pending_decision: PendingDecision | None = None
     messages: list[ConversationMessage] = []
     error: str | None = None

@@ -3,28 +3,46 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from threading import Lock
+from typing import Literal
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
 from .agent import execute_agent
 from .config import ModelSettings, create_model
+from .directories import (
+    DirectoryListing,
+    NativeDirectoryError,
+    browse_directories,
+    choose_native_directory,
+)
 from .jobs import BusyError, JobManager, JobStore
 from .models import AnalysisResult, Parameters, validate_result_context
-from .remote import RemoteWorker
+from .remote import RemoteError, RemoteWorker
 from .service import BodyLimitMiddleware, artifact_response, install_validation_handler, safe_log
 from .session import AnalysisSession
 from .upload_models import JobRecord, UploadRequest
+from .verification.backend import RemoteSimulinkBackend
 from .verification.routes import verification_router
 from .verification.runtime import VerificationRuntime
 
 
 class AnalysisRequest(BaseModel):
     request: str = Field(min_length=1, max_length=2000)
+
+
+class DirectorySelectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    target: Literal["project", "output"]
+    scenario: Literal["d1", "d2"] = "d1"
+    path: str = Field(default="", max_length=4096)
 
 
 class CachedRunner:
@@ -38,13 +56,17 @@ class CachedRunner:
 
 
 def create_web_app(
-    root: Path, *, verification_runtime: VerificationRuntime | None = None
+    root: Path,
+    *,
+    verification_runtime: VerificationRuntime | None = None,
+    native_directory_picker: bool = False,
 ) -> FastAPI:
     root = root.resolve()
     store = JobStore(root / "runs" / "web")
     manager = JobManager(store)
     token = secrets.token_urlsafe(32)
     static = Path(__file__).parent / "static"
+    native_picker_lock = Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -129,7 +151,62 @@ def create_web_app(
             "model_configured": model_error is None,
             "model_error": model_error,
             "trusted_code_only": True,
+            "native_directory_picker": native_directory_picker,
         }
+
+    @app.get("/api/directories", dependencies=auth)
+    def directories(
+        target: Literal["project", "output"],
+        path: str = Query(default="", max_length=4096),
+        scenario: Literal["d1", "d2"] = "d1",
+    ) -> DirectoryListing:
+        if target == "project" and scenario == "d1":
+            try:
+                return RemoteSimulinkBackend.from_environment().browse(path)
+            except (ValueError, RemoteError) as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+        try:
+            return browse_directories(path)
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/directories/select", dependencies=auth)
+    def select_directory(request: DirectorySelectionRequest) -> dict[str, str | None]:
+        if not native_directory_picker:
+            raise HTTPException(
+                status_code=409,
+                detail="Native directory selection requires --native-directory-picker",
+            )
+        if request.target == "project" and request.scenario == "d1":
+            try:
+                worker = RemoteWorker.from_environment()
+            except ValueError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            if urlsplit(worker.url).hostname not in ("127.0.0.1", "localhost", "::1"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Native project selection requires the Worker on the same machine",
+                )
+        if not native_picker_lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="A native directory picker is already open")
+        try:
+            return {
+                "path": choose_native_directory(
+                    request.path,
+                    title=(
+                        "选择诊断数据目录"
+                        if request.target == "project" and request.scenario == "d2"
+                        else "选择工程目录" if request.target == "project"
+                        else "选择输出根目录"
+                    ),
+                )
+            }
+        except NativeDirectoryError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except (ValueError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            native_picker_lock.release()
 
     @app.get("/api/examples/{name}", dependencies=auth)
     def example(name: str) -> FileResponse:

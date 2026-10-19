@@ -28,7 +28,9 @@ plans, selects available capabilities, organizes reports and explains recorded
 evidence. It cannot execute arbitrary MATLAB, change model/control parameters,
 invent missing signals or override numerical results.
 
-Root-cause diagnosis, optimization, automatic trimming, model/topology editing,
+Adaptive diagnosis is a separate D2 scenario described in `docs/d2-agent.md`;
+it does not change D1's fixed verification workflow. Unique root-cause proof,
+optimization, automatic trimming, model/topology editing,
 autonomous signal/analysis-point selection and a working Simate adapter are out
 of scope. A Simate capability can be represented but must report unsupported
 until an adapter is implemented.
@@ -65,6 +67,47 @@ clarification before discovery or an LLM call. Project paths can use POSIX,
 Windows drive or UNC syntax appropriate to the worker. An output root must be
 an absolute path usable on the **Agent/Web host**, not a remote worker path.
 Later messages can select a different project or output root.
+
+Both directory fields also offer **浏览…** (Browse). By default, the in-page picker lists
+engineering directories on the **Worker host** and output directories on the
+**Agent/Web host**; it does not open the browser computer's filesystem or
+transfer files. On a same-machine deployment these are local directories.
+The picker starts at the field's current path, or the service account's home
+directory when empty. It supports parent/child navigation, home, and a manually
+entered absolute address, including another drive on a Windows worker.
+
+Browsing is read-only: only immediate, non-symlink subdirectories are listed,
+sorted by name, with at most 500 entries and a visible truncation notice.
+No file contents are read and no directories are created. Invalid paths,
+permission failures and unavailable workers produce errors rather than a
+fallback to a different host. Project browsing requires the existing Worker
+credentials and `MATLAB_ALLOW_TRUSTED_PROJECTS=1`. Web listing requests also
+retain the Web token and same-origin checks.
+
+For a **same-machine macOS desktop** deployment, start Web with
+`flight-agent web --native-directory-picker --port 8000` instead. Both Browse
+buttons then open the system folder chooser on the Web host, starting at the
+field's current directory or the service account's home when empty. Confirming
+fills the canonical absolute path; cancelling leaves the field unchanged.
+Browser, Web and Worker must actually be on that same desktop: a loopback
+Worker URL routed through an SSH tunnel does not qualify. The explicit flag
+asserts this topology; non-loopback Worker URLs are rejected for project
+selection. Remote, headless and non-macOS deployments should keep the default
+in-page picker.
+
+Native selection retains Web token and same-origin checks, accepts one dialog
+at a time and times out after 120 seconds. Invalid paths, desktop/permission
+failures and timeouts are shown as errors, never silently redirected to another
+host or picker. Selecting an existing folder does not create or read its files.
+
+In the in-page picker, **选择此目录** only fills the relevant field. Cancel/Escape
+leaves it unchanged; neither browsing nor selection submits a request, grants
+trust or runs project code. Directory inputs and Browse buttons are disabled
+while planning or executing, and while a native selection is pending. Late
+native responses cannot overwrite another conversation or an edited field.
+Manual path entry remains available, including a not-yet-created output root;
+the selected paths take effect only when sent with a verification request,
+under the existing source/output separation and confirmation rules.
 
 ### Project contract
 
@@ -192,6 +235,13 @@ new ID. An unknown remote state must be reconciled first. Threshold and report
 changes increment the baseline version, preserve previous deliveries and require
 confirmation even when numerical results are reusable.
 
+A saved in-flight request must be reconciled even when a numerical cache entry
+exists. Resume preserves the adapter version recorded with that request and
+checks the remaining confirmed specification fields, rather than treating a
+newly registered adapter as the executor of earlier work. Legacy requests with
+no recorded adapter version carry explicit `unrecorded` provenance and a
+warning; they are not attributed to the current adapter.
+
 After a saved worker run has been verified as failed or interrupted, repaired
 project contents can be rediscovered into a new, unconfirmed task. The old task
 is archived only after a replacement plan has been constructed successfully.
@@ -203,6 +253,48 @@ allowed until its state is known.
 Simple combined tasks normally produce one report. Explicit requests can split
 reports; significant organizational ambiguity prompts a persisted question.
 Changing report grouping never reruns a completed simulation.
+
+### Shared evidence and cache contracts
+
+D1 and D2 use the same strict design references, effect permissions, typed
+capability registration and immutable `AnalysisRun` receipts from
+`flight_agent.runtime`. D1 still executes its confirmed dependency graph; D2
+adds its own evidence-review policy rather than introducing an LLM call after
+each D1 numerical result. Existing conversation records without a scenario
+remain D1.
+
+An `AnalysisSpec` identifies the capability and adapter version, controller and
+plant versions/digests, optional candidate, exact inputs, data fingerprints,
+conditions and numerical policy. Its canonical fingerprint, rather than an
+analysis name alone, determines reuse. The task keeps an append-only list of
+analysis runs; its current numerical result is a projection, not a replacement
+for historical evidence. A different specification of the same analysis kind
+gets a distinct run.
+
+The cache layers have independent identities:
+
+| Layer | Identity and invalidation |
+|---|---|
+| Numerical analysis | Complete analysis specification, including project/configuration, trim, data and adapter version; no threshold/report-group dependency |
+| Deterministic evaluation | Verified numerical evidence, criteria, evaluation policy and evaluator version; changing a threshold creates a new evaluation |
+| Report rendering | Current baseline, evaluation, grouping and format; changing report organization creates a new delivery without recalculating numerical evidence |
+
+Numerical receipts are stored at `numerical/analysis-runs/<run-id>.json`;
+evaluation receipts use `evaluation/analysis-runs/<run-id>.json`. Receipt
+identity, specification, output digest and artifact hashes are checked before
+loading or reuse. Existing receipt files are not overwritten. Report reuse
+also verifies its recorded artifact integrity; a mutable audit-log addition
+alone is not a new numerical or rendering request. Moving output roots copies
+only eligible numerical evidence, not stale evaluation or delivery files.
+
+The shared contracts distinguish `read_only`, `execute_project`,
+`write_delivery`, `write_candidate` and `adopt_candidate`. Declaring an effect
+does not authorize it: execution needs the confirmed scope. Candidate writes
+require a source-separated candidate workspace, and adoption requires separate
+explicit approval bound to that candidate and baseline version. These are
+extension contracts for future D3-D6 work, not implemented optimization,
+topology editing or candidate-adoption workflows. They govern trusted local
+adapters and do not provide an operating-system sandbox.
 
 ### Controlled tool extensions
 
@@ -274,6 +366,7 @@ Each task has a unique result directory with:
 - Necessary raw/linearized `.mat` data.
 - `evaluation.json`: baseline, criteria, results and evidence references.
 - `execution_record.json`: plan versions, calls, state, decisions and errors.
+- Immutable numerical and evaluation receipts, separate from report rendering.
 - An artifact index, including report-to-analysis coverage.
 
 An optional `output_root` selects a results root on the Agent/Web host. The
@@ -348,7 +441,7 @@ are not multi-user authentication, and the worker is not a sandbox.
 | Route | Purpose |
 |---|---|
 | `GET /api/conversations` | Recent persisted conversations |
-| `POST /api/conversations` | Start with `message`, optional `project_root` and optional `output_root` |
+| `POST /api/conversations` | Start with `message`, optional `project_root`, `output_root` and `scenario` (default `d1`) |
 | `GET /api/conversations/{id}` | Baseline, pending decision, plan, calls, status and artifact manifest |
 | `POST /api/conversations/{id}/messages` | Continue with `message`; optionally select a new `project_root` or `output_root` |
 | `POST /api/conversations/{id}/confirm` | Confirm with `{"version": 1, "trusted": true}` using the current version |
@@ -368,6 +461,14 @@ in `message` can also select it; conflicting field and message selections
 require clarification. Clearing the browser's output field and sending a
 message performs the explicit reset. The persisted conversation and task each
 record their selected root; older records without the field retain the default.
+
+`scenario` may be `d1` or `d2` when creating a conversation and cannot switch
+within an existing conversation. D2 uses Agent-host data, does not dispatch to
+the MATLAB worker, and has its own confirmation and receipt-based resume policy.
+The D1 `retry` and failure-proposal `replan` endpoints are not D2 controls.
+`flight-agent directory-task` uses these authenticated local Web interfaces
+instead of opening another offline runtime against the same persisted store;
+commands and D2-specific fields are documented in `docs/d2-agent.md`.
 
 Web mutation responses are `202` acknowledgements, not completion claims; poll
 the conversation. Stale baseline/invalid state is rejected, not silently

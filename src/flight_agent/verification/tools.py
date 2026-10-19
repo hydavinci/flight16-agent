@@ -6,9 +6,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Generic, Literal, TypeVar
 
-from pydantic import BaseModel, JsonValue
+from pydantic import JsonValue
 
 from ..models import Contract, Nonempty
+from ..runtime.capabilities import Capability, CapabilityRegistry
+from ..runtime.contracts import (
+    AnalysisSpec,
+    DesignContext,
+    DesignReference,
+    Effect,
+    ExecutionScope,
+    fingerprint,
+)
 from ..upload_models import finite_json
 from .artifacts import verify_artifact
 from .contracts import (
@@ -27,6 +36,7 @@ ToolInput = TypeVar("ToolInput", bound=Contract)
 ToolOutput = TypeVar("ToolOutput", bound=Contract)
 BuiltinOperation = Callable[[Conversation, VerificationTask, bool], dict[str, JsonValue]]
 RESERVED = frozenset({"confirmed_baseline", "numerical_result", "evaluation", "delivery"})
+SIMULINK_ANALYSIS_VERSION = "1"
 
 
 @dataclass(frozen=True)
@@ -77,20 +87,27 @@ class _Invocation:
 class _Entry:
     name: str
     description: str
-    input_model: type[BaseModel]
-    output_model: type[BaseModel]
+    input_model: type[Contract]
+    output_model: type[Contract]
     requires: frozenset[str]
     provides: frozenset[str]
     permission: str
-    operation: Callable[[_Invocation], object]
+    operation: Callable[[_Invocation], Contract]
 
 
-def _output(model: type[BaseModel], value: object) -> dict[str, JsonValue]:
-    if isinstance(value, BaseModel):
-        value = value.model_dump(warnings=False)
-    output = model.model_validate(value)
-    finite_json(output.model_dump())
-    return output.model_dump(mode="json")
+def _design(task: VerificationTask) -> DesignContext:
+    return DesignContext(
+        controller=DesignReference(
+            id="project-controller",
+            version=task.project.fingerprint,
+            sha256=task.project.fingerprint,
+        ),
+        plant=DesignReference(
+            id="project-plant",
+            version=task.project.fingerprint,
+            sha256=task.project.fingerprint,
+        ),
+    )
 
 
 def _read_context(invocation: _Invocation) -> ToolContext:
@@ -127,6 +144,7 @@ class ToolRegistry:
         self, analyze: BuiltinOperation, evaluate: BuiltinOperation, deliver: BuiltinOperation
     ):
         self._entries: dict[str, _Entry] = {}
+        self._capabilities: CapabilityRegistry[_Invocation] = CapabilityRegistry()
         self._builtin(
             "analyze_project",
             "Run or reuse registered numerical analyses.",
@@ -160,21 +178,45 @@ class ToolRegistry:
         name: str,
         description: str,
         operation: BuiltinOperation,
-        output: type[BaseModel],
+        output: type[Contract],
         permission: str,
         requires: set[str],
         provides: set[str],
     ) -> None:
-        self._entries[name] = _Entry(
-            name,
-            description,
-            _NoInput,
-            output,
-            frozenset(requires),
-            frozenset(provides),
-            permission,
-            lambda call: operation(call.conversation, call.task, call.resume),
+        self._install(
+            _Entry(
+                name,
+                description,
+                _NoInput,
+                output,
+                frozenset(requires),
+                frozenset(provides),
+                permission,
+                lambda call: output.model_validate(
+                    operation(call.conversation, call.task, call.resume)
+                ),
+            ),
+            version=SIMULINK_ANALYSIS_VERSION if name == "analyze_project" else "1",
         )
+
+    def _install(self, entry: _Entry, *, version: str = "1") -> None:
+        effect: Effect = (
+            "execute_project" if entry.permission == "execute_project"
+            else "write_delivery" if entry.permission == "write_delivery"
+            else "read_only"
+        )
+        self._capabilities.register(
+            Capability(
+                name=entry.name,
+                version=version,
+                description=entry.description,
+                input_model=entry.input_model,
+                output_model=entry.output_model,
+                effect=effect,
+                operation=lambda invocation, inputs: entry.operation(invocation),
+            )
+        )
+        self._entries[entry.name] = entry
 
     def register(self, tool: ReadOnlyTool[ToolInput, ToolOutput]) -> None:
         if not isinstance(tool, ReadOnlyTool) or tool.permission != "read_only":
@@ -197,15 +239,17 @@ class ToolRegistry:
             inputs = tool.input_model.model_validate(call.node.inputs)
             return tool.operation(_read_context(call), inputs)
 
-        self._entries[tool.name] = _Entry(
-            tool.name,
-            tool.description,
-            tool.input_model,
-            tool.output_model,
-            frozenset(tool.requires),
-            frozenset(tool.provides),
-            tool.permission,
-            invoke,
+        self._install(
+            _Entry(
+                tool.name,
+                tool.description,
+                tool.input_model,
+                tool.output_model,
+                frozenset(tool.requires),
+                frozenset(tool.provides),
+                tool.permission,
+                invoke,
+            )
         )
 
     def _entry(self, name: str) -> _Entry:
@@ -217,6 +261,7 @@ class ToolRegistry:
         return [
             {
                 "name": entry.name,
+                "version": self._capabilities.definition(entry.name).version,
                 "description": entry.description,
                 "permission": entry.permission,
                 "requires": sorted(entry.requires),
@@ -256,7 +301,50 @@ class ToolRegistry:
     def invoke(
         self, node: PlanNode, conversation: Conversation, task: VerificationTask, *, resume: bool
     ) -> dict[str, JsonValue]:
-        entry = self._entry(node.tool)
-        entry.input_model.model_validate(node.inputs)
+        self._entry(node.tool)
         invocation = _Invocation(conversation, task, node, resume)
-        return _output(entry.output_model, entry.operation(invocation))
+        return self._capabilities.invoke(
+            node.tool,
+            node.inputs,
+            invocation,
+            ExecutionScope(
+                baseline_version=task.baseline.version,
+                confirmed=task.baseline.confirmed,
+                design=_design(task),
+                allowed_effects=("read_only", "execute_project", "write_delivery"),
+            ),
+        )
+
+    def analysis_spec(self, task: VerificationTask, kind: AnalysisKind) -> AnalysisSpec:
+        return AnalysisSpec(
+            capability="analyze_project",
+            capability_version=self._capabilities.definition("analyze_project").version,
+            design=_design(task),
+            inputs={
+                "analysis": kind,
+                "trim_point": task.baseline.trim_point,
+                "project_fingerprint": task.project.fingerprint,
+            },
+            data_fingerprints={item.path: item.sha256 for item in task.project.files},
+            conditions=task.project.config.model_dump(mode="json"),
+            numerics={"steady_state": task.baseline.steady_state.model_dump(mode="json")},
+        )
+
+    def evaluation_spec(self, task: VerificationTask) -> AnalysisSpec:
+        if task.result is None:
+            raise ValueError("Evaluation requires recorded numerical evidence")
+        return AnalysisSpec(
+            capability="evaluate_results",
+            capability_version=self._capabilities.definition("evaluate_results").version,
+            design=_design(task),
+            inputs={
+                "analyses": list(task.baseline.analyses),
+                "criteria": [item.model_dump(mode="json") for item in task.baseline.criteria],
+                "trim_point": task.baseline.trim_point,
+                "steady_state": task.baseline.steady_state.model_dump(mode="json"),
+            },
+            data_fingerprints={
+                "numerical_result": fingerprint(task.result.model_dump(mode="json"))
+            },
+            conditions={"project_fingerprint": task.baseline.project_fingerprint},
+        )

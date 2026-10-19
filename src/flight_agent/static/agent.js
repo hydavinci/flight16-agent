@@ -8,6 +8,8 @@ const statuses = {
 };
 const tools = {
   analyze_project: "工程分析", evaluate_results: "确定性评价", deliver_report: "报告交付",
+  window_statistics: "窗口统计", compare_signals: "对齐比较",
+  parameter_sensitivity: "记录参数敏感性", local_loop: "局部环路分析",
 };
 const analyses = {step_response: "时域响应", stability_margins: "稳定裕度"};
 const metricAnalyses = {
@@ -24,6 +26,10 @@ let sending = false;
 let timer = null;
 let baselineKey = "";
 let historyRequest = 0;
+let directoryPicker = null;
+let directoryRequest = 0;
+let nativeDirectoryPickerEnabled = false;
+let nativePicker = null;
 
 function element(tag, text, className) {
   const node = document.createElement(tag);
@@ -75,17 +81,165 @@ function active() {
   return current && ["planning", "running"].includes(current.status);
 }
 
+function scenario() {
+  return current?.scenario || $("scenario").value;
+}
+
+function renderScenario() {
+  const diagnosis = scenario() === "d2";
+  $("project-label").textContent = diagnosis ? "诊断数据目录" : "工程目录";
+  $("request-label").textContent = diagnosis ? "诊断需求" : "验证需求";
+  $("project-root").placeholder = diagnosis
+    ? "Agent 所在机器上包含 flight-diagnosis.json 的目录"
+    : "MATLAB Worker 可见的工程目录，例如 D:\\F16_package";
+  $("browse-project").setAttribute("aria-label", diagnosis ? "浏览诊断数据目录" : "浏览工程目录");
+  $("project-hint").textContent = diagnosis
+    ? "D2 数据位于 Agent 所在机器，不需要 MATLAB Worker。只读取已登记的有界 JSON 数据；不上传或执行源工程。"
+    : "路径属于 Worker 所在机器；也可在聊天中写“工程目录：/绝对路径”。路径包含空格时请用引号包围，执行前仍需单独确认可信工程。";
+  $("message").placeholder = diagnosis
+    ? "说明异常现象、候选原因、需要对比的数据与时间窗；未知项将明确记录。"
+    : "说明分析类型、评价阈值和报告分组；也可追问已有结果。";
+  $("composer-hint").textContent = diagnosis
+    ? "确认只读能力和预算后，每轮根据真实回执更新假设、选择下一步或停止。"
+    : "更改阈值或报告分组会复用有效证据；增加分析只运行缺失分支。";
+  $("scenario-boundary").textContent = diagnosis
+    ? "D2 仅对已登记的时序和频响数据进行只读诊断，记录支持、反驳、未知项与停止原因。不修改设计，不把关联当成因果证明；合成示例不代表真实工程验收。"
+    : "D1 仅支持已注册的 Simulink 工程、配平点 1 的时域响应与稳定裕度。不修改源工程、控制律或模型拓扑，不自动配平、调参或推断故障根因。没有确认判据或有效证据时，结论为 UNDETERMINED。";
+}
+
 function controls() {
-  const busy = !token || sending || active();
+  const busy = !token || sending || active() || nativePicker;
   $("send").disabled = Boolean(busy);
   $("project-root").disabled = Boolean(busy);
   $("output-root").disabled = Boolean(busy);
+  $("scenario").disabled = Boolean(busy || current);
+  for (const target of ["project", "output"]) {
+    $(`browse-${target}`).disabled = Boolean(busy);
+    $(`browse-${target}`).textContent = nativePicker?.target === target ? "正在选择…" : "浏览…";
+  }
   $("message").disabled = Boolean(busy);
   $("confirm").disabled = Boolean(busy || !$("trusted").checked);
   $("retry").disabled = Boolean(busy || !$("trusted").checked);
   $("replan").disabled = Boolean(busy || !$("trusted").checked);
   $("resume").disabled = Boolean(busy);
   $("trusted").disabled = Boolean(busy);
+  if (busy && directoryPicker) closeDirectoryPicker();
+}
+
+function directoryControls() {
+  $("directory-up").disabled = !directoryPicker?.parent;
+  $("directory-choose").disabled = !directoryPicker?.path
+    || $("directory-address").value !== directoryPicker.path
+    || directoryPicker.selection !== selection || !token || sending || Boolean(active());
+}
+
+function closeDirectoryPicker() {
+  directoryPicker = null;
+  directoryRequest += 1;
+  if ($("directory-picker").open) $("directory-picker").close();
+}
+
+function resetDirectoryListing(status) {
+  if (!directoryPicker) return;
+  directoryRequest += 1;
+  directoryPicker.path = null;
+  directoryPicker.parent = null;
+  $("directory-list").replaceChildren();
+  $("directory-error").hidden = true;
+  $("directory-error").textContent = "";
+  $("directory-status").textContent = status;
+  directoryControls();
+}
+
+async function loadDirectory(path) {
+  const picker = directoryPicker;
+  if (!picker || picker.selection !== selection || !token || sending || active()) return;
+  $("directory-address").value = path;
+  resetDirectoryListing("正在读取目录…");
+  const request = directoryRequest;
+  const relevant = () => picker === directoryPicker && request === directoryRequest
+    && picker.selection === selection && $("directory-picker").open;
+  try {
+    const query = new URLSearchParams({target: picker.target, path});
+    if (scenario() === "d2") query.set("scenario", "d2");
+    const listing = await api(`/api/directories?${query}`);
+    if (!relevant()) return;
+    picker.path = listing.path;
+    picker.parent = listing.parent;
+    $("directory-address").value = listing.path;
+    $("directory-list").replaceChildren(...listing.directories.map((directory) => {
+      const item = element("li");
+      const button = element("button", directory.name);
+      button.type = "button";
+      button.addEventListener("click", () => loadDirectory(directory.path));
+      item.append(button);
+      return item;
+    }));
+    $("directory-status").textContent = listing.truncated
+      ? `仅显示前 ${listing.directories.length} 个子目录；可输入完整地址访问其他目录。`
+      : listing.directories.length ? `${listing.directories.length} 个子目录` : "此目录没有子目录。";
+    directoryControls();
+  } catch (error) {
+    if (!relevant()) return;
+    $("directory-status").textContent = "";
+    $("directory-error").textContent = `无法浏览目录：${error.message}`;
+    $("directory-error").hidden = false;
+  }
+}
+
+async function chooseNativeDirectory(target) {
+  const input = $(`${target}-root`);
+  const picker = {target, selection, value: input.value};
+  nativePicker = picker;
+  notice("");
+  controls();
+  const relevant = () => nativePicker === picker && picker.selection === selection
+    && input.value === picker.value;
+  try {
+    const body = {target, path: picker.value};
+    if (scenario() === "d2") body.scenario = "d2";
+    const result = await api("/api/directories/select", {
+      method: "POST", body,
+    });
+    if (!relevant()) return;
+    if (!result || (result.path !== null && (
+      typeof result.path !== "string" || !result.path.startsWith("/") || result.path.length > 4096
+    ))) {
+      throw new Error("目录选择器返回了无效路径。");
+    }
+    if (result.path !== null) input.value = result.path;
+  } catch (error) {
+    if (relevant()) notice(`无法选择目录：${error.message}`);
+  } finally {
+    if (nativePicker === picker) {
+      nativePicker = null;
+      controls();
+    }
+  }
+}
+
+function openDirectoryPicker(target) {
+  if (!token || sending || active() || nativePicker) return;
+  if (nativeDirectoryPickerEnabled) {
+    chooseNativeDirectory(target);
+    return;
+  }
+  closeDirectoryPicker();
+  directoryPicker = {target, selection, path: null, parent: null};
+  $("directory-title").textContent = target === "project"
+    ? scenario() === "d2" ? "选择诊断数据目录" : "选择工程目录" : "选择输出根目录";
+  $("directory-host").textContent = target === "project" && scenario() !== "d2"
+    ? "浏览 Worker 所在机器的目录；不会上传浏览器所在机器的文件。"
+    : "浏览 Agent 所在机器的目录；不是远程 Worker 的目录。";
+  $("directory-picker").showModal();
+  loadDirectory($(`${target}-root`).value.trim());
+}
+
+function chooseDirectory() {
+  directoryControls();
+  if ($("directory-choose").disabled || !$("directory-picker").open) return;
+  $(`${directoryPicker.target}-root`).value = directoryPicker.path;
+  closeDirectoryPicker();
 }
 
 function table(headers, rows) {
@@ -117,7 +271,26 @@ function renderBaseline(task) {
   const key = `${current.id}/${task.id}/${baseline.version}/${current.pending_decision?.kind || ""}`;
   if (key !== baselineKey) $("trusted").checked = false;
   baselineKey = key;
-  $("baseline").replaceChildren(
+  const diagnosis = task.scenario === "d2";
+  $("baseline-heading").textContent = diagnosis ? "诊断基线" : "评价基线";
+  $("trust-text").textContent = diagnosis
+    ? "我已核对数据范围、只读能力与预算，同意按证据进行诊断"
+    : "我已核对基线，并确认该工程代码可信";
+  $("trust-warning").textContent = diagnosis
+    ? "只分析已登记的数据快照，不执行源工程代码、不修改控制器或模型。后续计划不得扩展已确认的范围与预算。"
+    : "工程初始化代码以 Worker 用户权限在隔离副本中执行。只允许你已审查并信任的工程。";
+  if (diagnosis) {
+    $("baseline").replaceChildren(
+      element("p", `D2 基线 v${baseline.version} · ${baseline.confirmed ? "已确认" : "尚未确认"}`),
+      element("p", baseline.objective),
+      element("p", `只读能力：${baseline.allowed_capabilities.join("、")}`),
+      element("p", `预算：${baseline.budget.max_rounds} 轮 / ${baseline.budget.max_calls} 次调用 / ${baseline.budget.max_seconds}s；连续 ${baseline.budget.max_no_progress} 轮无新证据即停止。`),
+      element("p", `数据指纹：${baseline.project_fingerprint}`, "hint"),
+      element("p", `成果目录（Agent 所在机器）：${task.result_directory}`, "hint"),
+      table(["假设", "待检验陈述"], baseline.hypotheses.map((item) => [item.id, item.statement])),
+      details("设计版本与已登记数据", {design: baseline.design, data: task.project.summary}),
+    );
+  } else $("baseline").replaceChildren(
     element("p", `基线 v${baseline.version} · 配平点 ${baseline.trim_point} · ${
       baseline.confirmed ? "已确认" : "尚未确认"
     }`),
@@ -154,6 +327,11 @@ function renderBaseline(task) {
 }
 
 function renderEvaluation(task) {
+  if (task.scenario === "d2") {
+    renderDiagnosis(task);
+    return;
+  }
+  $("evaluation-heading").textContent = "评价结果";
   const evaluation = task.evaluation;
   $("evaluation-card").hidden = !evaluation;
   $("evaluation").replaceChildren();
@@ -176,6 +354,33 @@ function renderEvaluation(task) {
   if (task.explanation_error) {
     $("explanation").textContent = `LLM 解释未完成：${task.explanation_error}。确定性评价不受影响。`;
   }
+}
+
+function renderDiagnosis(task) {
+  $("evaluation-heading").textContent = "诊断证据与未知项";
+  $("evaluation-card").hidden = !task.analysis_runs.length && !task.termination;
+  $("evaluation").replaceChildren();
+  $("explanation").textContent = "支持或反驳只针对已记录的数据与假设，不证明唯一物理根因或可放飞。";
+  const labels = {supported: "支持", refuted: "反驳", unknown: "未知"};
+  $("evaluation").append(
+    table(["假设", "证据状态", "理由", "引用"], task.assessments.map((item) => [
+      item.hypothesis_id, labels[item.status] || item.status, item.reason,
+      item.evidence.map((ref) => `${ref.run_id}${ref.metric ? ` / ${ref.metric}` : ""}`).join("\n"),
+    ])),
+    element("p", `已记录 ${task.analysis_runs.length} 个独立分析回执、${task.rounds.length} 轮证据评审。`),
+  );
+  if (task.termination) {
+    $("evaluation").append(element("p", `停止：${task.termination.reason} — ${task.termination.detail}`));
+    task.termination.unknowns.forEach((value) => {
+      $("evaluation").append(element("p", `未知 / 限制：${value}`, "hint"));
+    });
+  }
+  task.analysis_runs.forEach((run) => {
+    $("evaluation").append(details(`分析证据 ${run.id}`, {spec: run.spec, output: run.output}));
+  });
+  $("evaluation").append(details("追加式计划版本与证据评审", {
+    plans: task.plan_revisions, rounds: task.rounds,
+  }));
 }
 
 async function download(conversationId, taskId, artifact, button) {
@@ -227,6 +432,8 @@ function render(record, resetDirectories = false) {
     }
   }
   current = record;
+  $("scenario").value = record.scenario || "d1";
+  renderScenario();
   $("conversation-status").textContent = statuses[record.status] || record.status;
   $("messages").replaceChildren();
   record.messages.forEach((message) => {
@@ -300,6 +507,8 @@ async function history() {
 
 function clearConversation() {
   selection += 1;
+  closeDirectoryPicker();
+  nativePicker = null;
   clearTimeout(timer);
   current = null;
   sending = false;
@@ -317,6 +526,7 @@ function clearConversation() {
     button.setAttribute("aria-current", "false");
   });
   notice("");
+  renderScenario();
   controls();
 }
 
@@ -347,7 +557,7 @@ async function select(id) {
 
 async function send(event) {
   event.preventDefault();
-  if (sending || active() || !token) return;
+  if (sending || active() || nativePicker || !token) return;
   const message = $("message").value.trim();
   const root = $("project-root").value.trim();
   const output = $("output-root").value.trim();
@@ -358,6 +568,7 @@ async function send(event) {
   const generation = selection;
   const id = current ? current.id : null;
   const body = {message};
+  if (!id && scenario() === "d2") body.scenario = "d2";
   if (root !== (current?.project_root || "")) body.project_root = root || null;
   if (output !== (current?.output_root || "")) body.output_root = output;
   sending = true;
@@ -385,7 +596,7 @@ async function send(event) {
 }
 
 async function decide(action) {
-  if (!current || sending || active()) return;
+  if (!current || sending || active() || nativePicker) return;
   if (action !== "resume" && !$("trusted").checked) return;
   const generation = selection;
   const id = current.id;
@@ -413,6 +624,31 @@ async function decide(action) {
 }
 
 $("composer").addEventListener("submit", send);
+$("scenario").addEventListener("change", () => {
+  if (current || sending || active() || nativePicker) return;
+  closeDirectoryPicker();
+  $("project-root").value = "";
+  renderScenario();
+});
+$("browse-project").addEventListener("click", () => openDirectoryPicker("project"));
+$("browse-output").addEventListener("click", () => openDirectoryPicker("output"));
+$("directory-address-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  loadDirectory($("directory-address").value.trim());
+});
+$("directory-address").addEventListener("input", () => {
+  resetDirectoryListing("地址已修改，请点击“前往”读取目录。");
+});
+$("directory-up").addEventListener("click", () => {
+  if (directoryPicker?.parent) loadDirectory(directoryPicker.parent);
+});
+$("directory-home").addEventListener("click", () => loadDirectory(""));
+$("directory-cancel").addEventListener("click", closeDirectoryPicker);
+$("directory-choose").addEventListener("click", chooseDirectory);
+$("directory-picker").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeDirectoryPicker();
+});
 $("trusted").addEventListener("change", controls);
 $("confirm").addEventListener("click", () => decide("confirm"));
 $("resume").addEventListener("click", () => decide("resume"));
@@ -427,6 +663,7 @@ async function start() {
   try {
     const bootstrap = await api("/api/bootstrap");
     token = bootstrap.token;
+    nativeDirectoryPickerEnabled = bootstrap.native_directory_picker === true;
     $("worker-state").textContent = bootstrap.worker_configured
       ? "MATLAB Worker：已配置" : `MATLAB Worker：${bootstrap.worker_error}`;
     $("model-state").textContent = bootstrap.model_configured

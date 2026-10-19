@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>目录验证 Agent</title>
+  <title>目录验证 Agent · D1 / D2</title>
   <link rel="stylesheet" href="/static/agent.css">
   <script src="/static/agent.js" defer></script>
 </head>
 <body>
   <aside class="sidebar">
-    <div class="brand">FLIGHT / D1</div>
+    <div class="brand">FLIGHT / D1 + D2</div>
     <button id="new-conversation" type="button">新建会话</button>
     <h2>最近会话</h2>
     <nav id="conversation-history" aria-label="最近会话"></nav>
@@ -22,12 +22,12 @@
   <main>
     <header>
       <div>
-        <h1>目录验证 Agent</h1>
+        <h1>目录验证 Agent · D1 / D2</h1>
         <p>只读检查工程 · 确认基线 · 受控执行 · 证据交付</p>
       </div>
       <span id="conversation-status" class="badge" role="status">新会话</span>
     </header>
-    <p class="boundary">
+    <p id="scenario-boundary" class="boundary">
       D1 仅支持已注册的 Simulink 工程、配平点 1 的时域响应与稳定裕度。
       不修改源工程、控制律或模型拓扑，不自动配平、调参或推断故障根因。
       没有确认判据或有效证据时，结论为 UNDETERMINED。
@@ -37,25 +37,38 @@
       <h2 id="conversation-heading">验证会话</h2>
       <div id="messages" aria-live="polite"></div>
       <form id="composer">
-        <label for="project-root">工程目录</label>
-        <input id="project-root" type="text" maxlength="4096" autocomplete="off"
-               placeholder="MATLAB Worker 可见的工程目录，例如 D:\F16_package">
-        <p class="hint">
+        <label for="scenario">任务类型</label>
+        <select id="scenario">
+          <option value="d1">D1 · 确认式验证</option>
+          <option value="d2">D2 · 证据驱动诊断</option>
+        </select>
+        <label id="project-label" for="project-root">工程目录</label>
+        <div class="directory-field">
+          <input id="project-root" type="text" maxlength="4096" autocomplete="off"
+                 placeholder="MATLAB Worker 可见的工程目录，例如 D:\F16_package">
+          <button id="browse-project" type="button" aria-label="浏览工程目录"
+                  aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
+        </div>
+        <p id="project-hint" class="hint">
           路径属于 Worker 所在机器；也可在聊天中写“工程目录：/绝对路径”。
           路径包含空格时请用引号包围。这里只读取清单，执行前仍需单独确认可信工程。
         </p>
         <label for="output-root">输出根目录</label>
-        <input id="output-root" type="text" maxlength="4096" autocomplete="off"
-               placeholder="Agent 所在机器的绝对目录；留空使用默认位置">
+        <div class="directory-field">
+          <input id="output-root" type="text" maxlength="4096" autocomplete="off"
+                 placeholder="Agent 所在机器的绝对目录；留空使用默认位置">
+          <button id="browse-output" type="button" aria-label="浏览输出根目录"
+                  aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
+        </div>
         <p class="hint">
           不是远程 Worker 路径。每个任务新建独立子目录，不覆盖历史成果。
           可在聊天中写“输出目录：/绝对路径”；修改或清空目录栏后，随验证需求发送才会生效。
         </p>
-        <label for="message">验证需求</label>
+        <label id="request-label" for="message">验证需求</label>
         <textarea id="message" rows="3" maxlength="4000" required
                   placeholder="说明分析类型、评价阈值和报告分组；也可追问已有结果。"></textarea>
         <div class="composer-actions">
-          <span class="hint">更改阈值或报告分组会复用有效证据；增加分析只运行缺失分支。</span>
+          <span id="composer-hint" class="hint">更改阈值或报告分组会复用有效证据；增加分析只运行缺失分支。</span>
           <button id="send" type="submit" disabled>发送</button>
         </div>
       </form>
@@ -67,7 +80,7 @@
         <p id="decision-message"></p>
         <label id="trust-label" class="consent">
           <input id="trusted" type="checkbox">
-          我已核对基线，并确认该工程代码可信
+          <span id="trust-text">我已核对基线，并确认该工程代码可信</span>
         </label>
         <p id="trust-warning" class="hint">
           工程初始化代码以 Worker 用户权限在隔离副本中执行。只允许你已审查并信任的工程。
@@ -101,5 +114,29 @@
       <div id="artifacts"></div>
     </section>
   </main>
+  <dialog id="directory-picker" aria-labelledby="directory-title" aria-describedby="directory-host">
+    <h2 id="directory-title">选择目录</h2>
+    <p id="directory-host" class="hint"></p>
+    <form id="directory-address-form">
+      <label for="directory-address">目录地址</label>
+      <div class="directory-field">
+        <input id="directory-address" type="text" maxlength="4096" autocomplete="off"
+               placeholder="输入绝对目录，或留空打开主目录" autofocus>
+        <button type="submit">前往</button>
+      </div>
+    </form>
+    <div class="actions">
+      <button id="directory-up" type="button" disabled>上一级</button>
+      <button id="directory-home" type="button">主目录</button>
+    </div>
+    <p id="directory-status" class="hint" role="status"></p>
+    <p id="directory-error" role="alert" hidden></p>
+    <ul id="directory-list" aria-label="子目录"></ul>
+    <p class="hint">仅浏览现有文件夹；选择后只填写目录栏，不发送任务或执行工程。</p>
+    <div class="actions directory-actions">
+      <button id="directory-cancel" type="button">取消</button>
+      <button id="directory-choose" type="button" disabled>选择此目录</button>
+    </div>
+  </dialog>
 </body>
 </html>

@@ -9,7 +9,7 @@
 body { margin: 0; display: flex; min-height: 100vh; }
 [hidden] { display: none !important; }
 a { color: #8bbdf9; }
-button, input, textarea { font: inherit; }
+button, input, textarea, select { font: inherit; }
 button {
   border: 1px solid #425873;
   border-radius: 7px;
@@ -49,7 +49,16 @@ header p, .hint, .boundary { color: #a8b6c9; font-size: .86rem; line-height: 1.7
 .message[data-role="user"] { border-left: 3px solid #7daada; }
 .message strong { display: block; color: #9cbfe8; font-size: .8rem; margin-bottom: 7px; }
 label { display: block; margin: 12px 0 8px; }
-input[type="text"], textarea { width: 100%; color: inherit; background: #111c2a; border: 1px solid #40516a; border-radius: 6px; padding: 10px 12px; }
+input[type="text"], textarea, select { width: 100%; color: inherit; background: #111c2a; border: 1px solid #40516a; border-radius: 6px; padding: 10px 12px; }
+.directory-field { display: flex; gap: 10px; }
+.directory-field input { min-width: 0; }
+.directory-field button { flex-shrink: 0; }
+#directory-picker { width: min(620px, calc(100% - 32px)); max-height: 85vh; overflow: auto; padding: 24px; color: inherit; background: #192331; border: 1px solid #425873; border-radius: 10px; }
+#directory-picker::backdrop { background: rgb(0 0 0 / 65%); }
+#directory-error { color: #ffa69e; overflow-wrap: anywhere; white-space: pre-wrap; }
+#directory-list { list-style: none; padding: 0; min-height: 80px; max-height: 35vh; overflow: auto; display: grid; gap: 8px; }
+#directory-list button { width: 100%; text-align: left; overflow-wrap: anywhere; }
+.directory-actions { justify-content: flex-end; flex-wrap: wrap; }
 textarea { resize: vertical; min-height: 82px; }
 .composer-actions, .actions { display: flex; align-items: center; gap: 14px; margin-top: 12px; }
 .composer-actions { justify-content: space-between; }

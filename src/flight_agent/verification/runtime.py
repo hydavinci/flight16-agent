@@ -4,16 +4,20 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from uuid import uuid4
+from typing import Literal
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from openai import APIError
 from pydantic import JsonValue
 
 from ..jobs import BusyError
+from ..runtime.contracts import AnalysisRun, EvidenceFile, fingerprint
+from ..runtime.evidence import load_run, persist_run, receipt_name
 from ..session import _write_json
 from .artifacts import describe_artifact, verify_artifact
 from .backend import AnalysisBackend, RemoteSimulinkBackend
 from .contracts import (
+    AnalysisKind,
     AnalysisResult,
     AnalysisRunRequest,
     Artifact,
@@ -21,6 +25,8 @@ from .contracts import (
     ConversationMessage,
     ConversationState,
     Decision,
+    DiagnosisTask,
+    Evaluation,
     EvaluationBaseline,
     ExecutionNode,
     PendingDecision,
@@ -29,9 +35,11 @@ from .contracts import (
     PlanVersion,
     ProjectDescriptor,
     RunRecord,
+    Task,
     ToolCall,
     VerificationTask,
 )
+from .diagnosis import DiagnosisRuntime
 from .evaluation import evaluate
 from .intake import parse_directories, safe_directory, validate_output_root
 from .planner import VerificationPlanner
@@ -55,6 +63,7 @@ class VerificationRuntime:
         self.planner = planner or VerificationPlanner()
         self.lock = threading.Lock()
         self.tools = ToolRegistry(self._analyze, self._evaluate, self._deliver)
+        self.diagnosis = DiagnosisRuntime(self.store, self.planner)
 
     @contextmanager
     def _operation(self) -> Iterator[None]:
@@ -101,9 +110,12 @@ class VerificationRuntime:
         project_root: str | None = None,
         *,
         output_root: str | None = None,
+        scenario: Literal["d1", "d2"] | None = None,
     ) -> Conversation:
         with self._operation():
-            conversation = self._queue_message(conversation_id, message, project_root, output_root)
+            conversation = self._queue_message(
+                conversation_id, message, project_root, output_root, scenario
+            )
             if conversation.status == "planning":
                 return self._propose(conversation, message)
             return conversation
@@ -115,9 +127,12 @@ class VerificationRuntime:
         project_root: str | None = None,
         *,
         output_root: str | None = None,
+        scenario: Literal["d1", "d2"] | None = None,
     ) -> Conversation:
         with self._operation():
-            return self._queue_message(conversation_id, message, project_root, output_root)
+            return self._queue_message(
+                conversation_id, message, project_root, output_root, scenario
+            )
 
     def _queue_message(
         self,
@@ -125,13 +140,21 @@ class VerificationRuntime:
         message: str,
         project_root: str | None,
         output_root: str | None,
+        scenario: Literal["d1", "d2"] | None,
     ) -> Conversation:
         if not message.strip() or len(message) > 4000:
             raise ValueError("A message between 1 and 4000 characters is required")
         conversation = self.store.get(conversation_id) if conversation_id else self.store.create()
+        if (
+            conversation_id is not None and scenario is not None
+            and scenario != conversation.scenario
+        ):
+            raise ValueError("Use a new conversation to change the task scenario")
+        if conversation_id is None:
+            conversation.scenario = scenario or "d1"
         self._message(conversation, "user", message.strip())
         if (
-            conversation.task
+            isinstance(conversation.task, VerificationTask)
             and conversation.task.pending_request
             and not self._known_failed_run(conversation.task)
         ):
@@ -160,7 +183,12 @@ class VerificationRuntime:
         conversation.project_root = intake.project_root
         conversation.output_root = intake.output_root
         if not conversation.project_root:
-            return self._wait(conversation, "请提供 MATLAB Worker 可见的工程目录路径。")
+            return self._wait(
+                conversation,
+                "请提供 Agent 可见的诊断数据目录路径。"
+                if conversation.scenario == "d2"
+                else "请提供 MATLAB Worker 可见的工程目录路径。",
+            )
         conversation.status = "planning"
         conversation.error = None
         conversation.pending_decision = None
@@ -189,6 +217,8 @@ class VerificationRuntime:
         try:
             if conversation.project_root is None:
                 raise ValueError("A project directory is required")
+            if conversation.scenario == "d2":
+                return self.diagnosis.propose(conversation, message)
             project = self._backend().inspect(conversation.project_root)
             conversation.output_root = self._resolve_output_root(conversation, project)
             if (
@@ -202,6 +232,8 @@ class VerificationRuntime:
             if proposal.action == "clarify":
                 return self._wait(conversation, proposal.question)
             if proposal.action == "explain":
+                if isinstance(conversation.task, DiagnosisTask):
+                    raise ValueError("D1 cannot reuse a diagnostic task")
                 if conversation.task and not self._same_project(conversation.task.project, project):
                     return self._wait(
                         conversation, "工程已经变化，请先确认新基线；不能沿用旧结论。"
@@ -236,6 +268,8 @@ class VerificationRuntime:
     ) -> None:
         self._validate_plan(project, proposal)
         task = conversation.task
+        if isinstance(task, DiagnosisTask):
+            raise ValueError("Use a new conversation to change the task scenario")
         prior_tasks = [*conversation.archived_tasks, *([task] if task else [])]
         version = max((item.baseline.version for item in prior_tasks), default=0) + 1
         baseline = EvaluationBaseline(
@@ -317,7 +351,7 @@ class VerificationRuntime:
         )
         self._message(conversation, "assistant", conversation.pending_decision.message)
 
-    def _task(self, conversation: Conversation) -> VerificationTask:
+    def _task(self, conversation: Conversation) -> Task:
         if conversation.task is None:
             raise ValueError("No verification task has been planned")
         directory = self.store.task_directory(
@@ -338,6 +372,9 @@ class VerificationRuntime:
             ):
                 raise ValueError("Only registered numerical evidence may be copied")
             verify_artifact(Path(task.result_directory), artifact)
+        for run in task.analysis_runs:
+            if load_run(Path(task.result_directory), run.id, run.spec) != run:
+                raise ValueError("Recorded analysis receipt is missing or inconsistent")
 
     def _copy_numerical(self, previous: VerificationTask, task: VerificationTask) -> None:
         if previous.result is None:
@@ -355,8 +392,9 @@ class VerificationRuntime:
             verify_artifact(target, artifact)
         task.result = previous.result.model_copy(deep=True)
         task.artifacts = list(task.result.artifacts)
+        task.analysis_runs = [run.model_copy(deep=True) for run in previous.analysis_runs]
 
-    def _check_confirmation(self, task: VerificationTask, version: int, trusted: bool) -> None:
+    def _check_confirmation(self, task: Task, version: int, trusted: bool) -> None:
         if version != task.baseline.version:
             raise ValueError("Confirmation baseline version is stale")
         if trusted is not True:
@@ -370,9 +408,10 @@ class VerificationRuntime:
             and first.capabilities == second.capabilities
         )
 
-    def _known_failed_run(self, task: VerificationTask) -> bool:
+    def _known_failed_run(self, task: Task) -> bool:
         return (
-            task.pending_request is not None
+            isinstance(task, VerificationTask)
+            and task.pending_request is not None
             and task.worker_run is not None
             and task.worker_run.id == task.pending_request.id
             and task.worker_run.status in ("failed", "interrupted")
@@ -387,6 +426,8 @@ class VerificationRuntime:
                 return conversation
             if task.baseline.confirmed:
                 raise ValueError("This baseline is already confirmed; use resume for saved work")
+            if isinstance(task, DiagnosisTask):
+                return self.diagnosis.confirm(conversation, task)
             try:
                 project = self._backend().inspect(task.project.root)
                 if not self._same_project(task.project, project):
@@ -423,7 +464,12 @@ class VerificationRuntime:
             task.decisions.append(
                 Decision(action="resume", baseline_version=task.baseline.version, created_at=now())
             )
-            self._message(conversation, "user", "续接已有任务；核对同一 Worker 运行，不重复提交。")
+            self._message(
+                conversation, "user",
+                "续接已有 D2 任务，核验已记录的证据回执，不重复派发未知调用。"
+                if isinstance(task, DiagnosisTask)
+                else "续接已有任务；核对同一 Worker 运行，不重复提交。",
+            )
             self.store.save(conversation)
             return self._run(conversation, resume=True)
 
@@ -431,6 +477,8 @@ class VerificationRuntime:
         with self._operation():
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
+            if isinstance(task, DiagnosisTask):
+                raise ValueError("Worker retry is only available for D1 tasks")
             self._check_confirmation(task, version, trusted)
             if not task.baseline.confirmed or not self._known_failed_run(task):
                 raise ValueError("Retry requires a known failed or interrupted worker run")
@@ -450,6 +498,8 @@ class VerificationRuntime:
         with self._operation():
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
+            if isinstance(task, DiagnosisTask):
+                raise ValueError("Worker recovery plans are only available for D1 tasks")
             self._check_confirmation(task, version, trusted)
             if task.pending_request is not None and not self._known_failed_run(task):
                 raise ValueError("Reconcile the unknown Worker run before adopting another plan")
@@ -478,6 +528,8 @@ class VerificationRuntime:
 
     def _run(self, conversation: Conversation, *, resume: bool) -> Conversation:
         task = self._task(conversation)
+        if isinstance(task, DiagnosisTask):
+            return self.diagnosis.run(conversation, task)
         if not task.baseline.confirmed:
             raise ValueError("Execution requires a confirmed baseline")
         validate_output_root(task.result_directory, task.project.root)
@@ -558,7 +610,8 @@ class VerificationRuntime:
             current_artifacts = [
                 item
                 for item in task.artifacts
-                if item.path.startswith(prefix) or item in request.result.artifacts
+                if item.path.startswith(prefix)
+                or item in request.result.artifacts or item in request.derived_artifacts
             ]
             final = finalize_execution_record(
                 request, Path(task.result_directory), current_artifacts
@@ -583,20 +636,59 @@ class VerificationRuntime:
     def _analyze(
         self, conversation: Conversation, task: VerificationTask, resume: bool
     ) -> dict[str, JsonValue]:
-        missing = [
-            kind
-            for kind in task.baseline.analyses
-            if task.result is None or task.result.analysis(kind) is None
-        ]
+        specs = {kind: self.tools.analysis_spec(task, kind) for kind in task.baseline.analyses}
+        request = task.pending_request
+        reconcile = request is not None
+        if request is not None:
+            if not resume:
+                raise ValueError("A recorded worker run must be reconciled, never resubmitted")
+            if (
+                request.project_root != task.project.root
+                or request.project_fingerprint != task.baseline.project_fingerprint
+                or request.trim_point != task.baseline.trim_point
+                or not set(request.analyses).issubset(specs)
+            ):
+                raise ValueError("Recorded worker request does not match the confirmed baseline")
+            versions = {spec.capability_version for spec in task.pending_specs.values()}
+            if len(versions) > 1:
+                raise ValueError(
+                    "Pending numerical specifications have inconsistent adapter versions"
+                )
+            version = next(iter(versions)) if versions else "unrecorded"
+            specs = {
+                kind: spec.model_copy(update={"capability_version": version})
+                for kind, spec in specs.items()
+            }
+            pending_specs = {kind: specs[kind] for kind in request.analyses}
+            if task.pending_specs and task.pending_specs != pending_specs:
+                raise ValueError(
+                    "Pending numerical specifications differ from the confirmed inputs"
+                )
+            if not task.pending_specs:
+                logger.warning("Adapter version was not recorded for Worker request %s", request.id)
+                task.pending_specs = pending_specs
+        cached: dict[AnalysisKind, AnalysisRun] = {}
         directory = Path(task.result_directory)
-        if not missing:
-            if task.result is None:
-                raise ValueError("Cached analysis is missing")
+        for kind, spec in specs.items():
+            match = next(
+                (
+                    run for run in reversed(task.analysis_runs)
+                    if run.spec.fingerprint == spec.fingerprint
+                ),
+                None,
+            )
+            if match is not None:
+                if load_run(directory, match.id, spec) != match:
+                    raise ValueError("Recorded analysis receipt is missing or inconsistent")
+                cached[kind] = match
+        missing = [
+            kind for kind in task.baseline.analyses if kind not in cached
+        ]
+        if not missing and request is None:
+            task.result = self._numerical_projection(task, cached)
             for artifact in task.result.artifacts:
                 verify_artifact(directory, artifact)
             return {"source": "reused recorded numerical evidence", "run_id": task.result.run_id}
-        request = task.pending_request
-        reconcile = request is not None
         if request is None:
             request = AnalysisRunRequest(
                 id=uuid4().hex,
@@ -607,9 +699,12 @@ class VerificationRuntime:
                 trusted=True,
             )
             task.pending_request = request
+            task.pending_specs = {kind: specs[kind] for kind in missing}
             task.worker_run = None
-        elif not resume:
-            raise ValueError("A recorded worker run must be reconciled, never resubmitted")
+        elif set(missing) - set(request.analyses):
+            raise ValueError(
+                "Recorded worker request is missing required cached numerical branches"
+            )
         task.calls[-1].inputs["request"] = request.model_dump(mode="json")
         self.store.save(conversation)
         run_directory = directory / "numerical" / request.id
@@ -645,23 +740,48 @@ class VerificationRuntime:
         artifacts = [
             artifact.model_copy(update={"path": prefix + artifact.path}) for artifact in paths
         ]
-        previous = task.result
-        run_history = dict(previous.provenance) if previous else {}
-        run_history[request.id] = {
-            "matlab_version": result.matlab_version,
-            "provenance": result.provenance,
-        }
-        task.result = AnalysisResult(
-            run_id=result.run_id,
-            project_fingerprint=result.project_fingerprint,
-            trim_point=result.trim_point,
-            matlab_version=result.matlab_version,
-            analyses=[*(previous.analyses if previous else []), *records],
-            artifacts=[*(previous.artifacts if previous else []), *artifacts],
-            provenance=run_history,
-        )
         self._merge_artifacts(task, artifacts)
+        for record in records:
+            branch = AnalysisResult(
+                run_id=result.run_id,
+                project_fingerprint=result.project_fingerprint,
+                trim_point=result.trim_point,
+                matlab_version=result.matlab_version,
+                analyses=[record],
+                artifacts=artifacts,
+                provenance={
+                    request.id: {
+                        "matlab_version": result.matlab_version,
+                        "provenance": result.provenance,
+                    }
+                },
+            )
+            output = branch.model_dump(mode="json")
+            run_id = uuid5(NAMESPACE_URL, f"flight-agent:{request.id}:{record.kind}").hex
+            saved = load_run(directory, run_id, specs[record.kind])
+            if saved is not None and saved.output != output:
+                raise ValueError("Reconciled numerical evidence differs from its immutable receipt")
+            receipt = saved or AnalysisRun(
+                id=run_id,
+                execution_id=request.id,
+                spec=specs[record.kind],
+                output=output,
+                output_sha256=fingerprint(output),
+                started_at=task.calls[-1].started_at,
+                finished_at=now(),
+                artifacts=[
+                    EvidenceFile(path=item.path, sha256=item.sha256, size=item.size)
+                    for item in artifacts
+                ],
+            )
+            persist_run(directory, receipt)
+            self._merge_artifacts(task, [describe_artifact(directory, receipt_name(run_id))])
+            if not any(run.id == receipt.id for run in task.analysis_runs):
+                task.analysis_runs.append(receipt)
+            cached[record.kind] = receipt
+        task.result = self._numerical_projection(task, cached)
         task.pending_request = None
+        task.pending_specs = {}
         self.store.save(conversation)
         return {
             "source": "reconciled worker run" if reconcile else "worker execution",
@@ -669,12 +789,67 @@ class VerificationRuntime:
             "analyses": list(request.analyses),
         }
 
+    def _numerical_projection(
+        self, task: VerificationTask, runs: dict[AnalysisKind, AnalysisRun]
+    ) -> AnalysisResult:
+        results = [
+            AnalysisResult.model_validate(runs[kind].output) for kind in task.baseline.analyses
+        ]
+        for kind, result in zip(task.baseline.analyses, results, strict=True):
+            if (
+                result.project_fingerprint != task.baseline.project_fingerprint
+                or result.trim_point != task.baseline.trim_point
+                or len(result.analyses) != 1
+                or result.analyses[0].kind != kind
+            ):
+                raise ValueError("Recorded numerical branch does not match its baseline")
+        return AnalysisResult(
+            run_id=results[-1].run_id,
+            project_fingerprint=task.baseline.project_fingerprint,
+            trim_point=task.baseline.trim_point,
+            matlab_version=results[-1].matlab_version,
+            analyses=[result.analyses[0] for result in results],
+            artifacts=[
+                item for item in task.artifacts
+                if item.path.startswith("numerical/")
+            ],
+            provenance={
+                key: value for result in results for key, value in result.provenance.items()
+            },
+        )
+
     def _evaluate(
         self, conversation: Conversation, task: VerificationTask, resume: bool
     ) -> dict[str, JsonValue]:
         if task.result is None:
             raise ValueError("Evaluation requires numerical evidence")
-        task.evaluation = evaluate(task.baseline, task.result)
+        spec = self.tools.evaluation_spec(task)
+        run_id = uuid5(NAMESPACE_URL, f"evaluation:{task.id}:{spec.fingerprint}").hex
+        directory = Path(task.result_directory)
+        saved = load_run(directory, run_id, spec, layer="evaluation")
+        recorded = next((item for item in task.evaluation_runs if item.id == run_id), None)
+        if recorded is not None and saved != recorded:
+            raise ValueError("Recorded evaluation receipt is missing or inconsistent")
+        if saved is None:
+            evaluation = evaluate(task.baseline, task.result)
+            output = evaluation.model_dump(mode="json")
+            saved = AnalysisRun(
+                id=run_id, spec=spec, output=output, output_sha256=fingerprint(output),
+                started_at=task.calls[-1].started_at, finished_at=now(),
+                artifacts=[
+                    EvidenceFile(path=item.path, sha256=item.sha256, size=item.size)
+                    for item in task.result.artifacts
+                ],
+            )
+            persist_run(directory, saved, layer="evaluation")
+        task.evaluation = Evaluation.model_validate(
+            {**saved.output, "baseline_version": task.baseline.version}
+        )
+        if recorded is None:
+            task.evaluation_runs.append(saved)
+        name = receipt_name(run_id, layer="evaluation")
+        self._merge_artifacts(task, [describe_artifact(directory, name)])
+        task.calls[-1].inputs.update(evaluation_fingerprint=spec.fingerprint, receipt=name)
         self.store.save(conversation)
         return task.evaluation.model_dump(mode="json")
 
@@ -689,7 +864,7 @@ class VerificationRuntime:
 
     def _answer(self, conversation: Conversation, question: str) -> Conversation:
         task = conversation.task
-        if task is None or task.evaluation is None:
+        if not isinstance(task, VerificationTask) or task.evaluation is None:
             return self._wait(conversation, "尚无已判定的数值证据；请先完成基线确认和验证。")
         try:
             explanation = self.planner.explain(task, question)
@@ -720,6 +895,8 @@ class VerificationRuntime:
             "nodes": [item.model_dump(mode="json") for item in task.nodes],
             "calls": [item.model_dump(mode="json") for item in task.calls],
             "decisions": [item.model_dump(mode="json") for item in task.decisions],
+            "analysis_runs": [item.model_dump(mode="json") for item in task.analysis_runs],
+            "evaluation_runs": [item.model_dump(mode="json") for item in task.evaluation_runs],
             "failure_proposal": (
                 task.failure_proposal.model_dump(mode="json") if task.failure_proposal else None
             ),
@@ -736,6 +913,9 @@ class VerificationRuntime:
             baseline=task.baseline,
             result=task.result,
             evaluation=task.evaluation,
+            derived_artifacts=[
+                item for item in task.artifacts if item.path.startswith("evaluation/")
+            ],
             grouping=task.proposal.grouping,
             explanation=task.explanation.text if task.explanation else None,
             explanation_evidence=task.explanation.evidence if task.explanation else [],

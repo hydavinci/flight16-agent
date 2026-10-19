@@ -153,7 +153,11 @@ class ConversationStore:
     def save(self, record: Conversation) -> None:
         with self.lock:
             record.updated_at = now()
-            _write_json(self.directory(record.id) / "conversation.json", record.model_dump())
+            data = record.model_dump()
+            content = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+            if len(content.encode("utf-8")) > 8_000_000:
+                raise ValueError("Conversation exceeds 8 MB; existing state was not replaced")
+            _write_json(self.directory(record.id) / "conversation.json", data)
 
     def default_task_root(self, conversation_id: str) -> Path:
         return self.directory(conversation_id) / "tasks"

@@ -1,9 +1,15 @@
 import argparse
+import json
 import os
+import re
 import sys
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import httpx
 from dotenv import load_dotenv
+from pydantic import JsonValue, TypeAdapter
 
 from .agent import AgentError, execute_agent
 from .config import ModelSettings, create_model
@@ -40,6 +46,79 @@ def doctor(root: Path) -> int:
     return 0 if ready else 1
 
 
+def directory_task(args: argparse.Namespace) -> int:
+    address = urlsplit(args.server)
+    if (
+        address.scheme != "http" or address.hostname not in ("127.0.0.1", "localhost")
+        or address.username is not None or address.password is not None
+        or address.path not in ("", "/") or address.query or address.fragment
+    ):
+        raise ValueError("--server must be a local HTTP origin without credentials or a path")
+    if not 1 <= args.timeout <= 3600:
+        raise ValueError("--timeout must be between 1 and 3600 seconds")
+    if args.action == "confirm":
+        if not args.trusted_project:
+            raise ValueError("Confirmation requires explicit --trusted-project consent")
+        if args.version < 1:
+            raise ValueError("--version must be a positive confirmed-baseline version")
+    identifier = args.conversation
+    if identifier is not None and not re.fullmatch(r"[a-f0-9]{32}", identifier):
+        raise ValueError("Expected a recorded conversation identifier")
+    schema = TypeAdapter(dict[str, JsonValue])
+    with httpx.Client(
+        base_url=args.server.rstrip("/"), timeout=min(args.timeout, 30),
+        follow_redirects=False, trust_env=False,
+    ) as client:
+        def request(
+            method: str, path: str, body: dict[str, JsonValue] | None = None
+        ) -> dict[str, JsonValue]:
+            response = client.request(method, path, json=body)
+            response.raise_for_status()
+            return schema.validate_python(response.json())
+
+        bootstrap = request("GET", "/api/bootstrap")
+        token = bootstrap.get("token")
+        if not isinstance(token, str) or not token:
+            raise ValueError("The local server did not provide an API token")
+        client.headers["X-Flight-Token"] = token
+        base = "/api/conversations"
+        if args.action == "propose":
+            body: dict[str, JsonValue] = {"message": args.request}
+            for field in ("project_root", "output_root", "scenario"):
+                value = getattr(args, field)
+                if value is not None:
+                    body[field] = value
+            record = request(
+                "POST", f"{base}/{identifier}/messages" if identifier else base, body
+            )
+        elif args.action == "status":
+            record = request("GET", f"{base}/{identifier}")
+        else:
+            record = request(
+                "POST", f"{base}/{identifier}/{args.action}",
+                {"version": args.version, "trusted": True} if args.action == "confirm" else None,
+            )
+        actual_id = record.get("id")
+        if (
+            not isinstance(actual_id, str) or not re.fullmatch(r"[a-f0-9]{32}", actual_id)
+            or identifier is not None and actual_id != identifier
+        ):
+            raise ValueError("Server returned a mismatched conversation identity")
+        deadline = time.monotonic() + args.timeout
+        while args.action != "status" and record.get("status") in ("planning", "running"):
+            if time.monotonic() >= deadline:
+                raise ValueError(
+                    f"Task {actual_id} continues on the local server; use directory-task status"
+                )
+            record = request("GET", f"{base}/{actual_id}")
+            if record.get("id") != actual_id:
+                raise ValueError("Server returned a mismatched conversation identity")
+            if record.get("status") in ("planning", "running"):
+                time.sleep(0.2)
+        print(json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False))
+        return 1 if record.get("status") in ("failed", "interrupted") else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local directory-based verification agent")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -47,9 +126,35 @@ def main(argv: list[str] | None = None) -> int:
     analyze = commands.add_parser("analyze", help="Analyze a JSON file using the real agent")
     web = commands.add_parser("web", help="Serve the local Web interface")
     worker = commands.add_parser("worker", help="Serve the trusted-project MATLAB worker")
+    directory = commands.add_parser(
+        "directory-task", help="Use the running local Web API for persistent D1/D2 tasks"
+    )
+    directory.add_argument("--server", default="http://127.0.0.1:8000")
+    directory.add_argument("--timeout", type=int, default=360)
+    actions = directory.add_subparsers(dest="action", required=True)
+    propose = actions.add_parser("propose", help="Propose a task without executing it")
+    propose.add_argument("--scenario", choices=("d1", "d2"))
+    propose.add_argument("--project-root", help="Worker project (D1) or Agent data directory (D2)")
+    propose.add_argument("--output-root", help="Agent-visible delivery directory")
+    propose.add_argument("--conversation", help="Continue an existing conversation")
+    propose.add_argument("--request", required=True)
+    confirm = actions.add_parser("confirm", help="Confirm a recorded baseline and execute")
+    confirm.add_argument("--version", type=int, required=True)
+    confirm.add_argument("--trusted-project", action="store_true")
+    resume = actions.add_parser(
+        "resume", help="Resume saved work without duplicating unknown calls"
+    )
+    status = actions.add_parser("status", help="Read durable state without modifying the task")
+    for command in (confirm, resume, status):
+        command.add_argument("conversation")
     for command in (check, analyze, web, worker):
         command.add_argument("--project-root", type=Path, default=Path.cwd())
     web.add_argument("--port", type=int, default=8000)
+    web.add_argument(
+        "--native-directory-picker",
+        action="store_true",
+        help="Use macOS folder dialogs when browser, Web and Worker run on this same desktop",
+    )
     worker.add_argument("--port", type=int, default=9001)
     worker.add_argument("--host", default="127.0.0.1")
     analyze.add_argument("parameters", type=Path, help="JSON path, relative to the project root")
@@ -59,9 +164,11 @@ def main(argv: list[str] | None = None) -> int:
     analyze.add_argument("--matlab-timeout", type=float, default=120)
     analyze.add_argument("--max-steps", type=int, default=20)
     args = parser.parse_args(argv)
-    root = args.project_root.resolve()
     session: AnalysisSession | None = None
     try:
+        if args.command == "directory-task":
+            return directory_task(args)
+        root = args.project_root.resolve()
         load_dotenv(root / ".env", override=False)
         if args.command == "doctor":
             return doctor(root)
@@ -73,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "web":
                 from .web import create_web_app
 
-                app = create_web_app(root)
+                app = create_web_app(root, native_directory_picker=args.native_directory_picker)
                 host = "127.0.0.1"
             else:
                 from .worker import create_worker_app
@@ -98,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Report: {report}")
         print(f"Assessment: {session.metadata['assessment_status']} (demonstration only)")
         return 0
-    except (AgentError, ValueError, OSError) as exc:
+    except (AgentError, ValueError, OSError, httpx.HTTPError) as exc:
         if session is not None:
             session.fail(str(exc))
             print(f"Run artifacts: {session.run_dir}", file=sys.stderr)

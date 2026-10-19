@@ -2,10 +2,11 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 
+from ..directories import DirectoryListing
 from ..remote import RemoteError, RemoteWorker
 from ..session import _write_json
 from .artifacts import MAX_ARTIFACT_BYTES, verify_artifact
@@ -27,6 +28,24 @@ class AnalysisBackend(Protocol):
 
 
 class RemoteSimulinkBackend(RemoteWorker):
+    def browse(self, path: str = "") -> DirectoryListing:
+        client = self.client or httpx.Client(trust_env=False)
+        try:
+            return DirectoryListing.model_validate_json(
+                self._request(
+                    client,
+                    "GET",
+                    "/verification/directories?" + urlencode({"path": path}),
+                    time.monotonic() + 30,
+                    limit=4_000_000,
+                )
+            )
+        except (httpx.HTTPError, ValueError, RemoteError) as exc:
+            raise RemoteError(f"Directory browsing failed: {exc}") from exc
+        finally:
+            if self.client is None:
+                client.close()
+
     def inspect(self, root: str) -> ProjectDescriptor:
         client = self.client or httpx.Client(trust_env=False)
         try:

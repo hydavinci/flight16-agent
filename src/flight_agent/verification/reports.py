@@ -7,6 +7,7 @@ from docx.shared import Inches
 from pydantic import JsonValue, field_validator
 
 from ..models import Contract, Nonempty
+from ..runtime.contracts import fingerprint
 from ..session import _write_json
 from ..upload_models import finite_json
 from .artifacts import describe_artifact, verify_artifact
@@ -21,6 +22,8 @@ from .contracts import (
 )
 from .evaluation import evaluate
 
+REPORT_FORMAT_VERSION = "1"
+
 
 class ReportRequest(Contract):
     task_id: Identifier
@@ -29,6 +32,7 @@ class ReportRequest(Contract):
     baseline: EvaluationBaseline
     result: AnalysisResult
     evaluation: Evaluation
+    derived_artifacts: list[Artifact] = []
     grouping: Literal["combined", "separate"] = "combined"
     explanation: str | None = None
     explanation_evidence: list[str] = []
@@ -160,6 +164,10 @@ def deliver_report(request: ReportRequest, directory: Path) -> list[Artifact]:
             raise ValueError(f"Valid analysis lacks figure or raw evidence: {record.kind}")
     for item in request.result.artifacts:
         verify_artifact(directory, item)
+    for item in request.derived_artifacts:
+        if item.role != "record" or not item.path.startswith("evaluation/"):
+            raise ValueError("Only registered evaluation receipts are derived evidence")
+        verify_artifact(directory, item)
     prefix = f"delivery-v{request.baseline.version}"
     target = directory / prefix
     if target.is_symlink():
@@ -172,8 +180,34 @@ def deliver_report(request: ReportRequest, directory: Path) -> list[Artifact]:
         coverage = {
             f"{prefix}/{kind.replace('_', '-')}.docx": [kind] for kind in request.baseline.analyses
         }
-    for name, kinds in coverage.items():
-        _write_report(request, directory, name, kinds)
+    render_key = fingerprint(
+        {
+            "format_version": REPORT_FORMAT_VERSION,
+            **request.model_dump(mode="json", exclude={"execution_record"}),
+        }
+    )
+    reused = False
+    index_name = f"{prefix}/artifact-index.json"
+    if (directory / index_name).exists() or (directory / index_name).is_symlink():
+        index_file = describe_artifact(directory, index_name)
+        index = json.loads(verify_artifact(directory, index_file).read_text("utf-8"))
+        if not isinstance(index, dict):
+            raise ValueError("Invalid report artifact index")
+        if index.get("report_fingerprint") == render_key:
+            if index.get("reports") != coverage:
+                raise ValueError("Cached report coverage does not match the requested delivery")
+            cached = {
+                item.path: item
+                for item in (Artifact.model_validate(value) for value in index["artifacts"])
+            }
+            for name in coverage:
+                if name not in cached or cached[name].role != "report":
+                    raise ValueError("Cached report is missing its registered artifact")
+                verify_artifact(directory, cached[name])
+            reused = True
+    if not reused:
+        for name, kinds in coverage.items():
+            _write_report(request, directory, name, kinds)
     _write_json(
         target / "evaluation.json",
         {
@@ -187,6 +221,7 @@ def deliver_report(request: ReportRequest, directory: Path) -> list[Artifact]:
     names = [*coverage, f"{prefix}/evaluation.json", f"{prefix}/execution_record.json"]
     artifacts = [
         *request.result.artifacts,
+        *request.derived_artifacts,
         *(describe_artifact(directory, name) for name in names),
     ]
     _write_json(
@@ -194,6 +229,7 @@ def deliver_report(request: ReportRequest, directory: Path) -> list[Artifact]:
         {
             "task_id": request.task_id,
             "baseline_version": request.baseline.version,
+            "report_fingerprint": render_key,
             "reports": coverage,
             "artifacts": [item.model_dump() for item in artifacts],
         },
