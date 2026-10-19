@@ -34,8 +34,10 @@ def test_browser_upload_result_figure_and_undetermined(project, fake_engine, mon
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             try:
-                page.goto(url)
+                page.goto(url + "/workbench")
                 expect(page.get_by_role("heading", name="MATLAB 分析工作台")).to_be_visible()
+                expect(page.get_by_role("combobox", name="示例程序")).to_have_count(0)
+                expect(page.get_by_role("button", name="载入示例", exact=True)).to_have_count(0)
                 page.locator("#file").set_input_files(
                     {
                         "name": "calculation.m",
@@ -69,7 +71,7 @@ def test_browser_shows_unconfigured_worker_and_rejects_bad_json(project, monkeyp
         browser = playwright.chromium.launch()
         page = browser.new_page()
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             expect(page.locator("#worker-state")).to_contain_text("未配置")
             page.locator("#file").set_input_files(
                 {
@@ -103,7 +105,7 @@ def test_browser_submission_snapshots_file_and_kind_before_reading(project):
 
         page.route("**/api/jobs", capture)
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.evaluate("""() => {
                 const original = File.prototype.arrayBuffer;
                 File.prototype.arrayBuffer = function() {
@@ -159,7 +161,7 @@ def test_browser_submits_raw_parameter_numbers(project):
 
         page.route("**/api/jobs", capture)
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#file").set_input_files(
                 {"name": "calculation.m", "mimeType": "text/plain", "buffer": b"result=params;"}
             )
@@ -222,7 +224,7 @@ def test_browser_displays_and_downloads_exact_result_numbers(project):
         browser = playwright.chromium.launch()
         page = browser.new_page()
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#history button").filter(has_text="first.m").click()
             expect(page.locator("#result-data")).to_contain_text('"value": 9007199254740993')
             with page.expect_download() as pending:
@@ -245,7 +247,7 @@ def test_browser_discards_superseded_result_response(project):
         delayed = []
         page.route(f"**/api/jobs/{records[0].id}/result", lambda route: delayed.append(route))
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             with page.expect_request(f"**/api/jobs/{records[0].id}/result"):
                 page.locator("#history button").filter(has_text="first.m").click()
             expect(page.locator("#download-result")).to_be_disabled()
@@ -287,7 +289,7 @@ def test_browser_retries_image_after_fetch_failure(project):
 
         page.route(f"**/api/jobs/{records[0].id}/artifacts/*", image_route)
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#history button").filter(has_text="first.m").click()
             expect(page.locator("#notice")).to_contain_text("Temporary image failure")
             page.locator("#history button").filter(has_text="first.m").click()
@@ -313,7 +315,7 @@ def test_browser_discards_old_image_request_after_reselect(project):
 
         page.route(f"**/api/jobs/{records[0].id}/artifacts/*", image_route)
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#history button").filter(has_text="first.m").click()
             expect(page.locator("#execution-status")).to_have_text("执行完成")
             page.locator("#history button").filter(has_text="second.m").click()
@@ -354,7 +356,7 @@ def test_browser_rejects_nonfinite_numbers_without_changing_them_to_null(project
 
         page.route("**/api/jobs", capture)
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#file").set_input_files(
                 {"name": "calculation.m", "mimeType": "text/plain", "buffer": b"result=params;"}
             )
@@ -370,118 +372,6 @@ def test_browser_rejects_nonfinite_numbers_without_changing_them_to_null(project
             page.locator("#run-button").click()
             expect(page.locator("#notice")).to_contain_text("Captured test request")
             assert submitted[-1]["parameters"] == valid
-        finally:
-            browser.close()
-
-
-@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
-@pytest.mark.parametrize("stage", ["source", "parameters"])
-@pytest.mark.parametrize("newer_input", ["file", "example", "parameters", "kind"])
-def test_browser_stale_example_cannot_overwrite_newer_input(project, stage, newer_input):
-    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
-        page = browser.new_page()
-        delayed = []
-        old_parameters = {"mass_kg": 10}
-        source = "function result = web_metrics(params)\nresult=params;\nend"
-
-        def source_route(route):
-            if stage == "source":
-                delayed.append(route)
-            else:
-                route.fulfill(status=200, body=source, content_type="text/plain")
-
-        def parameters_route(route):
-            if stage == "parameters":
-                delayed.append(route)
-            else:
-                route.fulfill(status=200, json=old_parameters)
-
-        page.route("**/api/examples/web_metrics.m", source_route)
-        page.route("**/api/examples/parameters.json", parameters_route)
-        page.route(
-            "**/api/examples/web_script.m",
-            lambda route: route.fulfill(status=200, body="result=params;"),
-        )
-        try:
-            page.goto(url)
-            page.locator("#file").set_input_files(
-                {"name": "first.m", "mimeType": "text/plain", "buffer": b"result=params;"}
-            )
-            page.locator("#parameters").fill('{"value":1}')
-            page.locator("#example").select_option("web_metrics.m")
-            delayed_path = "web_metrics.m" if stage == "source" else "parameters.json"
-            with page.expect_request(f"**/api/examples/{delayed_path}"):
-                page.locator("#load-example").click()
-
-            expected_filename = "first.m"
-            expected_parameters = {"value": 1}
-            expected_kind = "script"
-            if newer_input == "file":
-                page.locator("#file").set_input_files(
-                    {"name": "newest.m", "mimeType": "text/plain", "buffer": b"result=2;"}
-                )
-                page.locator("#parameters").fill('{"value":2}')
-                page.locator("#kind").select_option("script")
-                expected_filename = "newest.m"
-                expected_parameters = {"value": 2}
-            elif newer_input == "example":
-                page.locator("#example").select_option("web_script.m")
-                page.locator("#load-example").click()
-                expect(page.locator("#filename")).to_contain_text("web_script.m")
-                expected_filename = "web_script.m"
-                expected_parameters = {"frequency_hz": 1, "amplitude": 1, "samples": 200}
-            elif newer_input == "parameters":
-                page.locator("#parameters").fill('{"value":9}')
-                expected_parameters = {"value": 9}
-            else:
-                page.locator("#kind").select_option("function")
-                expected_kind = "function"
-
-            page.locator("#trusted").check()
-            assert delayed, "An older example response must still be pending"
-            with page.expect_response(f"**/api/examples/{delayed_path}") as response:
-                if stage == "source":
-                    delayed[0].fulfill(status=200, body=source, content_type="text/plain")
-                else:
-                    delayed[0].fulfill(status=200, json=old_parameters)
-            response.value.body()
-            page.evaluate(
-                "() => new Promise(resolve => requestAnimationFrame("
-                "() => requestAnimationFrame(resolve)))"
-            )
-            expect(page.locator("#filename")).to_contain_text(expected_filename)
-            assert json.loads(page.locator("#parameters").input_value()) == expected_parameters
-            expect(page.locator("#kind")).to_have_value(expected_kind)
-            expect(page.locator("#trusted")).to_be_checked()
-        finally:
-            browser.close()
-
-
-@pytest.mark.skipif(os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in")
-def test_browser_ignores_errors_from_superseded_example_requests(project):
-    with serve_app(web_module().create_web_app(project)) as url, sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
-        page = browser.new_page()
-        delayed = []
-        page.route("**/api/examples/web_script.m", lambda route: delayed.append(route))
-        try:
-            page.goto(url)
-            with page.expect_request("**/api/examples/web_script.m"):
-                page.locator("#load-example").click()
-            page.locator("#file").set_input_files(
-                {"name": "newest.m", "mimeType": "text/plain", "buffer": b"result=2;"}
-            )
-            assert delayed
-            with page.expect_response("**/api/examples/web_script.m") as response:
-                delayed[0].fulfill(status=503, json={"detail": "Obsolete example failure"})
-            response.value.body()
-            page.evaluate(
-                "() => new Promise(resolve => requestAnimationFrame("
-                "() => requestAnimationFrame(resolve)))"
-            )
-            expect(page.locator("#notice")).to_be_hidden()
-            expect(page.locator("#filename")).to_contain_text("newest.m")
         finally:
             browser.close()
 
@@ -512,7 +402,7 @@ def test_browser_keeps_measurement_and_requirement_units_separate(
         browser = playwright.chromium.launch()
         page = browser.new_page()
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#history button").filter(has_text="first.m").click()
             expect(page.locator("#assessment tr").nth(1).locator("td")).to_have_text(
                 ["DEMO-CL", measurement, "<= 1.2 1", status]
@@ -544,7 +434,7 @@ def test_browser_disables_job_actions_until_selection_loads(project, stage, outc
             ),
         )
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#history button").filter(has_text="first.m").click()
             expect(page.locator("#analyze-button")).to_be_enabled()
             expect(page.locator("#result-data")).to_contain_text('"first": 1')
@@ -607,7 +497,7 @@ def test_browser_clears_previous_report_when_selection_fails(project):
             lambda route: route.fulfill(status=503, json={"detail": "Selection unavailable"}),
         )
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#history button").filter(has_text="first.m").click()
             expect(page.locator("#report")).to_have_text("First job report")
             expect(page.locator("#download-report")).to_be_enabled()
@@ -637,7 +527,7 @@ def test_browser_rejects_mismatched_job_status(project):
             lambda route: route.fulfill(status=200, json=wrong_record),
         )
         try:
-            page.goto(url)
+            page.goto(url + "/workbench")
             page.locator("#history button").filter(has_text="second.m").click()
             expect(page.locator("#notice")).to_contain_text("任务 ID 不匹配")
             expect(page.locator("#job-meta")).not_to_contain_text("first.m")

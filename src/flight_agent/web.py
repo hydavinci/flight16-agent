@@ -19,6 +19,8 @@ from .remote import RemoteWorker
 from .service import BodyLimitMiddleware, artifact_response, install_validation_handler, safe_log
 from .session import AnalysisSession
 from .upload_models import JobRecord, UploadRequest
+from .verification.routes import verification_router
+from .verification.runtime import VerificationRuntime
 
 
 class AnalysisRequest(BaseModel):
@@ -35,7 +37,9 @@ class CachedRunner:
         return self.result
 
 
-def create_web_app(root: Path) -> FastAPI:
+def create_web_app(
+    root: Path, *, verification_runtime: VerificationRuntime | None = None
+) -> FastAPI:
     root = root.resolve()
     store = JobStore(root / "runs" / "web")
     manager = JobManager(store)
@@ -73,6 +77,10 @@ def create_web_app(root: Path) -> FastAPI:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     install_validation_handler(app)
     auth = [Depends(authorize)]
+    verification_runtime = verification_runtime or VerificationRuntime(
+        root / "runs" / "verification"
+    )
+    app.include_router(verification_router(verification_runtime, manager, authorize))
 
     @app.middleware("http")
     async def response_headers(
@@ -91,11 +99,15 @@ def create_web_app(root: Path) -> FastAPI:
 
     @app.get("/")
     def index() -> FileResponse:
+        return FileResponse(static / "agent.html", media_type="text/html")
+
+    @app.get("/workbench")
+    def workbench() -> FileResponse:
         return FileResponse(static / "index.html", media_type="text/html")
 
     @app.get("/static/{name}")
     def asset(name: str) -> FileResponse:
-        if name not in ("app.js", "style.css"):
+        if name not in ("app.js", "style.css", "agent.js", "agent.css"):
             raise HTTPException(status_code=404, detail="Unknown asset")
         return FileResponse(static / name)
 

@@ -41,12 +41,12 @@ def doctor(root: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Local MATLAB Engine analysis agent (demo only)")
+    parser = argparse.ArgumentParser(description="Local directory-based verification agent")
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("doctor", help="Inspect configuration without external calls")
     analyze = commands.add_parser("analyze", help="Analyze a JSON file using the real agent")
     web = commands.add_parser("web", help="Serve the local Web interface")
-    worker = commands.add_parser("worker", help="Serve the trusted-upload MATLAB worker")
+    worker = commands.add_parser("worker", help="Serve the trusted-project MATLAB worker")
     for command in (check, analyze, web, worker):
         command.add_argument("--project-root", type=Path, default=Path.cwd())
     web.add_argument("--port", type=int, default=8000)
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 from .worker import create_worker_app
 
-                if os.name != "posix":
+                if os.name != "posix" and os.environ.get("MATLAB_ALLOW_TRUSTED_UPLOADS") == "1":
                     raise ValueError("The upload worker currently supports macOS and Linux")
                 app = create_worker_app(root, os.environ.get("MATLAB_WORKER_TOKEN", ""))
                 host = args.host

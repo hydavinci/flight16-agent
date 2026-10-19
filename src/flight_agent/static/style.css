@@ -38,9 +38,7 @@ label .muted { font-weight: 400; margin-left: 5px; }
 .muted, .hint { color: var(--muted); }
 .hint { font-size: 11px; margin: 8px 0 16px; }
 .centered { text-align: center; margin-bottom: 0; }
-.example-row, .action-row, .result-toolbar { display: flex; align-items: center; gap: 10px; }
-.example-row { margin-top: 12px; }
-.example-row select { flex: 1; min-width: 0; }
+.action-row, .result-toolbar { display: flex; align-items: center; gap: 10px; }
 select, input[type="number"], textarea { border: 1px solid #d7deeb; border-radius: 7px; padding: 9px 10px; color: var(--ink); background: white; font: inherit; }
 select, input[type="number"] { width: 100%; font-size: 12px; }
 textarea { display: block; width: 100%; resize: vertical; font: 12px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; }
