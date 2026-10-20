@@ -51,6 +51,8 @@ class Engine:
             self.paths.append(Path(path))
 
     def feval(self, name, payload, *args, **kwargs):
+        if name == "flight_agent_verify":
+            return self.verification(payload)
         if name == "flight_agent_execute_upload":
             if not any(
                 path.name != "resources" and (path / f"{name}.m").is_file()
@@ -134,6 +136,59 @@ class Engine:
         output = {"result": result, "matlab_version": "test-engine", "figures": ["figure-1.png"]}
         (directory / "output.json").write_text(json.dumps(output))
         kwargs.get("stdout", sys.stdout).write("upload log\n")
+
+    def verification(self, directory):
+        from PIL import Image
+
+        directory = Path(directory)
+        request = json.loads((directory / "request.json").read_text())
+        project = json.loads((directory / "project.json").read_text())
+        assert (directory / "project" / project["config"]["model"]).is_file()
+        assert "LLM_API_KEY" not in os.environ
+        mode = os.environ.get("TEST_ENGINE_MODE", "")
+        if mode == "execution_error":
+            raise MatlabExecutionError("test solver failed")
+        if mode == "verification_block":
+            time.sleep(60)
+        output = {
+            "run_id": request["id"],
+            "project_fingerprint": request["project_fingerprint"],
+            "trim_point": request["trim_point"],
+            "matlab_version": "test-engine",
+            "analyses": [],
+        }
+        if mode == "verification_wrong_context":
+            output["trim_point"] = 2
+        for kind in request["analyses"]:
+            if kind == "step_response":
+                metrics = {
+                    "overshoot": {"value": 5.0, "unit": "%"},
+                    "settling_time": {"value": 2.0, "unit": "s"},
+                }
+                names = ["step-response.mat", "step-response.png"]
+            else:
+                metrics = {
+                    "gain_margin": {"value": 6.0, "unit": "dB"},
+                    "phase_margin": {"value": 45.0, "unit": "deg"},
+                }
+                names = ["stability-margins.mat", "bode.png"]
+            output["analyses"].append(
+                {
+                    "kind": kind,
+                    "valid": True,
+                    "metrics": metrics,
+                    "artifact_paths": names,
+                }
+            )
+            (directory / names[0]).write_bytes(b"MATLAB 5.0 MAT-file, test transport fixture")
+            Image.new("RGB", (2, 2), color="blue").save(directory / names[1])
+            if mode == "verification_missing_artifact":
+                (directory / names[0]).unlink()
+            if mode == "verification_bad_image":
+                (directory / names[1]).write_bytes(b"not PNG")
+        if mode == "verification_missing_branch":
+            output["analyses"] = []
+        (directory / "analysis.json").write_text(json.dumps(output))
 
     def quit(self):
         marker = os.environ.get("TEST_QUIT_FILE")

@@ -16,11 +16,17 @@ from .service import (
 )
 from .upload_engine import execute_upload
 from .upload_models import JobRecord, UploadRequest
+from .verification.worker import project_routes
 
 
 def create_worker_app(root: Path, token: str) -> FastAPI:
-    if os.environ.get("MATLAB_ALLOW_TRUSTED_UPLOADS") != "1":
-        raise ValueError("Set MATLAB_ALLOW_TRUSTED_UPLOADS=1 for explicitly trusted code only")
+    uploads_enabled = os.environ.get("MATLAB_ALLOW_TRUSTED_UPLOADS") == "1"
+    projects_enabled = os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") == "1"
+    if not uploads_enabled and not projects_enabled:
+        raise ValueError(
+            "Set MATLAB_ALLOW_TRUSTED_PROJECTS=1 or MATLAB_ALLOW_TRUSTED_UPLOADS=1 "
+            "for explicitly trusted code only"
+        )
     authorize = bearer_guard(token)
     store = JobStore(root / "runs" / "worker")
     manager = JobManager(store)
@@ -39,6 +45,7 @@ def create_worker_app(root: Path, token: str) -> FastAPI:
     )
     app.add_middleware(BodyLimitMiddleware)
     install_validation_handler(app)
+    app.include_router(project_routes(root, manager, projects_enabled))
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -48,6 +55,8 @@ def create_worker_app(root: Path, token: str) -> FastAPI:
             "service": "matlab-worker",
             "engine_package": engine_available(),
             "trusted_code_only": True,
+            "project_execution": projects_enabled,
+            "upload_execution": uploads_enabled,
         }
 
     def execute(job_id: str) -> None:
@@ -59,6 +68,8 @@ def create_worker_app(root: Path, token: str) -> FastAPI:
 
     @app.post("/jobs", status_code=202)
     def submit(request: UploadRequest) -> JobRecord:
+        if not uploads_enabled:
+            raise HTTPException(status_code=403, detail="Trusted uploads are disabled")
         try:
             return manager.submit(request, execute)
         except BusyError as exc:

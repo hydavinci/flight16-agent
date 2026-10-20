@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "kind": "frequency_response",
+  "loop": "pitch",
+  "frequency_hz": [1.0, 10.0, 100.0],
+  "gain_db": [20.0, 0.0, -20.0],
+  "phase_deg": [-90.0, -135.0, -225.0],
+  "phase_convention": "unwrapped",
+  "feedback_sign": -1
+}

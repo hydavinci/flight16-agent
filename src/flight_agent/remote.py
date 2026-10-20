@@ -2,6 +2,7 @@ import os
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Self
 from urllib.parse import urlsplit
 
 import httpx
@@ -44,7 +45,7 @@ class RemoteWorker:
         self.client = client
 
     @classmethod
-    def from_environment(cls) -> "RemoteWorker":
+    def from_environment(cls) -> Self:
         url = os.environ.get("MATLAB_WORKER_URL", "").strip()
         token = os.environ.get("MATLAB_WORKER_TOKEN", "").strip()
         if not url or not token:

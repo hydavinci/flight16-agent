@@ -94,3 +94,30 @@ def test_web_commands_have_real_cli_help(command):
     assert result.returncode == 0, result.stderr
     assert "--port" in result.stdout
     assert "--project-root" in result.stdout
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_web_native_directory_picker_is_explicit(project, monkeypatch, enabled):
+    import uvicorn
+
+    from flight_agent import web
+
+    calls = []
+    app = object()
+
+    def create(root, **kwargs):
+        calls.append((root, kwargs))
+        return app
+
+    monkeypatch.setattr(web, "create_web_app", create)
+    monkeypatch.setattr(
+        uvicorn, "run",
+        lambda application, **kwargs: calls.append((application, kwargs)),
+    )
+    args = ["web", "--project-root", str(project)]
+    if enabled:
+        args.append("--native-directory-picker")
+
+    assert cli_module().main(args) == 0
+    assert calls[0] == (project, {"native_directory_picker": enabled})
+    assert calls[1] == (app, {"host": "127.0.0.1", "port": 8000, "workers": 1})

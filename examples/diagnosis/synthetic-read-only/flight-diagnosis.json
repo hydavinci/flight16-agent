@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0",
+  "name": "Synthetic read-only diagnostic arithmetic example",
+  "synthetic": true,
+  "design": {
+    "controller": {
+      "id": "synthetic_controller",
+      "version": "demo-1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "plant": {
+      "id": "synthetic_plant",
+      "version": "demo-1",
+      "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "conditions": {
+    "purpose": "Synthetic arithmetic only; no flight-test or MATLAB acceptance evidence.",
+    "design_identity": "Synthetic placeholder identities, not real aircraft models."
+  },
+  "datasets": [
+    {
+      "id": "synthetic_series",
+      "path": "series.json",
+      "kind": "time_series",
+      "source": "synthetic",
+      "parameters": {"gain": 1.0}
+    },
+    {
+      "id": "synthetic_loop",
+      "path": "loop.json",
+      "kind": "frequency_response",
+      "source": "synthetic"
+    }
+  ]
+}

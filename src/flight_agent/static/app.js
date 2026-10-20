@@ -10,7 +10,6 @@ let figureKey = "";
 let imageUrls = [];
 let viewRevision = 0;
 let figureGeneration = 0;
-let inputRevision = 0;
 
 const executionLabels = {
   queued: "等待执行", running: "正在执行", completed: "执行完成",
@@ -235,37 +234,10 @@ function download(name, content, mime) {
 }
 
 $("file").addEventListener("change", () => {
-  inputRevision += 1;
   selectedFile = $("file").files[0] || null;
   $("trusted").checked = false;
   $("filename").textContent = selectedFile
     ? `${selectedFile.name} · ${(selectedFile.size / 1024).toFixed(1)} KB` : "尚未选择文件。";
-});
-
-$("parameters").addEventListener("input", () => { inputRevision += 1; });
-$("kind").addEventListener("change", () => { inputRevision += 1; });
-$("example").addEventListener("change", () => { inputRevision += 1; });
-
-$("load-example").addEventListener("click", async () => {
-  const revision = ++inputRevision;
-  try {
-    const name = $("example").value;
-    const blob = await api(`/api/examples/${name}`, {}, true);
-    if (revision !== inputRevision) return;
-    const parameters = name === "web_metrics.m"
-      ? await (await api("/api/examples/parameters.json", {}, true)).text()
-      : JSON.stringify({ frequency_hz: 1, amplitude: 1, samples: 200 }, null, 2);
-    if (revision !== inputRevision) return;
-    selectedFile = new File([blob], name, { type: "text/plain" });
-    $("file").value = "";
-    $("filename").textContent = `已载入 ${name}（尚未运行）`;
-    $("kind").value = name === "web_script.m" ? "script" : "function";
-    $("parameters").value = parameters;
-    $("trusted").checked = false;
-    notice("");
-  } catch (error) {
-    if (revision === inputRevision) notice(error.message);
-  }
 });
 
 $("run-form").addEventListener("submit", async (event) => {
@@ -275,7 +247,7 @@ $("run-form").addEventListener("submit", async (event) => {
     const file = selectedFile;
     const kind = $("kind").value;
     const timeoutSeconds = Number($("timeout").value);
-    if (!file) throw new Error("请先选择或载入一个 .m 文件。");
+    if (!file) throw new Error("请先选择一个 .m 文件。");
     if (!file.name.endsWith(".m") || file.size > 1000000) {
       throw new Error("请选择不超过 1 MB 的 .m 文件。");
     }

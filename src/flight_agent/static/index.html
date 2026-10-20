@@ -36,15 +36,7 @@
             <span class="muted">单个 UTF-8 文件，最大 1 MB</span>
             <input id="file" type="file" accept=".m" aria-label="上传 MATLAB 文件">
           </div>
-          <div class="example-row">
-            <select id="example" aria-label="示例程序">
-              <option value="web_script.m">波形脚本示例</option>
-              <option value="web_function.m">波形函数示例</option>
-              <option value="web_metrics.m">Agent 指标演示</option>
-            </select>
-            <button id="load-example" type="button" class="button subtle">载入示例</button>
-          </div>
-          <p id="filename" class="hint">尚未选择文件。示例也需要连接真实 worker 才能运行。</p>
+          <p id="filename" class="hint">尚未选择文件。</p>
           <div class="field-grid">
             <div><label for="kind">程序类型</label>
               <select id="kind"><option value="script">脚本</option><option value="function">函数</option></select>
