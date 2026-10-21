@@ -8,6 +8,7 @@ from openai import APIError
 from ..runtime.capabilities import CapabilityRegistry
 from ..runtime.contracts import AnalysisRun, AnalysisSpec, EvidenceFile, ExecutionScope, fingerprint
 from ..runtime.evidence import load_run, persist_run, receipt_name
+from ..runtime.loop import LoopDecision, run_loop
 from .artifacts import describe_artifact
 from .contracts import (
     Artifact,
@@ -26,10 +27,13 @@ from .diagnosis_contracts import (
     DiagnosisTermination,
     DiagnosticAnalysis,
     DiagnosticRound,
+    Hypothesis,
     HypothesisAssessment,
     PendingAnalysis,
     StopReason,
     validate_assessments,
+    validate_history,
+    validate_review,
 )
 from .diagnosis_reports import deliver_diagnosis_report
 from .diagnostic_data import (
@@ -178,12 +182,14 @@ class DiagnosisRuntime:
         )
 
     def _spec(
-        self, baseline: DiagnosisBaseline, project: DiagnosticProject, analysis: DiagnosticAnalysis
+        self, baseline: DiagnosisBaseline, project: DiagnosticProject, analysis: DiagnosticAnalysis,
+        *, hypotheses: list[Hypothesis] | None = None,
     ) -> AnalysisSpec:
         if analysis.capability not in baseline.allowed_capabilities:
             raise ValueError("Analysis capability is outside the confirmed diagnosis scope")
-        if not set(analysis.hypothesis_ids).issubset(item.id for item in baseline.hypotheses):
-            raise ValueError("Analysis refers to an unconfirmed hypothesis")
+        current = baseline.hypotheses if hypotheses is None else hypotheses
+        if not set(analysis.hypothesis_ids).issubset(item.id for item in current):
+            raise ValueError("Analysis refers to an unknown hypothesis")
         definition = self.tools.definition(analysis.capability)
         if (
             definition.effect != "read_only"
@@ -211,8 +217,13 @@ class DiagnosisRuntime:
         reason: str,
         version: int,
         evidence: list[str],
+        *,
+        hypotheses: list[Hypothesis] | None = None,
     ) -> DiagnosisPlanRevision:
-        specs = [self._spec(baseline, project, analysis) for analysis in analyses]
+        specs = [
+            self._spec(baseline, project, analysis, hypotheses=hypotheses)
+            for analysis in analyses
+        ]
         return DiagnosisPlanRevision(
             version=version,
             baseline_version=baseline.version,
@@ -235,11 +246,16 @@ class DiagnosisRuntime:
             for index, analysis in enumerate(plan.analyses)
         ]
 
-    def _verify_plan(self, task: DiagnosisTask, plan: DiagnosisPlanRevision) -> None:
+    def _verify_plan(
+        self, task: DiagnosisTask, plan: DiagnosisPlanRevision,
+        *, hypotheses: list[Hypothesis] | None = None,
+        analyses: list[DiagnosticAnalysis] | None = None,
+    ) -> None:
         if plan.baseline_version != task.baseline.version:
             raise ValueError("Diagnostic plan is bound to a different baseline")
         expected = self._plan(
-            task.baseline, task.project, plan.analyses, plan.reason, plan.version, plan.evidence
+            task.baseline, task.project, plan.analyses if analyses is None else analyses,
+            plan.reason, plan.version, plan.evidence, hypotheses=hypotheses,
         )
         if plan != expected:
             raise ValueError("Persisted diagnostic plan specifications do not match the baseline")
@@ -365,6 +381,7 @@ class DiagnosisRuntime:
             return None
         call = ToolCall(
             id=uuid4().hex, node_id=node.id, tool=spec.capability,
+            tool_version=spec.capability_version,
             baseline_version=task.baseline.version, started_at=now(),
             inputs={"spec": spec.model_dump(mode="json"), "plan_version": plan.version},
         )
@@ -403,8 +420,10 @@ class DiagnosisRuntime:
         persist_run(directory, run)
         return self._accept(conversation, task, node, call, run, "execution")
 
-    def _review(self, task: DiagnosisTask, review: DiagnosisReview) -> None:
-        validate_assessments(task.baseline.hypotheses, review.assessments, task.analysis_runs)
+    def _review(self, task: DiagnosisTask, review: DiagnosisReview) -> list[Hypothesis]:
+        if review.summary is None:
+            raise ValueError("A new diagnosis review requires an explicit structured summary")
+        return validate_review(task.current_hypotheses, review, task.analysis_runs)
 
     def _stop(self, task: DiagnosisTask, reason: StopReason, detail: str) -> None:
         unknowns = [
@@ -450,12 +469,23 @@ class DiagnosisRuntime:
         self.store.save(conversation)
         try:
             self._inputs(task)
-            if [plan.version for plan in task.plan_revisions] != list(
-                range(1, len(task.plan_revisions) + 1)
-            ):
-                raise ValueError("Diagnostic plan revisions must be contiguous and append-only")
-            for plan in task.plan_revisions:
-                self._verify_plan(task, plan)
+            current = validate_history(
+                task.baseline.hypotheses, task.plan_revisions, task.rounds, task.analysis_runs
+            )
+            validate_assessments(current, task.assessments, task.analysis_runs)
+            if task.rounds and task.assessments != task.rounds[-1].review.assessments:
+                raise ValueError("Recorded assessments differ from the final evidence review")
+            if len(task.rounds) == len(task.plan_revisions) and task.termination is None:
+                raise ValueError("Completed diagnostic rounds require an explicit stop reason")
+            hypotheses = task.baseline.hypotheses
+            for index, plan in enumerate(task.plan_revisions):
+                prior = task.rounds[index - 1].review if index else None
+                if prior and prior.hypothesis_revision:
+                    hypotheses = prior.hypothesis_revision.hypotheses
+                self._verify_plan(
+                    task, plan, hypotheses=hypotheses,
+                    analyses=prior.analyses if prior else None,
+                )
             expected = [
                 node.model_dump(include={"id", "tool", "inputs", "depends_on"})
                 for plan in task.plan_revisions for node in self._nodes(plan)
@@ -469,7 +499,16 @@ class DiagnosisRuntime:
             for recorded_run in task.analysis_runs:
                 self._verified_run(task, recorded_run.id, recorded_run.spec)
             self.store.save(conversation)
-            while task.termination is None:
+            def decide() -> LoopDecision:
+                return LoopDecision(
+                    action="stop" if task.termination is not None else "continue",
+                    reason=(
+                        task.termination.detail if task.termination is not None
+                        else "Execute and review the next confirmed evidence round"
+                    ),
+                )
+
+            def execute() -> None:
                 plan = task.plan_revisions[-1]
                 run_ids = []
                 for index in range(len(plan.analyses)):
@@ -482,7 +521,7 @@ class DiagnosisRuntime:
                         break
                     run_ids.append(run.id)
                 if task.termination is not None or self._budget(task):
-                    break
+                    return
                 task.stage = "review_evidence"
                 self.store.save(conversation)
                 review = self.planner.review_diagnosis(
@@ -492,11 +531,11 @@ class DiagnosisRuntime:
                         if item["name"] in task.baseline.allowed_capabilities
                     ],
                 )
-                self._review(task, review)
+                current = self._review(task, review)
                 next_plan = (
                     self._plan(
                         task.baseline, task.project, review.analyses, review.reason,
-                        plan.version + 1, run_ids,
+                        plan.version + 1, run_ids, hypotheses=current,
                     ) if review.action == "continue" else None
                 )
                 progressed = any(
@@ -525,7 +564,11 @@ class DiagnosisRuntime:
                 elif not self._budget(task) and next_plan is not None:
                     task.plan_revisions.append(next_plan)
                     task.nodes.extend(self._nodes(next_plan))
-                self.store.save(conversation)
+            run_loop(
+                decide=decide, execute=execute,
+                persist=lambda: self.store.save(conversation),
+                scope=self._scope(task), max_steps=task.baseline.budget.max_rounds,
+            )
             self._finish(conversation, task)
         except (APIError, OSError, ValueError, RuntimeError) as exc:
             logger.exception("Diagnosis execution failed for %s", task.id)

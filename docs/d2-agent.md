@@ -5,6 +5,9 @@
 D2 analyzes explicitly registered time-series and frequency-response JSON data
 on the **Agent/Web host**. It does not run the MATLAB worker, execute project
 code, import arbitrary files, generate new simulations or modify a controller.
+This is the bounded offline portion of Demo 2, not the full roadmap workflow:
+active additional Simulink runs and real fault-attribution acceptance remain
+unimplemented or unverified.
 D1 still accepts a prepared Simulink project on the **Worker host** and keeps
 its existing fixed verification plan; see `docs/d1-agent.md`.
 
@@ -16,7 +19,8 @@ artifact downloads. D2 adds a bounded policy loop:
 inspect registered data -> propose hypotheses, scope and initial analyses
   -> user confirms the current baseline
   -> verify and snapshot inputs -> run registered read-only analyses
-  -> review cited evidence and update every confirmed hypothesis
+  -> review cited evidence, record bounded hypothesis revisions and a summary
+  -> assess every current hypothesis, preserving the original baseline
   -> append the next plan within the confirmed scope, or stop explicitly
   -> persist diagnosis JSON, Word report and evidence index
 ```
@@ -27,11 +31,23 @@ the existing `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` and optional
 No MATLAB installation, Worker token or trusted-project Worker switch is needed
 for these D2 adapters. There is no production scripted-model fallback.
 
-Choose D2 in a **new** Web conversation. D1 remains the default, and an existing
-conversation cannot switch scenarios. D2 project browsing lists Agent-host
+The Web entry defaults to **auto**: knowledge questions need no directory or
+Worker, while execution requests are routed to registered workflows. Select D2
+explicitly or let auto enter it after verification in the same conversation.
+Every stage requires a new confirmed baseline; switching clears the selected
+project/data and output roots rather than inheriting D1's Worker project or
+reports. Missing registered diagnostic data pauses the next stage and cannot
+resume the old task. Previous tasks and downloads remain archived. Unknown
+in-flight calls must be reconciled before switching or dispatching new work.
+D2 project browsing lists Agent-host
 directories; output browsing also uses that host. The optional native macOS
 picker still requires a same-machine desktop, but D2 does not require a local
 Worker. Browsing or selecting a folder never grants confirmation.
+The light, task-first interface shows progress, the next required action and
+structured findings before technical records. History is initially collapsed
+on narrow screens. Technical JSON and non-Word evidence downloads are
+expandable; polling preserves expanded details and earlier message positions.
+Consent and execution-boundary warnings remain visible before confirmation.
 
 The Web process retains its existing single execution slot and local storage.
 Do not run multiple processes against the same conversation store. Existing
@@ -160,21 +176,52 @@ integrity failures and execution errors are reported separately.
 ## Confirmation, review and stopping
 
 The proposed baseline records the objective, design and project identity,
-up to eight hypotheses, an allowlist of capability names and versions, and a
-resource budget. Each plan revision has up to four analyses, exact validated
+up to eight initial hypotheses, an allowlist of capability names and versions,
+and a resource budget. Each hypothesis has an ID, statement and `priority`
+(`high`, `medium` or `low`, default `medium`). Priority is analysis ordering,
+not confidence or a calibrated likelihood. Each plan revision has up to four analyses, exact validated
 inputs, the confirmed baseline version and its preceding evidence references.
 Confirmation must identify the current version and explicitly set `trusted`.
 For D2 this authorizes the recorded read-only scope, not project execution,
 model editing, parameter changes or arbitrary Python.
 
-After each completed round, the model must assess **every confirmed
-hypothesis** as `supported`, `refuted` or `unknown`. Support/refutation requires
+After each completed round, the model must assess **every current hypothesis**
+as `supported`, `refuted` or `unknown`. Support/refutation requires
 citations to recorded analysis IDs and, when supplied, real metric names.
 Invalid evidence cannot support or refute a hypothesis. Unknown hypotheses
-require explicit unknowns. New analyses must stay within the confirmed
-capabilities and hypothesis set; a new broader task requires a new baseline.
+require explicit unknowns.
 
-The runtime verifies citation existence and output validity. It does **not**
+A review may include `hypothesis_revision` with the complete revised
+`hypotheses` snapshot, a `reason` and nonempty `evidence` citations. It may add
+an ID, reword a statement or change priority, but must preserve every existing
+ID and retain at most eight hypotheses. No-op revisions, duplicate IDs and
+invalid or unavailable evidence are rejected. The baseline and earlier rounds
+are not overwritten. The review assesses the revised set, and its next
+analyses must refer to that set. New analyses still cannot expand confirmed
+data, capability permissions or budgets; broader scope needs a new baseline.
+
+Every new review also requires a structured `summary`:
+
+| Field | Meaning |
+|---|---|
+| `problem` | The observed problem, not an invented cause |
+| `localization` | The best supported location or an explicit inability to localize |
+| `responsibility` | `model`, `control` or `undetermined` |
+| `reason` | The explanation and limitations of the attribution |
+| `hypothesis_ids` | Current hypotheses associated with the summary |
+| `evidence` | Recorded `{run_id, metric?}` references |
+| `recommendations` | One to eight follow-up suggestions, never executable changes |
+
+Attributing responsibility to `model` or `control` requires supported
+hypotheses and valid citations already used by those hypotheses. Otherwise
+the review must retain `undetermined`; the UI displays this as "尚无法归属".
+Recommendations do not authorize simulation, parameter changes or model edits.
+Old persisted reviews without these new fields remain readable. A missing
+legacy summary is explicitly marked unavailable, rather than generated from
+the old status labels.
+
+The runtime verifies citation existence, output validity and these structural
+attribution conditions. It does **not**
 independently prove that a model's causal explanation follows from the data.
 Treat the explanation and its sufficiency judgment as reviewable hypotheses,
 not deterministic flight-control acceptance.
@@ -185,6 +232,11 @@ not deterministic flight-control acceptance.
 | `max_calls` | 12 | 1-40 |
 | `max_seconds` | 300 | 1-3600 |
 | `max_no_progress` | 2 | 1-5 |
+
+The shared `runtime.loop.run_loop` drives D1 dependency nodes, D2 rounds and
+generic capability nodes. D2's decision policy still owns evidence review,
+hypothesis changes and its explicit stop reasons; D1 does not gain an LLM review
+after every numerical result.
 
 Budgets are checked at loop boundaries, not enforced as operating-system
 resource quotas. The wall-clock budget starts with execution and includes
@@ -218,6 +270,14 @@ spec can reuse a numerical result; a different window or design is another
 branch, even when its capability name is unchanged. The same evidence kernel
 serves D1; D1 evaluation and report caches remain separate from numerical data.
 
+Hypothesis revisions are stored inside `task.rounds[].review`, not as a second
+mutable baseline. The current set is derived by replaying those snapshots.
+Resume and delivery validate the contiguous plan/review history: each next
+plan must match the preceding review's requested capabilities, hypothesis
+references and normalized inputs. Citations can use only evidence available
+at that round, not later receipts. A changed projection or inconsistent
+history fails explicitly rather than silently becoming the current state.
+
 Receipts live in `numerical/analysis-runs/<run-id>.json`. A call is recorded as
 pending before dispatch and its receipt is persisted before task acknowledgement.
 On explicit resume, a matching valid receipt is recovered without calling the
@@ -225,12 +285,21 @@ adapter again. If an in-flight call has no receipt, execution is unknown:
 the runtime records `unknown_execution` instead of silently redispatching.
 This is a fail-closed recovery contract, not a general exactly-once execution
 guarantee. Restarted work requires explicit continuation.
+Capability versions are fixed in the proposed scope before confirmation and
+dispatch. A pending adapter upgrade requires a new proposal and confirmation;
+completed or recovered calls retain the version in their original specification,
+not the currently registered adapter's version.
 
 Deliveries under `delivery-v<baseline-version>/` include a DOCX diagnosis
 report, `diagnosis.json`, `execution_record.json` and an artifact index.
-They retain design/baseline identity, plan revisions, hypothesis assessments,
-run/metric citations, unknowns, budget state and the termination reason.
-Citation validation is repeated at delivery. Downloads use recorded paths and
+They retain design/baseline identity, plan revisions, current hypotheses and
+priorities, structured diagnosis, run/metric citations, unknowns, budget state
+and the termination reason. `diagnosis.json` includes `summary`,
+`current_hypotheses` and `hypothesis_revisions` (each with `plan_version` and
+the recorded `revision`); the execution record and Word report retain the same
+evolution. Legacy deliveries can have a null summary with an explicit
+"Structured diagnosis unavailable" explanation in Word.
+History and citation validation are repeated at delivery. Downloads use recorded paths and
 verified hashes, not arbitrary filesystem paths. These local files are not a
 cryptographically signed or externally witnessed audit log.
 
@@ -246,7 +315,7 @@ Use the existing Web bootstrap token (`X-Flight-Token`) and same-origin policy:
 | Request | D2 behavior |
 |---|---|
 | `POST /api/conversations` | `{"scenario":"d2","message":"...","project_root":"/absolute/agent/data"}` proposes a baseline; optional `output_root` selects the Agent-host results root |
-| `POST /api/conversations/{id}/messages` | Follow-up, clarification or a new proposal in the same scenario; questions preserve an existing task's lifecycle |
+| `POST /api/conversations/{id}/messages` | Follow-up or clarification; optional `scenario: "auto"`, `"d1"` or `"d2"` switches mode subject to unknown-execution guards; questions preserve an existing task's lifecycle |
 | `POST /api/conversations/{id}/confirm` | `{"version":1,"trusted":true}` confirms the current baseline |
 | `POST /api/conversations/{id}/resume` | Continue saved work with receipt reconciliation, not a duplicate unknown dispatch |
 | `GET /api/conversations/{id}` | Read durable baseline, plans, analysis runs, reviews, unknowns, termination and artifacts |
@@ -255,7 +324,12 @@ Use the existing Web bootstrap token (`X-Flight-Token`) and same-origin policy:
 Mutation acknowledgements are not completion responses; poll the conversation.
 The existing D1 `retry` and failure-proposal `replan` controls reject D2.
 Omitting `output_root` preserves the current choice, and `""` resets it to the
-default. D2 never falls back to a Worker or silently switches host.
+default within the current stage. A workflow transition requires a separate
+root selection. D2 never falls back to a Worker or silently switches host.
+`GET /api/conversations/workflows` returns registered workflow definitions,
+versions, input schemas and directory requirements. The low-level HTTP create
+request retains legacy D1 behavior when `scenario` is omitted; Web and CLI
+explicitly select auto for a new default session.
 
 The CLI talks to the already-running local Web API, so it uses the same state
 owner as the browser:
@@ -270,6 +344,11 @@ flight-agent directory-task status CONVERSATION_ID
 flight-agent directory-task resume CONVERSATION_ID
 flight-agent directory-task propose --conversation CONVERSATION_ID \
   --request "Explain the cited evidence and remaining limitations."
+
+# Change the mode explicitly; supply separate Agent-host registered data for D2.
+flight-agent directory-task propose --conversation CONVERSATION_ID --scenario d2 \
+  --project-root "$PWD/examples/diagnosis/synthetic-read-only" \
+  --request "Diagnose the recorded response after the completed verification."
 ```
 
 Replace the ID and version with the proposed values and inspect the plan before
@@ -280,6 +359,8 @@ follow redirects or environment proxies, and does not load `.env` from the
 data directory. A client timeout does not cancel the server-side task.
 Output is the persisted conversation JSON. Exit code 0 does not establish
 diagnostic sufficiency; inspect the termination and unknowns.
+CLI new sessions default to auto; omit `--scenario` on follow-ups to preserve
+the current mode, or use `--scenario auto|d1|d2` explicitly.
 
 ## Extension and acceptance boundaries
 
@@ -292,9 +373,13 @@ optimization algorithms, topology representation, automatic design changes or
 adoption UI is implemented.
 
 Automated synthetic cases cover known calculations, multiple successful
-evidence-driven rounds, exact-spec reuse, real run/metric references, explicit
+evidence-driven rounds, cited hypothesis revisions and priorities, conservative
+structured attribution, exact-spec reuse, real run/metric references, explicit
 unknowns, budget stops, snapshot integrity and receipt-based recovery. They
 establish software behavior, not real fault attribution. Real labeled D2 data
 and engineering-reviewed diagnostic criteria are still needed. D1 likewise
 still needs independent numerical references and agreed tolerances; D2 does not
 replace those acceptance requirements.
+The full roadmap's active additional Simulink analysis is not implemented:
+these adapters work only on already registered records. D1 execution support
+does not make that capability available to the D2 policy loop.

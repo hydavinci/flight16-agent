@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from ..jobs import BusyError, JobManager
+from ..runtime.intents import Scenario
 from .artifacts import verify_artifact
 from .contracts import Conversation, PendingDecision, VerificationTask
 from .runtime import VerificationRuntime
@@ -22,7 +23,7 @@ class MessageRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     project_root: str | None = Field(default=None, max_length=4096)
     output_root: str | None = Field(default=None, max_length=4096)
-    scenario: Literal["d1", "d2"] | None = None
+    scenario: Scenario | None = None
 
     @field_validator("message")
     @classmethod
@@ -126,7 +127,8 @@ class ConversationManager:
             record = self.runtime.store.get(conversation_id)
             task = record.task
             if task is None:
-                raise ValueError("No verification task has been planned")
+                raise ValueError("No task has been planned")
+            self.runtime._check_active_task(record, task)
             if request is not None and request.version != task.baseline.version:
                 raise ValueError("Confirmation baseline version is stale")
             if action in ("confirm", "resume") and record.status == "completed":
@@ -239,6 +241,10 @@ def verification_router(
         with request_errors():
             return manager.submit(None, request)
         raise AssertionError("Unreachable")
+
+    @router.get("/workflows")
+    def workflows() -> list[dict[str, object]]:
+        return runtime.workflows.catalog()
 
     @router.get("/{conversation_id}")
     def status(conversation_id: str) -> Conversation:

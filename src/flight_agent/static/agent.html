@@ -3,75 +3,60 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>目录验证 Agent · D1 / D2</title>
+  <title>飞控工程 Agent</title>
   <link rel="stylesheet" href="/static/agent.css">
   <script src="/static/agent.js" defer></script>
 </head>
 <body>
   <aside class="sidebar">
-    <div class="brand">FLIGHT / D1 + D2</div>
-    <button id="new-conversation" type="button">新建会话</button>
-    <h2>最近会话</h2>
-    <nav id="conversation-history" aria-label="最近会话"></nav>
-    <div class="environment">
-      <p id="worker-state">正在检查 Worker 配置…</p>
-      <p id="model-state">正在检查模型配置…</p>
-      <a href="/workbench">打开原 MATLAB 分析工作台</a>
+    <div class="sidebar-top">
+      <div class="brand">FLIGHT <span>ENGINEERING</span></div>
+      <button id="new-conversation" type="button">新建会话</button>
     </div>
+    <details id="history-panel" open>
+      <summary>最近会话</summary>
+      <nav id="conversation-history" aria-label="最近会话"></nav>
+      <details class="environment">
+        <summary>运行环境</summary>
+        <p id="worker-state">正在检查 Worker 配置…</p>
+        <p id="model-state">正在检查模型配置…</p>
+        <a href="/workbench">打开原 MATLAB 分析工作台</a>
+      </details>
+    </details>
   </aside>
   <main>
     <header>
       <div>
-        <h1>目录验证 Agent · D1 / D2</h1>
-        <p>只读检查工程 · 确认基线 · 受控执行 · 证据交付</p>
+        <p class="eyebrow">知识、验证与诊断</p>
+        <h1>飞控工程 Agent</h1>
+        <p class="subtitle">从需求到证据，每一步都可追溯。</p>
       </div>
       <span id="conversation-status" class="badge" role="status">新会话</span>
     </header>
+    <div class="workflow">
+      <ol id="task-progress" aria-label="任务进度">
+        <li aria-current="step"><span>1</span>明确需求</li>
+        <li><span>2</span>确认基线</li>
+        <li><span>3</span>执行分析</li>
+        <li><span>4</span>查看交付</li>
+      </ol>
+      <p id="next-action" role="status">直接描述需求；知识问答不需要目录，工程任务执行前需确认基线。</p>
+    </div>
     <p id="scenario-boundary" class="boundary">
-      D1 仅支持已注册的 Simulink 工程、配平点 1 的时域响应与稳定裕度。
-      不修改源工程、控制律或模型拓扑，不自动配平、调参或推断故障根因。
-      没有确认判据或有效证据时，结论为 UNDETERMINED。
+      自动模式先识别意图，只调用已注册能力。知识回答不构成工程证据；
+      工程阶段分别确认输入范围、能力版本、权限与预算，不跨阶段沿用授权。
     </p>
     <div id="notice" role="alert" hidden></div>
-    <section class="card" aria-labelledby="conversation-heading">
-      <h2 id="conversation-heading">验证会话</h2>
-      <div id="messages" aria-live="polite"></div>
-      <form id="composer">
-        <label for="scenario">任务类型</label>
-        <select id="scenario">
-          <option value="d1">D1 · 确认式验证</option>
-          <option value="d2">D2 · 证据驱动诊断</option>
-        </select>
-        <label id="project-label" for="project-root">工程目录</label>
-        <div class="directory-field">
-          <input id="project-root" type="text" maxlength="4096" autocomplete="off"
-                 placeholder="MATLAB Worker 可见的工程目录，例如 D:\F16_package">
-          <button id="browse-project" type="button" aria-label="浏览工程目录"
-                  aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
-        </div>
-        <p id="project-hint" class="hint">
-          路径属于 Worker 所在机器；也可在聊天中写“工程目录：/绝对路径”。
-          路径包含空格时请用引号包围。这里只读取清单，执行前仍需单独确认可信工程。
-        </p>
-        <label for="output-root">输出根目录</label>
-        <div class="directory-field">
-          <input id="output-root" type="text" maxlength="4096" autocomplete="off"
-                 placeholder="Agent 所在机器的绝对目录；留空使用默认位置">
-          <button id="browse-output" type="button" aria-label="浏览输出根目录"
-                  aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
-        </div>
-        <p class="hint">
-          不是远程 Worker 路径。每个任务新建独立子目录，不覆盖历史成果。
-          可在聊天中写“输出目录：/绝对路径”；修改或清空目录栏后，随验证需求发送才会生效。
-        </p>
-        <label id="request-label" for="message">验证需求</label>
-        <textarea id="message" rows="3" maxlength="4000" required
-                  placeholder="说明分析类型、评价阈值和报告分组；也可追问已有结果。"></textarea>
-        <div class="composer-actions">
-          <span id="composer-hint" class="hint">更改阈值或报告分组会复用有效证据；增加分析只运行缺失分支。</span>
-          <button id="send" type="submit" disabled>发送</button>
-        </div>
-      </form>
+    <section id="evaluation-card" class="card" aria-labelledby="evaluation-heading" hidden>
+      <h2 id="evaluation-heading">评价结果</h2>
+      <div id="evaluation"></div>
+      <p id="explanation" class="hint"></p>
+    </section>
+    <section id="delivery-card" class="card" aria-labelledby="delivery-heading" hidden>
+      <h2 id="delivery-heading">交付物</h2>
+      <p class="hint">下载时核对文件类型、大小与 SHA-256；历史版本保留，不覆盖原报告。</p>
+      <p id="results-directory" class="hint"></p>
+      <div id="artifacts"></div>
     </section>
     <section id="baseline-card" class="card" aria-labelledby="baseline-heading" hidden>
       <h2 id="baseline-heading">评价基线</h2>
@@ -102,16 +87,46 @@
         <pre id="execution-log"></pre>
       </details>
     </section>
-    <section id="evaluation-card" class="card" aria-labelledby="evaluation-heading" hidden>
-      <h2 id="evaluation-heading">评价结果</h2>
-      <div id="evaluation"></div>
-      <p id="explanation"></p>
-    </section>
-    <section id="delivery-card" class="card" aria-labelledby="delivery-heading" hidden>
-      <h2 id="delivery-heading">交付物</h2>
-      <p class="hint">每次下载均核对文件类型、大小和 SHA-256。历史版本保留，不覆盖原报告。</p>
-      <p id="results-directory"></p>
-      <div id="artifacts"></div>
+    <section class="card" aria-labelledby="conversation-heading">
+      <h2 id="conversation-heading">任务会话</h2>
+      <div id="messages" aria-live="polite"></div>
+      <form id="composer">
+        <label for="scenario">任务类型</label>
+        <select id="scenario">
+          <option value="auto" selected>自动 · 知识与工程任务</option>
+          <option value="d1">D1 · 确认式验证</option>
+          <option value="d2">D2 · 证据驱动诊断</option>
+        </select>
+        <label id="project-label" for="project-root">工程目录</label>
+        <div class="directory-field">
+          <input id="project-root" type="text" maxlength="4096" autocomplete="off"
+                 placeholder="MATLAB Worker 可见的工程目录，例如 D:\F16_package">
+          <button id="browse-project" type="button" aria-label="浏览工程目录"
+                  aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
+        </div>
+        <p id="project-hint" class="hint">
+          路径属于 Worker 所在机器；也可在聊天中写“工程目录：/绝对路径”。
+          路径包含空格时请用引号包围。这里只读取清单，执行前仍需单独确认可信工程。
+        </p>
+        <label for="output-root">输出根目录</label>
+        <div class="directory-field">
+          <input id="output-root" type="text" maxlength="4096" autocomplete="off"
+                 placeholder="Agent 所在机器的绝对目录；留空使用默认位置">
+          <button id="browse-output" type="button" aria-label="浏览输出根目录"
+                  aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
+        </div>
+        <p class="hint">
+          不是远程 Worker 路径。每个任务新建独立子目录，不覆盖历史成果。
+          可在聊天中写“输出目录：/绝对路径”；修改或清空目录栏后，随验证需求发送才会生效。
+        </p>
+        <label id="request-label" for="message">验证需求</label>
+        <textarea id="message" rows="3" maxlength="4000" required
+                  placeholder="说明分析类型、评价阈值和报告分组；也可追问已有结果。"></textarea>
+        <div class="composer-actions">
+          <span id="composer-hint" class="hint">更改阈值或报告分组会复用有效证据；增加分析只运行缺失分支。</span>
+          <button id="send" class="primary" type="submit" disabled>发送</button>
+        </div>
+      </form>
     </section>
   </main>
   <dialog id="directory-picker" aria-labelledby="directory-title" aria-describedby="directory-host">

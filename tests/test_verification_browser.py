@@ -44,6 +44,7 @@ def test_browser_native_picker_fills_both_fields_without_submitting(
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("工程目录", exact=True).fill(str(root.parent))
             page.get_by_label("验证需求").fill("Keep this unsent request.")
             for target, expected_path in (("project", root), ("output", output)):
@@ -92,6 +93,7 @@ def test_browser_native_picker_cancel_and_errors_preserve_input(
             page.route("**/api/directories/select", lambda route: route.fulfill(json={"path": 42}))
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("输出根目录", exact=True).fill(str(tmp_path))
             page.get_by_label("验证需求").fill("Keep this unsent request.")
             with page.expect_response("**/api/directories/select", timeout=3000):
@@ -131,6 +133,7 @@ def test_browser_native_picker_ignores_previous_conversation_response(
         page.route("**/api/directories/select", lambda route: pending.append(route))
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("输出根目录", exact=True).fill("/old/output")
             page.get_by_label("验证需求").fill("Do not send this request.")
             with page.expect_request("**/api/directories/select", timeout=3000):
@@ -143,6 +146,7 @@ def test_browser_native_picker_ignores_previous_conversation_response(
             expect(page.locator("#browse-output")).to_have_text("正在选择…")
             page.locator("#composer").evaluate("(form) => form.requestSubmit()")
             page.get_by_role("button", name="新建会话", exact=True).click()
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("工程目录", exact=True).fill("/new/project")
             page.get_by_label("输出根目录", exact=True).fill("/new/output")
             page.get_by_label("验证需求").fill("New unsent request.")
@@ -186,6 +190,7 @@ def test_browser_native_picker_cannot_overwrite_edited_field(project, tmp_path):
         page.route("**/api/directories/select", lambda route: pending.append(route))
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             with page.expect_request("**/api/directories/select", timeout=3000):
                 page.locator("#browse-output").click(timeout=3000)
             page.locator("#output-root").evaluate("(input) => { input.value = '/new/output'; }")
@@ -221,6 +226,7 @@ def test_browser_browses_both_hosts_without_submitting(
             page.on("pageerror", lambda error: errors.append(str(error)))
             try:
                 page.goto(url)
+                page.locator("#scenario").select_option("d1")
                 for target in ("project", "output"):
                     button = page.locator(f"#browse-{target}")
                     expect(button).to_be_enabled()
@@ -282,6 +288,7 @@ def test_browser_browse_cancel_and_errors_preserve_input(project, tmp_path):
         page = browser.new_page()
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("输出根目录", exact=True).fill(str(root))
             page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
             dialog = page.get_by_role("dialog", name="选择输出根目录")
@@ -323,6 +330,7 @@ def test_browser_browse_ignores_late_response_after_cancel_and_reopen(
         page.route("**/api/directories?**", lambda route: pending.append(route))
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("输出根目录", exact=True).fill("/keep-output")
             with page.expect_request("**/api/directories?**"):
                 page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
@@ -367,6 +375,7 @@ def test_browser_browse_pending_response_cannot_overwrite_edited_address(project
         page.route("**/api/directories?**", lambda route: pending.append(route))
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             with page.expect_request("**/api/directories?**"):
                 page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
             dialog = page.get_by_role("dialog", name="选择输出根目录")
@@ -379,6 +388,7 @@ def test_browser_browse_pending_response_cannot_overwrite_edited_address(project
             expect(dialog.get_by_label("目录地址")).to_have_value("/new-address")
             expect(dialog.get_by_role("button", name="选择此目录")).to_be_disabled()
             page.locator("#new-conversation").evaluate("(button) => button.click()")
+            page.locator("#scenario").select_option("d1")
             expect(dialog).not_to_be_visible()
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
         finally:
@@ -401,6 +411,7 @@ def test_browser_browse_buttons_are_disabled_while_sending(project, tmp_path):
         )
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             project_browse = page.get_by_role("button", name="浏览工程目录", exact=True)
             output_browse = page.get_by_role("button", name="浏览输出根目录", exact=True)
             expect(project_browse).to_be_enabled(timeout=3000)
@@ -411,6 +422,7 @@ def test_browser_browse_buttons_are_disabled_while_sending(project, tmp_path):
             expect(project_browse).to_be_disabled()
             expect(output_browse).to_be_disabled()
             page.get_by_role("button", name="新建会话", exact=True).click()
+            page.locator("#scenario").select_option("d1")
             pending[0].fulfill(status=503, json={"detail": "old send failed"})
             expect(project_browse).to_be_enabled()
             expect(output_browse).to_be_enabled()
@@ -431,7 +443,8 @@ def test_browser_directory_conversation_confirmation_delivery_and_history(projec
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
-            expect(page.get_by_role("heading", name="目录验证 Agent")).to_be_visible()
+            page.locator("#scenario").select_option("d1")
+            expect(page.get_by_role("heading", name="飞控工程 Agent")).to_be_visible()
             page.get_by_label("工程目录", exact=True).fill(str(root))
             page.get_by_label("验证需求").fill("Perform pitch step verification.")
             page.get_by_role("button", name="发送", exact=True).click()
@@ -492,6 +505,7 @@ def test_browser_chat_directories_refresh_fields_without_resubmitting_stale_path
         page = browser.new_page()
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             message = f'工程目录：“{root}”；输出目录：“{output}”。验证阶跃。'
             page.get_by_label("验证需求").fill(message)
             with page.expect_request("**/api/conversations") as posted:
@@ -500,7 +514,7 @@ def test_browser_chat_directories_refresh_fields_without_resubmitting_stale_path
             expect(page.locator("#baseline")).to_contain_text("Agent 所在机器")
             expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(output))
-            assert posted.value.post_data_json == {"message": message}
+            assert posted.value.post_data_json == {"message": message, "scenario": "d1"}
             expect(page.locator("#delivery-card")).to_be_hidden()
             assert not backend.calls
             page.get_by_label("我已核对基线，并确认该工程代码可信").check()
@@ -543,6 +557,7 @@ def test_browser_output_selection_reset_and_reload_preserve_numerical_and_histor
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("工程目录", exact=True).fill(str(root))
             page.get_by_label("输出根目录", exact=True).fill(str(first_output))
             page.get_by_label("验证需求").fill("Verify pitch step.")
@@ -594,6 +609,7 @@ def test_browser_output_selection_reset_and_reload_preserve_numerical_and_histor
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=15000)
             assert len(backend.calls) == 1
             page.get_by_role("button", name="新建会话", exact=True).click()
+            page.locator("#scenario").select_option("d1")
             expect(page.get_by_label("工程目录", exact=True)).to_have_value("")
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
             page.locator(f'#conversation-history button[data-id="{first.id}"]').click()
@@ -690,6 +706,7 @@ def test_browser_interrupted_execution_can_resume_without_duplicate_submission(p
         page = browser.new_page()
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("工程目录", exact=True).fill(str(root))
             page.get_by_label("验证需求").fill("Verify pitch step.")
             page.get_by_role("button", name="发送", exact=True).click()
@@ -722,6 +739,7 @@ def test_browser_renders_model_messages_as_text_and_keeps_failed_input(project, 
         page = browser.new_page()
         try:
             page.goto(url)
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("工程目录", exact=True).fill(str(root))
             page.get_by_label("验证需求").fill("Clarify the project.")
             page.get_by_role("button", name="发送", exact=True).click()
@@ -791,6 +809,7 @@ def test_browser_discards_old_selection_response_after_starting_a_new_conversati
                 page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.get_by_role("button", name="发送", exact=True)).to_be_disabled()
             page.get_by_role("button", name="新建会话", exact=True).click()
+            page.locator("#scenario").select_option("d1")
             page.get_by_label("验证需求").fill("New unsent request.")
             page.get_by_label("工程目录", exact=True).fill("/new/project")
             page.get_by_label("输出根目录", exact=True).fill("/new/output")

@@ -88,6 +88,8 @@ def directory_task(args: argparse.Namespace) -> int:
                 value = getattr(args, field)
                 if value is not None:
                     body[field] = value
+            if identifier is None and args.scenario is None:
+                body["scenario"] = "auto"
             record = request(
                 "POST", f"{base}/{identifier}/messages" if identifier else base, body
             )
@@ -120,20 +122,24 @@ def directory_task(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Local directory-based verification agent")
+    parser = argparse.ArgumentParser(description="Local flight-engineering agent")
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("doctor", help="Inspect configuration without external calls")
     analyze = commands.add_parser("analyze", help="Analyze a JSON file using the real agent")
     web = commands.add_parser("web", help="Serve the local Web interface")
     worker = commands.add_parser("worker", help="Serve the trusted-project MATLAB worker")
     directory = commands.add_parser(
-        "directory-task", help="Use the running local Web API for persistent D1/D2 tasks"
+        "directory-task",
+        help="Use the local Web API for knowledge and persistent engineering tasks",
     )
     directory.add_argument("--server", default="http://127.0.0.1:8000")
     directory.add_argument("--timeout", type=int, default=360)
     actions = directory.add_subparsers(dest="action", required=True)
     propose = actions.add_parser("propose", help="Propose a task without executing it")
-    propose.add_argument("--scenario", choices=("d1", "d2"))
+    propose.add_argument(
+        "--scenario", choices=("auto", "d1", "d2"),
+        help="New conversations default to auto; follow-ups preserve the selected mode",
+    )
     propose.add_argument("--project-root", help="Worker project (D1) or Agent data directory (D2)")
     propose.add_argument("--output-root", help="Agent-visible delivery directory")
     propose.add_argument("--conversation", help="Continue an existing conversation")

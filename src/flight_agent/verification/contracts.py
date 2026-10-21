@@ -1,12 +1,15 @@
 import re
-from collections.abc import Sequence
 from pathlib import PurePosixPath
 from typing import Annotated, Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from ..models import Contract, FiniteNumber, Nonempty
-from ..runtime.contracts import AnalysisRun, AnalysisSpec
+from ..runtime.contracts import AnalysisRun, AnalysisSpec, Version
+from ..runtime.intents import WorkflowRequest
+from ..runtime.tasks import GeneralBaseline, GeneralProposal
+from ..runtime.tasks import PlanNode as PlanNode
+from ..runtime.tasks import plan_ancestors as plan_ancestors
 from ..upload_models import finite_json
 from .diagnosis_contracts import (
     DiagnosisBaseline,
@@ -14,6 +17,7 @@ from .diagnosis_contracts import (
     DiagnosisProposal,
     DiagnosisTermination,
     DiagnosticRound,
+    Hypothesis,
     HypothesisAssessment,
     PendingAnalysis,
 )
@@ -330,48 +334,6 @@ ToolName = NodeIdentifier
 NodeStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
 
 
-class PlanNode(Contract):
-    id: NodeIdentifier
-    tool: ToolName
-    depends_on: Annotated[list[str], Field(max_length=8)] = []
-    inputs: dict[str, JsonValue] = {}
-
-    @field_validator("inputs")
-    @classmethod
-    def finite_inputs(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        finite_json(value)
-        return value
-
-
-def plan_ancestors(nodes: Sequence[PlanNode]) -> dict[str, set[str]]:
-    if not nodes:
-        raise ValueError("A plan requires at least one node")
-    by_id = {node.id: node for node in nodes}
-    if len(by_id) != len(nodes):
-        raise ValueError("Plan node IDs must be unique")
-    ancestors: dict[str, set[str]] = {}
-
-    def visit(node_id: str, visiting: frozenset[str]) -> set[str]:
-        if node_id in visiting:
-            raise ValueError("Plan dependencies contain a cycle")
-        if node_id not in by_id:
-            raise ValueError("Plan dependency refers to an unknown node")
-        if node_id in ancestors:
-            return ancestors[node_id]
-        dependencies = by_id[node_id].depends_on
-        if len(dependencies) != len(set(dependencies)):
-            raise ValueError("Plan dependencies must be unique")
-        result = set(dependencies)
-        for dependency in dependencies:
-            result.update(visit(dependency, visiting | {node_id}))
-        ancestors[node_id] = result
-        return result
-
-    for node in nodes:
-        visit(node.id, frozenset())
-    return ancestors
-
-
 class PlanProposal(Contract):
     action: Literal["plan", "clarify", "explain"]
     title: Annotated[str, Field(max_length=200)] = ""
@@ -382,6 +344,7 @@ class PlanProposal(Contract):
     rationale: Annotated[str, Field(max_length=2000)] = ""
     question: Annotated[str, Field(max_length=2000)] = ""
     nodes: Annotated[list[PlanNode], Field(max_length=8)] = []
+    tool_versions: dict[ToolName, Version] = {}
 
     @model_validator(mode="after")
     def executable_plan(self) -> Self:
@@ -426,6 +389,7 @@ class ToolCall(MutableRecord):
     id: Identifier
     node_id: str
     tool: ToolName
+    tool_version: Version | None = None
     baseline_version: int
     status: NodeStatus = "running"
     started_at: str
@@ -512,8 +476,33 @@ class DiagnosisTask(MutableRecord):
     dispatch_count: Annotated[int, Field(strict=True, ge=0, le=40)] = 0
     no_progress_rounds: Annotated[int, Field(strict=True, ge=0)] = 0
 
+    @property
+    def current_hypotheses(self) -> list[Hypothesis]:
+        for round_ in reversed(self.rounds):
+            if revision := round_.review.hypothesis_revision:
+                return revision.hypotheses
+        return self.baseline.hypotheses
 
-Task = VerificationTask | DiagnosisTask
+
+class GeneralTask(MutableRecord):
+    scenario: Literal["general"] = "general"
+    workflow: NodeIdentifier
+    id: Identifier
+    baseline: GeneralBaseline
+    proposal: GeneralProposal
+    result_directory: Nonempty
+    output_root: str | None = None
+    stage: str = "awaiting_confirmation"
+    nodes: list[ExecutionNode]
+    calls: list[ToolCall] = []
+    decisions: list[Decision] = []
+    analysis_runs: list[AnalysisRun] = []
+    artifacts: list[Artifact] = []
+    outputs: dict[str, dict[str, JsonValue]] = {}
+    started_at: str | None = None
+
+
+Task = VerificationTask | DiagnosisTask | GeneralTask
 
 
 ConversationStatus = Literal[
@@ -528,19 +517,23 @@ class ConversationState(Contract):
 
 
 class Conversation(MutableRecord):
-    scenario: Literal["d1", "d2"] = "d1"
+    scenario: Literal["auto", "d1", "d2"] = "d1"
     id: Identifier
     created_at: Nonempty
     updated_at: Nonempty
     status: ConversationStatus = "waiting_for_user"
     project_root: str | None = None
     output_root: str | None = None
+    output_root_reset: bool = False
     task: Task | None = None
     archived_tasks: list[Task] = []
     pending_decision: PendingDecision | None = None
     messages: list[ConversationMessage] = []
     error: str | None = None
     turn_origin: ConversationState | None = None
+    goal: Annotated[str, Field(max_length=4000)] = ""
+    active_workflow: NodeIdentifier | None = None
+    workflow_agenda: Annotated[list[WorkflowRequest], Field(max_length=6)] = []
 
     def restore_turn_origin(self) -> bool:
         if self.turn_origin is None:

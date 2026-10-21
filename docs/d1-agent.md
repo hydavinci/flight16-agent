@@ -39,8 +39,10 @@ until an adapter is implemented.
 
 ```text
 Directory + conversation
-  -> local FastAPI Web / verification Runtime
-  -> typed, registered verification tools
+  -> local FastAPI Web / typed intent and registered workflow catalog
+  -> knowledge answer, clarification or separately confirmed execution stages
+  -> shared bounded execution driver + D1 verification policy
+  -> typed, version-pinned verification tools
   -> authenticated MATLAB worker
   -> Simulink adapter in a dedicated subprocess
   -> isolated project copy + actual MATLAB/Simulink
@@ -51,6 +53,13 @@ Directory + conversation
 The existing upload workbench remains available at `/workbench`. The new
 directory-based conversation becomes `/`. Existing upload APIs and CLI demo
 analysis remain compatible.
+The Web/CLI entry defaults to automatic intent handling. D1 can still be chosen
+explicitly. A knowledge answer requires neither a project nor MATLAB. A later
+D2 or generic stage gets its own inputs, permissions, baseline and output root;
+old tasks and deliveries remain archived rather than being overwritten.
+Missing D2 registered data cannot fall back to the D1 project/report directory
+or resume the already finished D1 task. An unknown call blocks stage switching
+and redispatch until its original execution has been reconciled.
 
 The engineering directory is on the **worker's filesystem**. With a local
 worker this is the user's local directory. With a remote worker it must be a
@@ -108,6 +117,9 @@ native responses cannot overwrite another conversation or an edited field.
 Manual path entry remains available, including a not-yet-created output root;
 the selected paths take effect only when sent with a verification request,
 under the existing source/output separation and confirmation rules.
+In automatic mode, project browsing becomes available once the active workflow
+declares its directory requirement; it does not guess between Worker and Agent
+hosts. A no-directory capability or a knowledge question needs no project picker.
 
 ### Project contract
 
@@ -241,6 +253,10 @@ checks the remaining confirmed specification fields, rather than treating a
 newly registered adapter as the executor of earlier work. Legacy requests with
 no recorded adapter version carry explicit `unrecorded` provenance and a
 warning; they are not attributed to the current adapter.
+Every D1 plan pins all tool versions before confirmation. A registered version
+change affecting a pending node requires replanning and fresh confirmation,
+including non-numerical extensions. Completed calls and in-flight reconciliation
+retain the original version instead of relabeling history with today's registry.
 
 After a saved worker run has been verified as failed or interrupted, repaired
 project contents can be rediscovered into a new, unconfirmed task. The old task
@@ -262,6 +278,11 @@ capability registration and immutable `AnalysisRun` receipts from
 adds its own evidence-review policy rather than introducing an LLM call after
 each D1 numerical result. Existing conversation records without a scenario
 remain D1.
+All three policies (D1, D2 and generic tasks) invoke the same bounded
+`runtime.loop.run_loop` execution driver: decide, authorize, execute, persist,
+then observe again. Domain policies retain their different graph/round and
+stopping rules. Shared mechanics do not make D1's analysis kinds, trim-point
+restriction or mandatory analysis/evaluation/delivery nodes global constraints.
 
 An `AnalysisSpec` identifies the capability and adapter version, controller and
 plant versions/digests, optional candidate, exact inputs, data fingerprints,
@@ -330,6 +351,7 @@ def count_analyses(context: ToolContext, request: CountInput) -> CountOutput:
 runtime.tools.register(
     ReadOnlyTool(
         name="count_analyses",
+        version="1",
         description="Count recorded numerical analyses without modifying them.",
         input_model=CountInput,
         output_model=CountOutput,
@@ -356,6 +378,60 @@ still use the host account's privileges. The model cannot dynamically import
 code or install/register plugins, and no HTTP plugin-registration endpoint is
 provided. Register the same extensions during startup before resuming saved
 plans; a missing registration fails closed after restart.
+
+### Registering an independent main capability
+
+The D1 tool extension above is for extra steps within D1. An independent
+capability instead registers once through `runtime.register_capability`:
+
+```python
+from pydantic import Field
+
+from flight_agent.models import Contract
+from flight_agent.runtime.capabilities import Capability
+from flight_agent.verification.general import GeneralContext
+
+
+class MassInput(Contract):
+    components: list[float] = Field(min_length=1, max_length=16)
+
+
+class MassOutput(Contract):
+    total: float
+    unit: str
+
+
+def sum_mass(context: GeneralContext, request: MassInput) -> MassOutput:
+    return MassOutput(total=sum(request.components), unit="kg")
+
+
+runtime.register_capability(Capability(
+    name="mass_summary",
+    version="1",
+    description="Sum explicitly supplied component masses in kg.",
+    input_model=MassInput,
+    output_model=MassOutput,
+    effect="read_only",
+    operation=sum_mass,
+))
+```
+
+Register in trusted application startup before accepting or resuming requests.
+The workflow catalog exposes its input schema, version and no-directory input
+requirement; auto can then choose it without changes to routing or the UI.
+The generic planner builds a dependency graph, not a D1 verification proposal.
+The baseline fixes design references, validated per-node inputs, capability
+versions, allowed effects and budget. Execution still requires explicit user
+confirmation; upgrades of pending capabilities need a new plan and confirmation.
+
+`GeneralContext` exposes the task directory, confirmed scope and copied outputs
+of dependency ancestors. Output schemas are validated and finite JSON is
+required. Output fingerprints and ancestor-output hashes bind immutable receipts
+to the actual dependency evidence. The UI shows typed JSON outputs and
+`execution_record.json`, not D1 criteria, trim points or a fabricated PASS/FAIL.
+Receipt recovery preserves original versions and never redispatches an unknown
+in-flight call. These trusted adapters are not sandboxed, and registering this
+example is not an engineering-validated mass-estimation capability.
 
 ### Local delivery
 
@@ -441,9 +517,10 @@ are not multi-user authentication, and the worker is not a sandbox.
 | Route | Purpose |
 |---|---|
 | `GET /api/conversations` | Recent persisted conversations |
-| `POST /api/conversations` | Start with `message`, optional `project_root`, `output_root` and `scenario` (default `d1`) |
+| `GET /api/conversations/workflows` | Registered workflow names, versions, effects, input schemas and directory requirements |
+| `POST /api/conversations` | Start with `message`, optional `project_root`, `output_root` and `scenario`; Web/CLI send `auto`, while omitted HTTP fields retain legacy `d1` |
 | `GET /api/conversations/{id}` | Baseline, pending decision, plan, calls, status and artifact manifest |
-| `POST /api/conversations/{id}/messages` | Continue with `message`; optionally select a new `project_root` or `output_root` |
+| `POST /api/conversations/{id}/messages` | Continue with `message`; optionally select `scenario`, a new `project_root` or `output_root` |
 | `POST /api/conversations/{id}/confirm` | Confirm with `{"version": 1, "trusted": true}` using the current version |
 | `POST /api/conversations/{id}/resume` | Reconcile/continue saved confirmed work, without a new remote submission |
 | `POST /api/conversations/{id}/retry` | Explicitly retry a known terminal worker run; same confirmation body |
@@ -462,8 +539,10 @@ require clarification. Clearing the browser's output field and sending a
 message performs the explicit reset. The persisted conversation and task each
 record their selected root; older records without the field retain the default.
 
-`scenario` may be `d1` or `d2` when creating a conversation and cannot switch
-within an existing conversation. D2 uses Agent-host data, does not dispatch to
+`scenario` may be `auto`, `d1` or `d2` when creating or continuing a conversation.
+Mode changes are explicit and cannot bypass unknown in-flight execution.
+Each new workflow stage requires its own roots, scope and confirmation; old
+tasks and downloads remain available. D2 uses Agent-host data, does not dispatch to
 the MATLAB worker, and has its own confirmation and receipt-based resume policy.
 The D1 `retry` and failure-proposal `replan` endpoints are not D2 controls.
 `flight-agent directory-task` uses these authenticated local Web interfaces

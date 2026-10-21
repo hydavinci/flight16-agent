@@ -51,6 +51,15 @@ class AdaptivePlanner(VerificationPlanner):
     def review_diagnosis(self, task, *, tools):
         self.seen.append([run.model_dump() for run in task.analysis_runs])
         run_id = "f" * 32 if self.invalid_citation else task.analysis_runs[-1].id
+        summary = {
+            "problem": "Recorded pitch differs from the reference.",
+            "localization": "The recorded pitch comparison contains a nonzero mean error.",
+            "responsibility": "undetermined",
+            "reason": "An offset does not distinguish model and control causes.",
+            "hypothesis_ids": ["bias"],
+            "evidence": [{"run_id": run_id, "metric": "mean_error"}],
+            "recommendations": ["Obtain independently labeled observations before attribution."],
+        }
         if len(task.rounds) == 0 or self.repeat:
             analysis = diagnosis_proposal()["analyses"][0]
             if not self.repeat:
@@ -73,6 +82,7 @@ class AdaptivePlanner(VerificationPlanner):
                 ],
                 "unknowns": ["Whether the mismatch persists in the later window."],
                 "analyses": [analysis],
+                "summary": summary,
             })
         return DiagnosisReview.model_validate({
             "action": "stop",
@@ -90,4 +100,57 @@ class AdaptivePlanner(VerificationPlanner):
                 for hypothesis, status in (("bias", "supported"), ("transient", "refuted"))
             ],
             "unknowns": ["No real labeled flight-test dataset has been supplied."],
+            "summary": summary,
         })
+
+
+class EvolvingPlanner(AdaptivePlanner):
+    def __init__(self, *, fail_second=False, revision_fault=None):
+        super().__init__()
+        self.fail_second = fail_second
+        self.revision_fault = revision_fault
+
+    def review_diagnosis(self, task, *, tools):
+        data = super().review_diagnosis(task, tools=tools).model_dump()
+        run_id = task.analysis_runs[-1].id
+        data["summary"] = {
+            "problem": "Recorded pitch differs from the reference.",
+            "localization": "The recorded pitch comparison shows a persistent offset.",
+            "responsibility": "undetermined",
+            "reason": "A recorded offset alone cannot distinguish model and control causes.",
+            "hypothesis_ids": ["bias"],
+            "evidence": [{"run_id": run_id, "metric": "mean_error"}],
+            "recommendations": ["Verify acquisition timing and signal scaling independently."],
+        }
+        data["assessments"].append({
+            "hypothesis_id": "alignment", "status": "unknown",
+            "reason": "No independently verified acquisition timing is available.",
+        })
+        data["unknowns"].append("Acquisition timing is not independently verified.")
+        if not task.rounds:
+            data["hypothesis_revision"] = {
+                "hypotheses": [
+                    {"id": "bias", "statement": "A persistent recorded pitch offset.",
+                     "priority": "high"},
+                    task.baseline.hypotheses[1].model_dump(),
+                    {"id": "alignment", "statement": "Acquisition alignment may contribute.",
+                     "priority": "low"},
+                ],
+                "reason": "A nonzero mean error warrants a separate alignment hypothesis.",
+                "evidence": [{"run_id": run_id, "metric": "mean_error"}],
+            }
+            data["analyses"][0]["hypothesis_ids"].append("alignment")
+            if self.revision_fault == "drop":
+                data["hypothesis_revision"]["hypotheses"].pop(1)
+            elif self.revision_fault == "citation":
+                data["hypothesis_revision"]["evidence"][0]["run_id"] = "f" * 32
+            elif self.revision_fault == "scope":
+                data["analyses"][0]["capability"] = "write_candidate"
+            elif self.revision_fault == "attribution":
+                data["summary"]["responsibility"] = "control"
+                data["summary"]["hypothesis_ids"] = ["alignment"]
+        else:
+            data["stop_reason"] = "missing_input"
+            if self.fail_second:
+                data["summary"]["evidence"][0]["run_id"] = "f" * 32
+        return DiagnosisReview.model_validate(data)

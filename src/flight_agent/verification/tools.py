@@ -58,6 +58,7 @@ class ReadOnlyTool(Generic[ToolInput, ToolOutput]):
     requires: frozenset[str]
     provides: frozenset[str]
     permission: Literal["read_only"] = "read_only"
+    version: str = "1"
 
 
 class _NoInput(Contract):
@@ -199,7 +200,7 @@ class ToolRegistry:
             version=SIMULINK_ANALYSIS_VERSION if name == "analyze_project" else "1",
         )
 
-    def _install(self, entry: _Entry, *, version: str = "1") -> None:
+    def _install(self, entry: _Entry, *, version: str) -> None:
         effect: Effect = (
             "execute_project" if entry.permission == "execute_project"
             else "write_delivery" if entry.permission == "write_delivery"
@@ -249,7 +250,8 @@ class ToolRegistry:
                 frozenset(tool.provides),
                 tool.permission,
                 invoke,
-            )
+            ),
+            version=tool.version,
         )
 
     def _entry(self, name: str) -> _Entry:
@@ -271,6 +273,35 @@ class ToolRegistry:
             }
             for entry in self._entries.values()
         ]
+
+    def versions(self, nodes: Sequence[PlanNode]) -> dict[str, str]:
+        return {
+            node.tool: self._capabilities.definition(node.tool).version for node in nodes
+        }
+
+    def effect(self, name: str) -> Effect:
+        return self._capabilities.definition(name).effect
+
+    def scope(self, task: VerificationTask) -> ExecutionScope:
+        return ExecutionScope(
+            baseline_version=task.baseline.version,
+            confirmed=task.baseline.confirmed,
+            design=_design(task),
+            allowed_effects=("read_only", "execute_project", "write_delivery"),
+        )
+
+    def validate_versions(self, task: VerificationTask) -> None:
+        for node in task.nodes:
+            if node.status == "completed":
+                continue
+            if node.tool == "analyze_project" and task.pending_request is not None:
+                continue
+            version = task.proposal.tool_versions.get(node.tool)
+            if version != self._capabilities.definition(node.tool).version:
+                raise ValueError(
+                    f"Tool version changed or was not recorded: {node.tool}; "
+                    "propose and confirm a new baseline before execution"
+                )
 
     def validate_plan(self, nodes: Sequence[PlanNode]) -> None:
         ancestors = plan_ancestors(nodes)
@@ -307,12 +338,7 @@ class ToolRegistry:
             node.tool,
             node.inputs,
             invocation,
-            ExecutionScope(
-                baseline_version=task.baseline.version,
-                confirmed=task.baseline.confirmed,
-                design=_design(task),
-                allowed_effects=("read_only", "execute_project", "write_delivery"),
-            ),
+            self.scope(task),
         )
 
     def analysis_spec(self, task: VerificationTask, kind: AnalysisKind) -> AnalysisSpec:
