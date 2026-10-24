@@ -1,4 +1,12 @@
-# D2 read-only, evidence-driven diagnosis
+# Offline diagnosis adapter and historical D2 contracts
+
+The current Web page has one requirements entry, **no D1/D2 selector**.
+This document retains the diagnostic data, internal evidence-loop and saved v1
+contracts. New tasks use a v2 baseline and the registered `offline_diagnosis`
+capability, with `diagnostic_data` on the Agent host. The loop below runs inside
+that capability using the same outer budget and authenticated checkpoints.
+Legacy task-level baseline/review fields are not the common v2 display schema;
+see README and `docs/d1-agent.md` for the unified entry and registration example.
 
 ## Scope and deployment
 
@@ -8,8 +16,8 @@ code, import arbitrary files, generate new simulations or modify a controller.
 This is the bounded offline portion of Demo 2, not the full roadmap workflow:
 active additional Simulink runs and real fault-attribution acceptance remain
 unimplemented or unverified.
-D1 still accepts a prepared Simulink project on the **Worker host** and keeps
-its existing fixed verification plan; see `docs/d1-agent.md`.
+The registered Simulink adapter accepts prepared projects on the **Worker host**;
+its limitations do not become generic task restrictions; see `docs/d1-agent.md`.
 
 Both scenarios share conversation persistence, explicit baseline confirmation,
 typed capability contracts, immutable analysis receipts and authenticated
@@ -31,12 +39,13 @@ the existing `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` and optional
 No MATLAB installation, Worker token or trusted-project Worker switch is needed
 for these D2 adapters. There is no production scripted-model fallback.
 
-The Web entry defaults to **auto**: knowledge questions need no directory or
-Worker, while execution requests are routed to registered workflows. Select D2
-explicitly or let auto enter it after verification in the same conversation.
-Every stage requires a new confirmed baseline; switching clears the selected
-project/data and output roots rather than inheriting D1's Worker project or
-reports. Missing registered diagnostic data pauses the next stage and cannot
+Knowledge questions need no directory or Worker. Select the registered offline
+diagnostic **resource location**, provide its Agent-host directory and describe
+the request; the planner proposes only registered capabilities.
+Every new plan requires confirmation; switching resource locations clears the
+source directory, not the independently selected output root. It never treats
+Worker projects or verification reports as diagnostic data.
+Missing registered diagnostic data pauses planning and cannot
 resume the old task. Previous tasks and downloads remain archived. Unknown
 in-flight calls must be reconciled before switching or dispatching new work.
 D2 project browsing lists Agent-host
@@ -312,24 +321,26 @@ do not submit secrets or material unapproved for the configured model service.
 
 Use the existing Web bootstrap token (`X-Flight-Token`) and same-origin policy:
 
-| Request | D2 behavior |
+| Request | Current registered diagnosis behavior |
 |---|---|
-| `POST /api/conversations` | `{"scenario":"d2","message":"...","project_root":"/absolute/agent/data"}` proposes a baseline; optional `output_root` selects the Agent-host results root |
-| `POST /api/conversations/{id}/messages` | Follow-up or clarification; optional `scenario: "auto"`, `"d1"` or `"d2"` switches mode subject to unknown-execution guards; questions preserve an existing task's lifecycle |
+| `POST /api/conversations` | `{"location":"diagnostic_data","message":"...","project_root":"/absolute/agent/data"}` proposes a v2 baseline; optional `output_root` selects the Agent-host results root |
+| `POST /api/conversations/{id}/messages` | Follow-up or clarification; optional resource `location` and roots, subject to unknown-execution guards; questions preserve existing lifecycle |
 | `POST /api/conversations/{id}/confirm` | `{"version":1,"trusted":true}` confirms the current baseline |
 | `POST /api/conversations/{id}/resume` | Continue saved work with receipt reconciliation, not a duplicate unknown dispatch |
-| `GET /api/conversations/{id}` | Read durable baseline, plans, analysis runs, reviews, unknowns, termination and artifacts |
+| `GET /api/conversations/{id}` | Read the original durable record, including generic calls/receipts or historical diagnostic fields |
+| `GET /api/conversations/{id}/view` | Common observations, findings, tables, gaps and artifacts; no invented acceptance verdict |
 | `GET /api/conversations/{id}/tasks/{task-id}/artifacts/{path}` | Download a registered, integrity-checked artifact |
 
 Mutation acknowledgements are not completion responses; poll the conversation.
-The existing D1 `retry` and failure-proposal `replan` controls reject D2.
+Historical D2 tasks retain their original recovery rules. Generic v2 tasks may
+retry known failed nodes after explicit consent; unknown calls require resume.
+Saved failure-proposal `replan` is a v1 compatibility action, not v2 replanning.
 Omitting `output_root` preserves the current choice, and `""` resets it to the
-default within the current stage. A workflow transition requires a separate
-root selection. D2 never falls back to a Worker or silently switches host.
-`GET /api/conversations/workflows` returns registered workflow definitions,
-versions, input schemas and directory requirements. The low-level HTTP create
-request retains legacy D1 behavior when `scenario` is omitted; Web and CLI
-explicitly select auto for a new default session.
+default. Changing resource location requires a new source directory; check the
+output root separately. Diagnosis never falls back to Worker or silently switches
+host. `GET /api/conversations/capabilities` is the current capability catalog;
+`GET /api/resource-locations` lists resource adapters. The old workflows route is
+compatibility-only. Omitting `scenario` uses the generic coordinator.
 
 The CLI talks to the already-running local Web API, so it uses the same state
 owner as the browser:
@@ -345,7 +356,7 @@ flight-agent directory-task resume CONVERSATION_ID
 flight-agent directory-task propose --conversation CONVERSATION_ID \
   --request "Explain the cited evidence and remaining limitations."
 
-# Change the mode explicitly; supply separate Agent-host registered data for D2.
+# Legacy CLI resource alias; supply separate Agent-host registered data.
 flight-agent directory-task propose --conversation CONVERSATION_ID --scenario d2 \
   --project-root "$PWD/examples/diagnosis/synthetic-read-only" \
   --request "Diagnose the recorded response after the completed verification."
@@ -359,8 +370,9 @@ follow redirects or environment proxies, and does not load `.env` from the
 data directory. A client timeout does not cancel the server-side task.
 Output is the persisted conversation JSON. Exit code 0 does not establish
 diagnostic sufficiency; inspect the termination and unknowns.
-CLI new sessions default to auto; omit `--scenario` on follow-ups to preserve
-the current mode, or use `--scenario auto|d1|d2` explicitly.
+CLI new sessions need no scenario. Existing `--scenario d1|d2` options remain
+resource-location aliases (`auto` selects neither), not task-type or standards
+switches. Omit them on follow-ups to preserve the selected resource location.
 
 ## Extension and acceptance boundaries
 

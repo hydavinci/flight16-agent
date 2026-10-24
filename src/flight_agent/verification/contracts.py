@@ -5,8 +5,18 @@ from typing import Annotated, Literal, Self
 from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from ..models import Contract, FiniteNumber, Nonempty
-from ..runtime.contracts import AnalysisRun, AnalysisSpec, Version
+from ..runtime.agent_contracts import (
+    AgentBaseline,
+    AgentNode,
+    BudgetState,
+    InvocationRun,
+    InvocationSpec,
+)
+from ..runtime.contracts import AnalysisRun, AnalysisSpec, Name, Version
 from ..runtime.intents import WorkflowRequest
+from ..runtime.observations import CapabilityOutcome, OutputArtifact, TaskResult
+from ..runtime.observations import MetricValue as MetricValue
+from ..runtime.requirements import CapabilityGap
 from ..runtime.tasks import GeneralBaseline, GeneralProposal
 from ..runtime.tasks import PlanNode as PlanNode
 from ..runtime.tasks import plan_ancestors as plan_ancestors
@@ -197,28 +207,6 @@ class EvaluationBaseline(Contract):
         return self
 
 
-class MetricValue(Contract):
-    value: FiniteNumber | None = None
-    unit: Nonempty
-    special: SpecialValue | None = None
-    valid: bool = True
-    reason: str = ""
-
-    @model_validator(mode="after")
-    def explicit_value(self) -> Self:
-        if self.value is not None and self.special is not None:
-            raise ValueError("A metric cannot contain both a finite and a special value")
-        if (
-            self.valid
-            and self.value is None
-            and self.special not in ("positive_infinity", "negative_infinity")
-        ):
-            raise ValueError("A valid metric requires a finite value or explicit infinity")
-        if not self.valid and not self.reason:
-            raise ValueError("An invalid metric requires an explicit reason")
-        return self
-
-
 class Artifact(FileDigest):
     media_type: Nonempty
     role: Literal["figure", "data", "report", "record"]
@@ -406,7 +394,9 @@ class PlanVersion(Contract):
 
 
 class PendingDecision(Contract):
-    kind: Literal["clarify", "confirm_baseline", "confirm_replan", "resume", "retry"]
+    kind: Literal[
+        "clarify", "capability_gap", "confirm_baseline", "confirm_replan", "resume", "retry",
+    ]
     message: Nonempty
 
 
@@ -421,6 +411,8 @@ class ConversationMessage(Contract):
     role: Literal["user", "assistant"]
     content: Nonempty
     created_at: Nonempty
+    response_kind: Literal["answer", "clarify", "capability_gap", "plan"] | None = None
+    gaps: Annotated[list[CapabilityGap], Field(max_length=40)] = []
 
 
 class VerificationTask(MutableRecord):
@@ -502,7 +494,44 @@ class GeneralTask(MutableRecord):
     started_at: str | None = None
 
 
-Task = VerificationTask | DiagnosisTask | GeneralTask
+class AgentExecutionNode(AgentNode, MutableRecord):
+    status: NodeStatus = "pending"
+    error: str | None = None
+
+
+class AgentTask(MutableRecord):
+    schema_version: Literal["2.0"] = "2.0"
+    id: Identifier
+    baseline: AgentBaseline
+    baseline_sha256: Digest | None = None
+    nodes: list[AgentExecutionNode]
+    calls: list[ToolCall] = []
+    decisions: list[Decision] = []
+    outputs: dict[str, CapabilityOutcome] = {}
+    analysis_runs: list[InvocationRun] = []
+    pending_specs: dict[Identifier, InvocationSpec] = {}
+    budget_state: BudgetState = BudgetState()
+    progress_calls: list[Identifier] = []
+    checkpoints: dict[Identifier, Nonempty] = {}
+    checkpoint_sha256: dict[Identifier, Digest] = {}
+    reuse_sources: dict[Identifier, Identifier] = {}
+    reuse_mappings: dict[Identifier, dict[NodeIdentifier, NodeIdentifier]] = {}
+    result: TaskResult | None = None
+    artifacts: list[OutputArtifact] = []
+    result_directory: Nonempty
+    output_root: str | None = None
+    stage: str = "awaiting_confirmation"
+
+    @field_validator("checkpoints")
+    @classmethod
+    def safe_checkpoints(cls, value: dict[str, str]) -> dict[str, str]:
+        for path in value.values():
+            relative_path(path)
+        return value
+
+
+LegacyTask = VerificationTask | DiagnosisTask | GeneralTask
+Task = LegacyTask | AgentTask
 
 
 ConversationStatus = Literal[
@@ -523,6 +552,7 @@ class Conversation(MutableRecord):
     updated_at: Nonempty
     status: ConversationStatus = "waiting_for_user"
     project_root: str | None = None
+    resource_location: Name | None = None
     output_root: str | None = None
     output_root_reset: bool = False
     task: Task | None = None

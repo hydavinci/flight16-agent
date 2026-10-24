@@ -1,17 +1,22 @@
 import json
+import math
 import re
 from collections.abc import Sequence
-from typing import TypeVar
+from copy import copy
+from dataclasses import replace
+from typing import Self, TypeVar
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langsmith import tracing_context
 from pydantic import BaseModel
 
-from ..config import create_model
+from ..config import ModelSettings, create_model
+from ..copilot import structured_response
 from ..runtime.intents import IntentProposal, WorkflowRequest
 from ..runtime.tasks import GeneralProposal
 from .contracts import (
+    AgentTask,
     Conversation,
     DiagnosisTask,
     EvidenceExplanation,
@@ -99,13 +104,8 @@ GENERAL_PROMPT = """
 ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
 
 
-def _redact(
-    text: str,
-    project: ProjectDescriptor | DiagnosticProject | None,
-    local_paths: Sequence[str | None] = (),
-) -> str:
-    paths = [*local_paths, project.root if project else None]
-    for path in sorted((item for item in paths if item), key=len, reverse=True):
+def redact_text(text: str, local_paths: Sequence[str | None] = ()) -> str:
+    for path in sorted((item for item in local_paths if item), key=len, reverse=True):
         text = text.replace(path, "[local path]")
     text = re.sub(
         r"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)\S+",
@@ -118,8 +118,15 @@ def _redact(
         r"\1[redacted]",
         text,
     )
-    text = redact_paths(text)
-    return text[:2000]
+    return redact_paths(text)
+
+
+def _redact(
+    text: str,
+    project: ProjectDescriptor | DiagnosticProject | None,
+    local_paths: Sequence[str | None] = (),
+) -> str:
+    return redact_text(text, [*local_paths, project.root if project else None])[:2000]
 
 
 def _project_context(project: ProjectDescriptor) -> dict[str, object]:
@@ -184,18 +191,34 @@ def _conversation_paths(conversation: Conversation) -> list[str | None]:
     ]
 
 
-class VerificationPlanner:
+class StructuredPlanner:
     def __init__(self, model: BaseChatModel | None = None):
         self.model = model
+        self._timeout_seconds: float | None = None
 
-    def _call(
+    def with_timeout(self, seconds: float) -> Self:
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("Planner timeout must be finite and positive")
+        bounded = copy(self)
+        bounded._timeout_seconds = min(seconds, self._timeout_seconds or seconds)
+        return bounded
+
+    def call(
         self,
         name: str,
         schema: type[ResponseModel],
         context: dict[str, object],
         *,
-        system_prompt: str = SYSTEM_PROMPT,
+        system_prompt: str,
     ) -> ResponseModel:
+        if self.model is None:
+            settings = ModelSettings.from_environment()
+            if self._timeout_seconds is not None:
+                settings = replace(
+                    settings, timeout_seconds=min(settings.timeout_seconds, self._timeout_seconds)
+                )
+            if settings.provider == "copilot-cli":
+                return structured_response(name, schema, context, system_prompt, settings)
         model = self.model or create_model()
         tool = {
             "type": "function",
@@ -205,12 +228,13 @@ class VerificationPlanner:
                 "parameters": schema.model_json_schema(),
             },
         }
+        options = {"timeout": self._timeout_seconds} if self._timeout_seconds is not None else {}
         with tracing_context(enabled=False):
-            response = model.bind_tools([tool], tool_choice=name).invoke(
+            response = model.bind_tools([tool], tool_choice=name).bind(**options).invoke(
                 [
                     SystemMessage(content=system_prompt),
                     HumanMessage(content=json.dumps(context, ensure_ascii=False, allow_nan=False)),
-                ]
+                ],
             )
         if (
             not isinstance(response, AIMessage)
@@ -222,12 +246,26 @@ class VerificationPlanner:
             raise ValueError("Model must return one complete, registered structured tool call")
         return schema.model_validate(response.tool_calls[0]["args"])
 
+
+class VerificationPlanner(StructuredPlanner):
+    def _call(
+        self,
+        name: str,
+        schema: type[ResponseModel],
+        context: dict[str, object],
+        *,
+        system_prompt: str = SYSTEM_PROMPT,
+    ) -> ResponseModel:
+        return self.call(name, schema, context, system_prompt=system_prompt)
+
     def plan_intent(
         self, message: str, conversation: Conversation, *,
         workflows: list[dict[str, object]], phase: str = "request",
     ) -> IntentProposal:
         paths = _conversation_paths(conversation)
         task = conversation.task
+        if isinstance(task, AgentTask):
+            raise ValueError("Use the generic v2 planner for this task")
         observation = None
         if task is not None:
             observation = {

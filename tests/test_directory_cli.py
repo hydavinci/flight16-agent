@@ -6,12 +6,16 @@ import httpx
 import pytest
 
 from flight_agent import cli
+from tests.agent_helpers import draft_data, make_agent_web
+from tests.helpers import serve_app
 
 
 def test_directory_task_cli_help_has_auto_and_both_scenarios():
     result = subprocess.run(
         [sys.executable, "-m", "flight_agent", "directory-task", "propose", "--help"],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert result.returncode == 0, result.stderr
     assert "--scenario" in result.stdout
@@ -32,13 +36,15 @@ def test_directory_cli_defaults_new_requests_to_auto_but_preserves_existing_mode
         assert request.headers["X-Flight-Token"] == "local-test-token"
         body = json.loads(request.content)
         assert body == (
-            {"message": "Explain gain margin."} if existing
+            {"message": "Explain gain margin."}
+            if existing
             else {"message": "Explain gain margin.", "scenario": "auto"}
         )
         return httpx.Response(202, json={"id": identifier, "status": "completed", "task": None})
 
     monkeypatch.setattr(
-        cli.httpx, "Client",
+        cli.httpx,
+        "Client",
         lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
     )
     args = ["directory-task", "propose", "--request", "Explain gain margin."]
@@ -68,13 +74,25 @@ def test_directory_cli_uses_authenticated_api_and_preserves_async_task_identity(
         )
 
     monkeypatch.setattr(
-        cli.httpx, "Client",
+        cli.httpx,
+        "Client",
         lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
     )
-    assert cli.main([
-        "directory-task", "propose", "--scenario", "d2",
-        "--project-root", "/registered/data", "--request", "Investigate the mismatch.",
-    ]) == 0
+    assert (
+        cli.main(
+            [
+                "directory-task",
+                "propose",
+                "--scenario",
+                "d2",
+                "--project-root",
+                "/registered/data",
+                "--request",
+                "Investigate the mismatch.",
+            ]
+        )
+        == 0
+    )
     record = json.loads(capsys.readouterr().out)
     assert record["id"] == identifier
     assert record["status"] == "waiting_for_user"
@@ -86,9 +104,18 @@ def test_directory_cli_confirmation_needs_explicit_consent_before_contact(monkey
         pytest.fail("Missing consent must be rejected before contacting the server")
 
     monkeypatch.setattr(cli.httpx, "Client", forbidden)
-    assert cli.main([
-        "directory-task", "confirm", "a" * 32, "--version", "1",
-    ]) == 1
+    assert (
+        cli.main(
+            [
+                "directory-task",
+                "confirm",
+                "a" * 32,
+                "--version",
+                "1",
+            ]
+        )
+        == 1
+    )
     assert "--trusted-project" in capsys.readouterr().err
 
 
@@ -104,3 +131,56 @@ def test_directory_cli_never_sends_local_paths_to_nonlocal_or_redirected_endpoin
     monkeypatch.setattr(cli.httpx, "Client", forbidden)
     assert cli.main(["directory-task", "--server", server, "status", "a" * 32]) == 1
     assert "local" in capsys.readouterr().err.lower()
+
+
+def test_default_directory_cli_uses_generic_plan_and_explicit_confirmation(tmp_path, capsys):
+    app, _, calls, _ = make_agent_web(
+        tmp_path,
+        [
+            {
+                "action": "plan",
+                "text": "Confirm synthetic arrays.",
+                "plan": draft_data(),
+            }
+        ],
+    )
+    with serve_app(app) as server:
+        assert (
+            cli.main(
+                [
+                    "directory-task",
+                    "--server",
+                    server,
+                    "propose",
+                    "--request",
+                    "Analyze synthetic arrays [0,2] and [0,0]; no acceptance.",
+                ]
+            )
+            == 0
+        )
+        pending = json.loads(capsys.readouterr().out)
+        assert pending["status"] == "waiting_for_user"
+        assert pending["task"]["schema_version"] == "2.0"
+        assert "scenario" not in pending["task"]
+        assert pending["task"]["baseline"]["resources"] == []
+        assert pending["task"]["baseline"]["nodes"][0]["tool"] == "offline_rmse"
+        assert calls == []
+        assert (
+            cli.main(
+                [
+                    "directory-task",
+                    "--server",
+                    server,
+                    "confirm",
+                    pending["id"],
+                    "--version",
+                    "1",
+                    "--trusted-project",
+                ]
+            )
+            == 0
+        )
+        done = json.loads(capsys.readouterr().out)
+        assert done["task"]["result"]["observations"][0]["value"] == pytest.approx(2**0.5)
+        assert done["task"]["result"]["evaluation"] is None
+        assert len(calls) == 1

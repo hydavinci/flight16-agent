@@ -1,4 +1,12 @@
-# D1 directory-based flight-control verification
+# Simulink adapter and historical D1 contracts
+
+This document describes prepared-project discovery, the existing Simulink adapter
+and historical v1 verification/recovery contracts. **The current page has no D1/D2
+selector. All new tasks use the requirements-driven v2 agent described in README.**
+Legacy plan shapes, fixed node counts, default case values and automatic recovery
+proposals below apply only to saved v1 tasks and the explicitly injected legacy
+runtime, not to new tasks. They are retained for compatibility, not global policy.
+The registration and HTTP sections below describe the current v2 entry.
 
 ## Scope
 
@@ -12,7 +20,9 @@ documents. Their filenames are V0.3 and v0.5; their internal version labels are
 V0.2 and V0.4 respectively. The business document defines the product; the case
 document and the engineering package define the initial Simulink profile.
 
-The initial case is the F-16 longitudinal pitch inner loop at trim point 1:
+The historical case is the F-16 longitudinal pitch inner loop at trim point 1.
+These acceptance numbers are examples, used in a new baseline only when the user
+explicitly adopts them with a traceable source:
 
 - Nonlinear step response: recorded input and response, `stepinfo`, overshoot
   <= 10%, settling time <= 3 s with a 5% settling band.
@@ -28,8 +38,8 @@ plans, selects available capabilities, organizes reports and explains recorded
 evidence. It cannot execute arbitrary MATLAB, change model/control parameters,
 invent missing signals or override numerical results.
 
-Adaptive diagnosis is a separate D2 scenario described in `docs/d2-agent.md`;
-it does not change D1's fixed verification workflow. Unique root-cause proof,
+The offline diagnosis adapter is described in `docs/d2-agent.md`.
+Unique root-cause proof,
 optimization, automatic trimming, model/topology editing,
 autonomous signal/analysis-point selection and a working Simate adapter are out
 of scope. A Simate capability can be represented but must report unsupported
@@ -39,24 +49,25 @@ until an adapter is implemented.
 
 ```text
 Directory + conversation
-  -> local FastAPI Web / typed intent and registered workflow catalog
-  -> knowledge answer, clarification or separately confirmed execution stages
-  -> shared bounded execution driver + D1 verification policy
-  -> typed, version-pinned verification tools
+  -> local FastAPI Web / sourced requirements and registered capability catalog
+  -> knowledge answer, clarification, capability gap or unconfirmed v2 graph
+  -> shared bounded execution driver / exact capability snapshots
+  -> typed, version-pinned Simulink capabilities
   -> authenticated MATLAB worker
   -> Simulink adapter in a dedicated subprocess
   -> isolated project copy + actual MATLAB/Simulink
-  -> structured evidence / deterministic evaluation
-  -> Word reports, PNG, MAT, JSON and conversation summary
+  -> structured observations / immutable receipts
+  -> evaluation and JSON/Word delivery only as requested
 ```
 
 The existing upload workbench remains available at `/workbench`. The new
 directory-based conversation becomes `/`. Existing upload APIs and CLI demo
 analysis remain compatible.
-The Web/CLI entry defaults to automatic intent handling. D1 can still be chosen
-explicitly. A knowledge answer requires neither a project nor MATLAB. A later
-D2 or generic stage gets its own inputs, permissions, baseline and output root;
-old tasks and deliveries remain archived rather than being overwritten.
+The Web/CLI entry needs no scenario. A knowledge answer requires neither a project
+nor MATLAB. Directory inputs require an explicit registered resource location:
+`simulink_project` on Worker or `diagnostic_data` on Agent. A later task gets its
+own baseline, authorization and delivery directory; the chosen output root may
+remain selected and must be reviewed. Old tasks and deliveries remain archived.
 Missing D2 registered data cannot fall back to the D1 project/report directory
 or resume the already finished D1 task. An unknown call blocks stage switching
 and redispatch until its original execution has been reconciled.
@@ -117,9 +128,9 @@ native responses cannot overwrite another conversation or an edited field.
 Manual path entry remains available, including a not-yet-created output root;
 the selected paths take effect only when sent with a verification request,
 under the existing source/output separation and confirmation rules.
-In automatic mode, project browsing becomes available once the active workflow
-declares its directory requirement; it does not guess between Worker and Agent
-hosts. A no-directory capability or a knowledge question needs no project picker.
+Project browsing requires selecting a registered resource location; it does not
+guess between Worker and Agent hosts. The location is not a task type or source
+of acceptance criteria. A no-directory capability needs no project picker.
 
 ### Project contract
 
@@ -379,59 +390,105 @@ code or install/register plugins, and no HTTP plugin-registration endpoint is
 provided. Register the same extensions during startup before resuming saved
 plans; a missing registration fails closed after restart.
 
-### Registering an independent main capability
+### Registering a current v2 capability
 
-The D1 tool extension above is for extra steps within D1. An independent
-capability instead registers once through `runtime.register_capability`:
+The `ReadOnlyTool` example above extends only legacy v1 tasks. New capabilities
+register in `CapabilityRegistry(agent_mode=True)` and return `CapabilityOutcome`.
+This complete startup assembly adds a synthetic mass sum without changing the
+executor, routes or UI. It requires no directory, controller/plant pair or F16
+metadata, and is not an engineering-validated mass-estimation model:
 
 ```python
+from pathlib import Path
+from typing import Annotated
+
 from pydantic import Field
 
-from flight_agent.models import Contract
+from flight_agent.models import FiniteNumber
 from flight_agent.runtime.capabilities import Capability
-from flight_agent.verification.general import GeneralContext
+from flight_agent.runtime.capabilities import CapabilityRegistry
+from flight_agent.runtime.capability_metadata import CapabilityMetadata, MetricDefinition
+from flight_agent.runtime.observations import CapabilityOutcome, Observation
+from flight_agent.runtime.resources import AgentContract
+from flight_agent.verification.agent_planner import AgentPlanner
+from flight_agent.verification.agent_runtime import AgentContext, AgentExecutor
+from flight_agent.verification.coordinator import EngineeringRuntime
+from flight_agent.verification.plugins import register_builtin_plugins
+from flight_agent.verification.resources import ResourceRegistry
+from flight_agent.verification.runtime import VerificationRuntime
+from flight_agent.verification.store import ConversationStore
+from flight_agent.web import create_web_app
 
 
-class MassInput(Contract):
-    components: list[float] = Field(min_length=1, max_length=16)
+class MassInput(AgentContract):
+    components: Annotated[
+        list[Annotated[FiniteNumber, Field(ge=0)]], Field(min_length=1, max_length=16)
+    ]
 
 
-class MassOutput(Contract):
-    total: float
-    unit: str
+def sum_mass(context: AgentContext, request: MassInput) -> CapabilityOutcome:
+    return CapabilityOutcome(observations=[
+        Observation(
+            node_id=context.node_id, metric_id="total_mass", label="Total mass",
+            value=sum(request.components), unit="kg",
+        ),
+    ])
 
 
-def sum_mass(context: GeneralContext, request: MassInput) -> MassOutput:
-    return MassOutput(total=sum(request.components), unit="kg")
+root = Path.cwd()
+store = ConversationStore(root / "runs" / "verification")
+resources = ResourceRegistry()
+tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
+legacy = VerificationRuntime(store.root, store=store)
+register_builtin_plugins(
+    tools, resources, backend=legacy.backend, planner=legacy.planner,
+)
 
-
-runtime.register_capability(Capability(
+tools.register(Capability(
     name="mass_summary",
     version="1",
     description="Sum explicitly supplied component masses in kg.",
     input_model=MassInput,
-    output_model=MassOutput,
+    output_model=CapabilityOutcome,
     effect="read_only",
     operation=sum_mass,
+    metadata=CapabilityMetadata(
+        metrics=[MetricDefinition(id="total_mass", label="Total mass", unit="kg")],
+        validity_policy={
+            "id": "provided-components", "version": "1",
+            "basis": "Finite nonnegative supplied masses; no inferred components.",
+        },
+        cacheable=True,
+    ),
 ))
+runtime = EngineeringRuntime(
+    store, AgentPlanner(), AgentExecutor(store, tools, resources), resources, legacy,
+)
+app = create_web_app(root, engineering_runtime=runtime)
+# Serve this app using the existing single-process local deployment policy.
 ```
 
 Register in trusted application startup before accepting or resuming requests.
-The workflow catalog exposes its input schema, version and no-directory input
-requirement; auto can then choose it without changes to routing or the UI.
-The generic planner builds a dependency graph, not a D1 verification proposal.
-The baseline fixes design references, validated per-node inputs, capability
-versions, allowed effects and budget. Execution still requires explicit user
-confirmation; upgrades of pending capabilities need a new plan and confirmation.
+`GET /api/conversations/capabilities` exposes schemas, metadata and availability.
+The model can propose a graph containing the new name; it cannot install/import
+plugins. For a new resource type, explicitly register a `ResourceAdapter` with
+inspection, fingerprint verification and host identity. There is no HTTP plugin
+registration or dynamic discovery.
 
-`GeneralContext` exposes the task directory, confirmed scope and copied outputs
-of dependency ancestors. Output schemas are validated and finite JSON is
-required. Output fingerprints and ancestor-output hashes bind immutable receipts
-to the actual dependency evidence. The UI shows typed JSON outputs and
-`execution_record.json`, not D1 criteria, trim points or a fabricated PASS/FAIL.
-Receipt recovery preserves original versions and never redispatches an unknown
-in-flight call. These trusted adapters are not sandboxed, and registering this
-example is not an engineering-validated mass-estimation capability.
+The baseline fixes requirements and authenticated criterion sources, resources,
+capability declarations/versions, input bindings, effects and budget. Analysis
+does not require acceptance. Verification needs explicitly sourced criteria;
+node/metric/conditions/units must match the observations, with no hidden conversion.
+Validity policies such as steady-state screening are not acceptance standards.
+Changed declarations require a new plan and confirmation, even at the same version.
+
+`AgentContext` exposes only declared dependency outputs, authorized resource
+bindings, the task directory, shared budget and call-bound checkpoint access.
+Output hashes and immutable `InvocationRun` receipts bind the actual specification
+and dependency evidence. Cache reuse is opt-in, same-conversation and exact-spec;
+changing only criteria does not alter the original computation or historical
+reports. Unknown calls reconcile the original identity, never redispatch.
+These trusted adapters are not an operating-system sandbox.
 
 ### Local delivery
 
@@ -517,14 +574,17 @@ are not multi-user authentication, and the worker is not a sandbox.
 | Route | Purpose |
 |---|---|
 | `GET /api/conversations` | Recent persisted conversations |
-| `GET /api/conversations/workflows` | Registered workflow names, versions, effects, input schemas and directory requirements |
-| `POST /api/conversations` | Start with `message`, optional `project_root`, `output_root` and `scenario`; Web/CLI send `auto`, while omitted HTTP fields retain legacy `d1` |
+| `GET /api/conversations/capabilities` | Current capability schemas, versions, metadata and availability |
+| `GET /api/resource-locations` | Registered resource adapter IDs and host/availability |
+| `GET /api/conversations/workflows` | Legacy workflow catalog, not new task dispatch |
+| `POST /api/conversations` | Start with `message`; optional `location`, `project_root`, `output_root`; no scenario required |
 | `GET /api/conversations/{id}` | Baseline, pending decision, plan, calls, status and artifact manifest |
-| `POST /api/conversations/{id}/messages` | Continue with `message`; optionally select `scenario`, a new `project_root` or `output_root` |
+| `GET /api/conversations/{id}/view` | Common display contract for current and archived v2/v1 tasks |
+| `POST /api/conversations/{id}/messages` | Continue with `message`; optionally select resource `location`, `project_root` or `output_root` |
 | `POST /api/conversations/{id}/confirm` | Confirm with `{"version": 1, "trusted": true}` using the current version |
 | `POST /api/conversations/{id}/resume` | Reconcile/continue saved confirmed work, without a new remote submission |
 | `POST /api/conversations/{id}/retry` | Explicitly retry a known terminal worker run; same confirmation body |
-| `POST /api/conversations/{id}/replan` | Adopt the saved failure proposal with the current `{"version": 1, "trusted": true}`; a separate confirmation of the new baseline is still required |
+| `POST /api/conversations/{id}/replan` | Legacy v1 saved recovery proposal only; v2 changes are new requirement messages |
 | `GET /api/conversations/{id}/tasks/{task-id}/artifacts/{path}` | Download only a registered, hash-verified artifact |
 | `POST /verification/projects/inspect` | Worker-side read-only discovery with `{"root": "/absolute/worker/project"}` |
 | `POST /verification/runs` | Idempotent, consented registered-analysis submission |
@@ -539,12 +599,14 @@ require clarification. Clearing the browser's output field and sending a
 message performs the explicit reset. The persisted conversation and task each
 record their selected root; older records without the field retain the default.
 
-`scenario` may be `auto`, `d1` or `d2` when creating or continuing a conversation.
-Mode changes are explicit and cannot bypass unknown in-flight execution.
-Each new workflow stage requires its own roots, scope and confirmation; old
-tasks and downloads remain available. D2 uses Agent-host data, does not dispatch to
-the MATLAB worker, and has its own confirmation and receipt-based resume policy.
-The D1 `retry` and failure-proposal `replan` endpoints are not D2 controls.
+`location` uses the registered adapter ID (`simulink_project` or `diagnostic_data`
+in the default assembly). Deprecated `scenario: d1|d2` translates only to those
+resource locations; `auto` selects neither and never activates demo criteria.
+Omitting `scenario` uses the generic coordinator, not legacy D1 dispatch.
+Changing known resource locations clears the source root; output selection is
+independent. Every new plan needs confirmation. Unknown calls block switching.
+Historical v1 tasks retain their original decoding, actions and evaluations;
+missing historical criterion sources are shown as unrecorded, never invented.
 `flight-agent directory-task` uses these authenticated local Web interfaces
 instead of opening another offline runtime against the same persisted store;
 commands and D2-specific fields are documented in `docs/d2-agent.md`.

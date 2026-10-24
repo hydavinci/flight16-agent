@@ -25,7 +25,12 @@ def doctor(root: Path) -> int:
     available = engine_available()
     print(f"MATLAB Engine: {'package found' if available else 'not installed'}")
     print("MATLAB release/Python compatibility, runtime startup and license: not verified")
-    for name in ("LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"):
+    provider = os.environ.get("LLM_PROVIDER", "openai-compatible").strip()
+    print(f"LLM_PROVIDER: {provider}")
+    names = ("LLM_MODEL",) if provider == "copilot-cli" else (
+        "LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"
+    )
+    for name in names:
         print(f"{name}: {'configured' if os.environ.get(name, '').strip() else 'missing'}")
     ready = available
     try:
@@ -130,17 +135,21 @@ def main(argv: list[str] | None = None) -> int:
     worker = commands.add_parser("worker", help="Serve the trusted-project MATLAB worker")
     directory = commands.add_parser(
         "directory-task",
-        help="Use the local Web API for knowledge and persistent engineering tasks",
+        help="Use the unified requirements-driven Web agent and saved conversations",
     )
     directory.add_argument("--server", default="http://127.0.0.1:8000")
     directory.add_argument("--timeout", type=int, default=360)
     actions = directory.add_subparsers(dest="action", required=True)
-    propose = actions.add_parser("propose", help="Propose a task without executing it")
+    propose = actions.add_parser(
+        "propose", help="Describe requirements; no scenario is needed and execution needs consent",
+    )
     propose.add_argument(
         "--scenario", choices=("auto", "d1", "d2"),
-        help="New conversations default to auto; follow-ups preserve the selected mode",
+        help="Legacy resource aliases: d1=Worker project, d2=Agent data; auto selects neither",
     )
-    propose.add_argument("--project-root", help="Worker project (D1) or Agent data directory (D2)")
+    propose.add_argument(
+        "--project-root", help="Resource directory on its registered host, not an uploaded path",
+    )
     propose.add_argument("--output-root", help="Agent-visible delivery directory")
     propose.add_argument("--conversation", help="Continue an existing conversation")
     propose.add_argument("--request", required=True)

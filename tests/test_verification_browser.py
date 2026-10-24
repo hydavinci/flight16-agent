@@ -5,6 +5,8 @@ import pytest
 from playwright.sync_api import expect, sync_playwright
 
 from flight_agent.directories import NativeDirectoryError
+from flight_agent.verification.backend import RemoteSimulinkBackend
+from flight_agent.verification.views import to_conversation_view
 from tests.helpers import serve_app, tool_message
 from tests.test_verification_runtime import explanation, proposal, runtime_fixture
 from tests.test_web import web_module
@@ -27,15 +29,19 @@ def test_browser_native_picker_fills_both_fields_without_submitting(
 
     def choose(path="", *, title):
         calls.append((path, title))
-        return str(root if title == "选择工程目录" else output)
+        return str(root if title == "选择资源目录" else output)
 
     monkeypatch.setattr(web_module(), "choose_native_directory", choose)
     monkeypatch.setenv("MATLAB_WORKER_URL", "http://127.0.0.1:9001")
     monkeypatch.setenv("MATLAB_WORKER_TOKEN", TOKEN)
     with (
-        serve_app(web_module().create_web_app(
-            project, verification_runtime=runtime, native_directory_picker=True,
-        )) as url,
+        serve_app(
+            web_module().create_web_app(
+                project,
+                verification_runtime=runtime,
+                native_directory_picker=True,
+            )
+        ) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
@@ -44,23 +50,27 @@ def test_browser_native_picker_fills_both_fields_without_submitting(
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
-            page.get_by_label("工程目录", exact=True).fill(str(root.parent))
-            page.get_by_label("验证需求").fill("Keep this unsent request.")
+            page.locator("#resource-location").select_option("simulink_project")
+            page.get_by_label("资源目录（可选）", exact=True).fill(str(root.parent))
+            page.get_by_label("任务需求", exact=True).fill("Keep this unsent request.")
             for target, expected_path in (("project", root), ("output", output)):
                 with page.expect_response("**/api/directories/select", timeout=3000) as response:
                     page.locator(f"#browse-{target}").click(timeout=3000)
                 assert response.value.status == 200
                 assert response.value.request.post_data_json == {
-                    "target": target, "path": str(root.parent) if target == "project" else "",
+                    "target": target,
+                    "path": str(root.parent) if target == "project" else "",
+                    **({"location": "simulink_project"} if target == "project" else {}),
                 }
                 expect(page.locator(f"#{target}-root")).to_have_value(str(expected_path))
                 expect(page.locator(f"#browse-{target}")).to_be_enabled()
                 expect(page.get_by_role("dialog")).not_to_be_visible()
-            expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
-            expect(page.get_by_label("验证需求")).to_have_value("Keep this unsent request.")
+            expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(str(root))
+            expect(page.get_by_label("任务需求", exact=True)).to_have_value(
+                "Keep this unsent request."
+            )
             expect(page.locator("#trusted")).not_to_be_checked()
-            assert calls == [(str(root.parent), "选择工程目录"), ("", "选择输出根目录")]
+            assert calls == [(str(root.parent), "选择资源目录"), ("", "选择输出根目录")]
             assert not runtime.store.recent()
             assert not model.seen
             assert not backend.calls
@@ -82,26 +92,33 @@ def test_browser_native_picker_cancel_and_errors_preserve_input(
 
     monkeypatch.setattr(web_module(), "choose_native_directory", choose)
     with (
-        serve_app(web_module().create_web_app(
-            project, verification_runtime=runtime, native_directory_picker=True,
-        )) as url,
+        serve_app(
+            web_module().create_web_app(
+                project,
+                verification_runtime=runtime,
+                native_directory_picker=True,
+            )
+        ) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         if outcome == "malformed":
             page.route("**/api/directories/select", lambda route: route.fulfill(json={"path": 42}))
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
+            page.locator("#resource-location").select_option("simulink_project")
             page.get_by_label("输出根目录", exact=True).fill(str(tmp_path))
-            page.get_by_label("验证需求").fill("Keep this unsent request.")
+            page.get_by_label("任务需求", exact=True).fill("Keep this unsent request.")
             with page.expect_response("**/api/directories/select", timeout=3000):
                 page.locator("#browse-output").click(timeout=3000)
             expect(page.locator("#browse-output")).to_be_enabled()
             expect(page.get_by_role("dialog")).not_to_be_visible()
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(tmp_path))
-            expect(page.get_by_label("验证需求")).to_have_value("Keep this unsent request.")
+            expect(page.get_by_label("任务需求", exact=True)).to_have_value(
+                "Keep this unsent request."
+            )
             expect(page.locator("#trusted")).not_to_be_checked()
             if outcome == "cancel":
                 expect(page.locator("#notice")).not_to_be_visible()
@@ -122,34 +139,48 @@ def test_browser_native_picker_ignores_previous_conversation_response(
 ):
     runtime, backend, model, _ = runtime_fixture(tmp_path)
     with (
-        serve_app(web_module().create_web_app(
-            project, verification_runtime=runtime, native_directory_picker=True,
-        )) as url,
+        serve_app(
+            web_module().create_web_app(
+                project,
+                verification_runtime=runtime,
+                native_directory_picker=True,
+            )
+        ) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         pending = []
         page.route("**/api/directories/select", lambda route: pending.append(route))
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
+            page.locator("#resource-location").select_option("simulink_project")
             page.get_by_label("输出根目录", exact=True).fill("/old/output")
-            page.get_by_label("验证需求").fill("Do not send this request.")
+            page.get_by_label("任务需求", exact=True).fill("Do not send this request.")
             with page.expect_request("**/api/directories/select", timeout=3000):
                 page.locator("#browse-output").click(timeout=3000)
             for control in (
-                "send", "message", "project-root", "output-root", "trusted",
-                "confirm", "retry", "replan", "resume", "browse-project", "browse-output",
+                "send",
+                "message",
+                "project-root",
+                "output-root",
+                "trusted",
+                "confirm",
+                "retry",
+                "replan",
+                "resume",
+                "browse-project",
+                "browse-output",
             ):
                 expect(page.locator(f"#{control}")).to_be_disabled()
             expect(page.locator("#browse-output")).to_have_text("正在选择…")
             page.locator("#composer").evaluate("(form) => form.requestSubmit()")
             page.get_by_role("button", name="新建会话", exact=True).click()
-            page.locator("#scenario").select_option("d1")
-            page.get_by_label("工程目录", exact=True).fill("/new/project")
+            page.locator("#resource-location").select_option("simulink_project")
+            page.get_by_label("资源目录（可选）", exact=True).fill("/new/project")
             page.get_by_label("输出根目录", exact=True).fill("/new/output")
-            page.get_by_label("验证需求").fill("New unsent request.")
+            page.get_by_label("任务需求", exact=True).fill("New unsent request.")
             with page.expect_request("**/api/directories/select"):
                 page.locator("#browse-project").click()
             assert len(pending) == 2
@@ -179,18 +210,23 @@ def test_browser_native_picker_ignores_previous_conversation_response(
 def test_browser_native_picker_cannot_overwrite_edited_field(project, tmp_path):
     runtime, _, _, _ = runtime_fixture(tmp_path)
     with (
-        serve_app(web_module().create_web_app(
-            project, verification_runtime=runtime, native_directory_picker=True,
-        )) as url,
+        serve_app(
+            web_module().create_web_app(
+                project,
+                verification_runtime=runtime,
+                native_directory_picker=True,
+            )
+        ) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         pending = []
         page.route("**/api/directories/select", lambda route: pending.append(route))
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
+            page.locator("#resource-location").select_option("simulink_project")
             with page.expect_request("**/api/directories/select", timeout=3000):
                 page.locator("#browse-output").click(timeout=3000)
             page.locator("#output-root").evaluate("(input) => { input.value = '/new/output'; }")
@@ -216,6 +252,7 @@ def test_browser_browses_both_hosts_without_submitting(
     monkeypatch.setenv("MATLAB_WORKER_TOKEN", TOKEN)
     with serve_app(worker().create_worker_app(project, TOKEN)) as worker_url:
         monkeypatch.setenv("MATLAB_WORKER_URL", worker_url)
+        runtime.backend = RemoteSimulinkBackend.from_environment()
         with (
             serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
             sync_playwright() as playwright,
@@ -226,7 +263,7 @@ def test_browser_browses_both_hosts_without_submitting(
             page.on("pageerror", lambda error: errors.append(str(error)))
             try:
                 page.goto(url)
-                page.locator("#scenario").select_option("d1")
+                page.locator("#resource-location").select_option("simulink_project")
                 for target in ("project", "output"):
                     button = page.locator(f"#browse-{target}")
                     expect(button).to_be_enabled()
@@ -236,10 +273,10 @@ def test_browser_browses_both_hosts_without_submitting(
                     assert button_box["x"] >= input_box["x"] + input_box["width"]
                     assert abs(button_box["y"] - input_box["y"]) < 1
                 assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-                page.get_by_label("工程目录", exact=True).fill(str(root.parent))
-                page.get_by_label("验证需求").fill("Keep this unsent request.")
-                page.get_by_role("button", name="浏览工程目录", exact=True).click(timeout=3000)
-                dialog = page.get_by_role("dialog", name="选择工程目录")
+                page.get_by_label("资源目录（可选）", exact=True).fill(str(root.parent))
+                page.get_by_label("任务需求", exact=True).fill("Keep this unsent request.")
+                page.get_by_role("button", name="浏览资源目录", exact=True).click(timeout=3000)
+                dialog = page.get_by_role("dialog", name="选择资源目录")
                 expect(dialog).to_be_visible()
                 expect(dialog).to_contain_text("Worker 所在机器")
                 dialog.get_by_role("button", name=root.name, exact=True).click()
@@ -249,7 +286,7 @@ def test_browser_browses_both_hosts_without_submitting(
                 dialog.get_by_role("button", name=root.name, exact=True).click()
                 dialog.get_by_role("button", name="选择此目录", exact=True).click()
                 expect(dialog).not_to_be_visible()
-                expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
+                expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(str(root))
                 expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
 
                 page.get_by_role("button", name="浏览输出根目录", exact=True).click()
@@ -265,8 +302,10 @@ def test_browser_browses_both_hosts_without_submitting(
                 dialog.get_by_label("目录地址").press("Enter")
                 dialog.get_by_role("button", name="选择此目录", exact=True).click()
                 expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(output))
-                expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
-                expect(page.get_by_label("验证需求")).to_have_value("Keep this unsent request.")
+                expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(str(root))
+                expect(page.get_by_label("任务需求", exact=True)).to_have_value(
+                    "Keep this unsent request."
+                )
                 assert not runtime.store.recent()
                 assert not model.seen
                 assert not backend.calls
@@ -286,9 +325,10 @@ def test_browser_browse_cancel_and_errors_preserve_input(project, tmp_path):
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
+            page.locator("#resource-location").select_option("simulink_project")
             page.get_by_label("输出根目录", exact=True).fill(str(root))
             page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
             dialog = page.get_by_role("dialog", name="选择输出根目录")
@@ -326,27 +366,29 @@ def test_browser_browse_ignores_late_response_after_cancel_and_reopen(
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         pending = []
         page.route("**/api/directories?**", lambda route: pending.append(route))
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
+            page.locator("#resource-location").select_option("simulink_project")
             page.get_by_label("输出根目录", exact=True).fill("/keep-output")
             with page.expect_request("**/api/directories?**"):
                 page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
             page.keyboard.press("Escape")
             with page.expect_request("**/api/directories?**"):
-                page.get_by_role("button", name="浏览工程目录", exact=True).click()
+                page.get_by_role("button", name="浏览资源目录", exact=True).click()
             assert len(pending) == 2
             chosen = r"D:\worker-projects"
             pending[1].fulfill(
                 json={"path": chosen, "parent": "D:\\", "directories": [], "truncated": False}
             )
-            dialog = page.get_by_role("dialog", name="选择工程目录")
+            dialog = page.get_by_role("dialog", name="选择资源目录")
             expect(dialog.get_by_label("目录地址")).to_have_value(chosen)
             late_body = (
                 {"path": "/stale", "parent": "/", "directories": [], "truncated": False}
-                if late_status == 200 else {"detail": "stale directory error"}
+                if late_status == 200
+                else {"detail": "stale directory error"}
             )
             with page.expect_request_finished(
                 lambda request: request.url == pending[0].request.url
@@ -356,7 +398,7 @@ def test_browser_browse_ignores_late_response_after_cancel_and_reopen(
             expect(dialog.get_by_label("目录地址")).to_have_value(chosen)
             expect(dialog.get_by_role("alert")).not_to_be_visible()
             dialog.get_by_role("button", name="选择此目录", exact=True).click()
-            expect(page.get_by_label("工程目录", exact=True)).to_have_value(chosen)
+            expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(chosen)
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("/keep-output")
             assert not runtime.store.recent()
         finally:
@@ -371,11 +413,12 @@ def test_browser_browse_pending_response_cannot_overwrite_edited_address(project
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         pending = []
         page.route("**/api/directories?**", lambda route: pending.append(route))
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
+            page.locator("#resource-location").select_option("simulink_project")
             with page.expect_request("**/api/directories?**"):
                 page.get_by_role("button", name="浏览输出根目录", exact=True).click(timeout=3000)
             dialog = page.get_by_role("dialog", name="选择输出根目录")
@@ -388,7 +431,7 @@ def test_browser_browse_pending_response_cannot_overwrite_edited_address(project
             expect(dialog.get_by_label("目录地址")).to_have_value("/new-address")
             expect(dialog.get_by_role("button", name="选择此目录")).to_be_disabled()
             page.locator("#new-conversation").evaluate("(button) => button.click()")
-            page.locator("#scenario").select_option("d1")
+            page.locator("#resource-location").select_option("simulink_project")
             expect(dialog).not_to_be_visible()
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
         finally:
@@ -403,26 +446,28 @@ def test_browser_browse_buttons_are_disabled_while_sending(project, tmp_path):
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         pending = []
         page.route(
             "**/api/conversations",
-            lambda route: pending.append(route) if route.request.method == "POST"
-            else route.continue_(),
+            lambda route: (
+                pending.append(route) if route.request.method == "POST" else route.continue_()
+            ),
         )
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
-            project_browse = page.get_by_role("button", name="浏览工程目录", exact=True)
+            page.locator("#resource-location").select_option("simulink_project")
+            project_browse = page.get_by_role("button", name="浏览资源目录", exact=True)
             output_browse = page.get_by_role("button", name="浏览输出根目录", exact=True)
             expect(project_browse).to_be_enabled(timeout=3000)
             expect(output_browse).to_be_enabled()
-            page.get_by_label("验证需求").fill("Plan later.")
+            page.get_by_label("任务需求", exact=True).fill("Plan later.")
             with page.expect_request(lambda request: request.method == "POST"):
                 page.get_by_role("button", name="发送", exact=True).click()
             expect(project_browse).to_be_disabled()
             expect(output_browse).to_be_disabled()
             page.get_by_role("button", name="新建会话", exact=True).click()
-            page.locator("#scenario").select_option("d1")
+            page.locator("#resource-location").select_option("simulink_project")
             pending[0].fulfill(status=503, json={"detail": "old send failed"})
             expect(project_browse).to_be_enabled()
             expect(output_browse).to_be_enabled()
@@ -433,30 +478,29 @@ def test_browser_browse_buttons_are_disabled_while_sending(project, tmp_path):
 
 def test_browser_directory_conversation_confirmation_delivery_and_history(project, tmp_path):
     runtime, backend, _, root = runtime_fixture(tmp_path, [proposal(), proposal(threshold=4)])
+    saved = runtime.submit(None, "Perform pitch step verification.", str(root))
     with (
         serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
+            page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.get_by_role("heading", name="飞控工程 Agent")).to_be_visible()
-            page.get_by_label("工程目录", exact=True).fill(str(root))
-            page.get_by_label("验证需求").fill("Perform pitch step verification.")
-            page.get_by_role("button", name="发送", exact=True).click()
             expect(page.locator("#baseline")).to_contain_text("v1", timeout=10000)
             expect(page.locator("#baseline")).to_contain_text("overshoot")
             expect(page.locator("#baseline")).to_contain_text("10")
             expect(
                 page.locator("#baseline tbody tr").filter(has_text="overshoot").locator("td").first
-            ).to_have_text("时域响应")
+            ).to_contain_text("overshoot")
             expect(page.get_by_role("button", name="确认基线并执行")).to_be_disabled()
             assert not backend.calls
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=15000)
             expect(page.locator("#evaluation")).to_contain_text("PASS")
@@ -471,11 +515,13 @@ def test_browser_directory_conversation_confirmation_delivery_and_history(projec
             page.reload()
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=10000)
             expect(page.locator("#messages")).to_contain_text("Perform pitch step verification.")
-            page.get_by_label("验证需求").fill("Change only the overshoot threshold to 4%.")
+            page.get_by_label("任务需求", exact=True).fill(
+                "Change only the overshoot threshold to 4%."
+            )
             page.get_by_role("button", name="发送", exact=True).click()
             expect(page.locator("#baseline")).to_contain_text("v2", timeout=10000)
-            expect(page.get_by_label("我已核对基线，并确认该工程代码可信")).not_to_be_checked()
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            expect(page.locator("#trusted")).not_to_be_checked()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#evaluation")).to_contain_text("FAIL", timeout=15000)
             assert len(backend.calls) == 1
@@ -497,39 +543,39 @@ def test_browser_chat_directories_refresh_fields_without_resubmitting_stale_path
     other_root = project_tree(tmp_path / "second source")
     output = tmp_path / "first results"
     other_output = tmp_path / "second results"
+    initial_message = f"工程目录：“{root}”；输出目录：“{output}”。验证阶跃。"
+    saved = runtime.submit(None, initial_message)
     with (
         serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
-            message = f'工程目录：“{root}”；输出目录：“{output}”。验证阶跃。'
-            page.get_by_label("验证需求").fill(message)
-            with page.expect_request("**/api/conversations") as posted:
-                page.get_by_role("button", name="发送", exact=True).click()
+            page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text(str(output), timeout=10000)
             expect(page.locator("#baseline")).to_contain_text("Agent 所在机器")
-            expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
+            expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(str(root))
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(output))
-            assert posted.value.post_data_json == {"message": message, "scenario": "d1"}
+            assert saved.project_root == str(root)
+            assert saved.output_root == str(output)
             expect(page.locator("#delivery-card")).to_be_hidden()
             assert not backend.calls
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=15000)
-            message = f'工程目录：“{other_root}”；输出目录：“{other_output}”。验证新工程。'
-            page.get_by_label("验证需求").fill(message)
+            message = f"工程目录：“{other_root}”；输出目录：“{other_output}”。验证新工程。"
+            page.get_by_label("任务需求", exact=True).fill(message)
             with page.expect_request("**/api/conversations/*/messages") as posted:
                 page.get_by_role("button", name="发送", exact=True).click()
             assert posted.value.post_data_json == {"message": message}
             expect(page.locator("#baseline")).to_contain_text("v2", timeout=10000)
             expect(page.locator("#baseline")).to_contain_text(str(other_output))
-            expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(other_root))
+            expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(str(other_root))
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(other_output))
-            expect(page.get_by_label("我已核对基线，并确认该工程代码可信")).not_to_be_checked()
+            expect(page.locator("#trusted")).not_to_be_checked()
             saved = runtime.store.recent()[0]
             assert saved.task.project.root == str(other_root)
             assert saved.task.result is None
@@ -547,30 +593,28 @@ def test_browser_output_selection_reset_and_reload_preserve_numerical_and_histor
     )
     first_output = tmp_path / "first results"
     second_output = tmp_path / "second results"
+    saved = runtime.submit(None, "Verify pitch step.", str(root), output_root=str(first_output))
     with (
         serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
-            page.get_by_label("工程目录", exact=True).fill(str(root))
-            page.get_by_label("输出根目录", exact=True).fill(str(first_output))
-            page.get_by_label("验证需求").fill("Verify pitch step.")
-            page.get_by_role("button", name="发送", exact=True).click()
+            page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text(str(first_output), timeout=10000)
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=15000)
             first = runtime.store.recent()[0]
             report = next(item for item in first.task.artifacts if item.role == "report")
             original_report = (Path(first.task.result_directory) / report.path).read_bytes()
             page.get_by_label("输出根目录", exact=True).fill(str(second_output))
-            page.get_by_label("验证需求").fill("Change output and threshold to 4%.")
+            page.get_by_label("任务需求", exact=True).fill("Change output and threshold to 4%.")
             with page.expect_request("**/api/conversations/*/messages") as posted:
                 page.get_by_role("button", name="发送", exact=True).click()
             assert posted.value.post_data_json == {
@@ -579,9 +623,9 @@ def test_browser_output_selection_reset_and_reload_preserve_numerical_and_histor
             }
             expect(page.locator("#baseline")).to_contain_text("v2", timeout=10000)
             expect(page.locator("#baseline")).to_contain_text(str(second_output))
-            expect(page.get_by_label("我已核对基线，并确认该工程代码可信")).not_to_be_checked()
+            expect(page.locator("#trusted")).not_to_be_checked()
             assert len(backend.calls) == 1
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=15000)
             expect(page.locator("#evaluation")).to_contain_text("FAIL")
@@ -589,31 +633,34 @@ def test_browser_output_selection_reset_and_reload_preserve_numerical_and_histor
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value(
                 str(second_output), timeout=10000
             )
-            expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
+            expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(str(root))
             with page.expect_download() as downloaded:
                 page.locator("#artifacts button").filter(has_text="历史任务").filter(
                     has_text=".docx"
                 ).first.click()
             assert Path(downloaded.value.path()).read_bytes() == original_report
             page.get_by_label("输出根目录", exact=True).fill("")
-            page.get_by_label("验证需求").fill("Return to the default output directory.")
+            page.get_by_label("任务需求", exact=True).fill(
+                "Return to the default output directory."
+            )
             with page.expect_request("**/api/conversations/*/messages") as posted:
                 page.get_by_role("button", name="发送", exact=True).click()
             assert posted.value.post_data_json == {
-                "message": "Return to the default output directory.", "output_root": ""
+                "message": "Return to the default output directory.",
+                "output_root": "",
             }
             expect(page.locator("#baseline")).to_contain_text("v3", timeout=10000)
             expect(page.locator("#baseline")).to_contain_text(str(runtime.store.root))
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=15000)
             assert len(backend.calls) == 1
             page.get_by_role("button", name="新建会话", exact=True).click()
-            page.locator("#scenario").select_option("d1")
-            expect(page.get_by_label("工程目录", exact=True)).to_have_value("")
+            page.locator("#resource-location").select_option("simulink_project")
+            expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value("")
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
             page.locator(f'#conversation-history button[data-id="{first.id}"]').click()
-            expect(page.get_by_label("工程目录", exact=True)).to_have_value(str(root))
+            expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(str(root))
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
             assert len(runtime.store.get(first.id).archived_tasks) == 2
             assert errors == []
@@ -632,12 +679,13 @@ def test_browser_unsent_directory_edits_survive_confirmation_and_polling(project
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         try:
             page.goto(url)
             page.locator(f'#conversation-history button[data-id="{planned.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text(str(output))
             page.get_by_label("输出根目录", exact=True).fill(str(unsent_output))
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=15000)
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value(str(unsent_output))
@@ -663,6 +711,7 @@ def test_browser_recovery_plan_adoption_still_requires_fresh_baseline_consent(
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         try:
             page.goto(url)
             page.locator(f'#conversation-history button[data-id="{failed.id}"]').click()
@@ -671,14 +720,14 @@ def test_browser_recovery_plan_adoption_still_requires_fresh_baseline_consent(
             adopt = page.get_by_role("button", name="采纳恢复方案（不执行）", exact=True)
             expect(adopt).to_be_visible()
             expect(adopt).to_be_disabled()
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             adopt.click()
             expect(page.locator("#baseline")).to_contain_text("v2", timeout=10000)
-            expect(page.get_by_label("我已核对基线，并确认该工程代码可信")).not_to_be_checked()
+            expect(page.locator("#trusted")).not_to_be_checked()
             expect(page.get_by_role("button", name="确认基线并执行")).to_be_disabled()
             assert runtime.store.get(failed.id).task.baseline.confirmed is False
             assert len(backend.calls) == 1
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成", timeout=15000)
             expect(page.locator("#evaluation")).to_contain_text("FAIL")
@@ -698,20 +747,19 @@ def test_browser_interrupted_execution_can_resume_without_duplicate_submission(p
         ),
         explanation(),
     ]
+    saved = runtime.submit(None, "Verify pitch step.", str(root))
     with (
         serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
-            page.get_by_label("工程目录", exact=True).fill(str(root))
-            page.get_by_label("验证需求").fill("Verify pitch step.")
-            page.get_by_role("button", name="发送", exact=True).click()
+            page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text("v1", timeout=10000)
-            page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+            page.locator("#trusted").check()
             page.get_by_role("button", name="确认基线并执行").click()
             expect(page.get_by_role("button", name="续接已有运行", exact=True)).to_be_visible(
                 timeout=15000
@@ -731,18 +779,17 @@ def test_browser_renders_model_messages_as_text_and_keeps_failed_input(project, 
     model.responses = [
         tool_message("propose_verification", {"action": "clarify", "question": injection})
     ]
+    saved = runtime.submit(None, "Clarify the project.", str(root))
     with (
         serve_app(web_module().create_web_app(project, verification_runtime=runtime)) as url,
         sync_playwright() as playwright,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         try:
             page.goto(url)
-            page.locator("#scenario").select_option("d1")
-            page.get_by_label("工程目录", exact=True).fill(str(root))
-            page.get_by_label("验证需求").fill("Clarify the project.")
-            page.get_by_role("button", name="发送", exact=True).click()
+            page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#messages")).to_contain_text(injection, timeout=10000)
             assert page.locator("#messages img").count() == 0
             assert page.evaluate("window.unsafeRendered === undefined")
@@ -752,10 +799,12 @@ def test_browser_renders_model_messages_as_text_and_keeps_failed_input(project, 
                     status=409, json={"detail": "Controlled busy response"}
                 ),
             )
-            page.get_by_label("验证需求").fill("Keep this request on failure.")
+            page.get_by_label("任务需求", exact=True).fill("Keep this request on failure.")
             page.get_by_role("button", name="发送", exact=True).click()
             expect(page.locator("#notice")).to_contain_text("Controlled busy response")
-            expect(page.get_by_label("验证需求")).to_have_value("Keep this request on failure.")
+            expect(page.get_by_label("任务需求", exact=True)).to_have_value(
+                "Keep this request on failure."
+            )
         finally:
             browser.close()
 
@@ -771,8 +820,9 @@ def test_browser_rejects_mismatched_conversation_and_clears_old_evidence(project
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         page.route(
-            f"**/api/conversations/{second.id}",
+            f"**/api/conversations/{second.id}/view",
             lambda route: route.fulfill(status=200, json=first.model_dump()),
         )
         try:
@@ -800,8 +850,9 @@ def test_browser_discards_old_selection_response_after_starting_a_new_conversati
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         delayed = []
-        path = f"**/api/conversations/{saved.id}"
+        path = f"**/api/conversations/{saved.id}/view"
         page.route(path, lambda route: delayed.append(route), times=1)
         try:
             page.goto(url)
@@ -809,9 +860,9 @@ def test_browser_discards_old_selection_response_after_starting_a_new_conversati
                 page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.get_by_role("button", name="发送", exact=True)).to_be_disabled()
             page.get_by_role("button", name="新建会话", exact=True).click()
-            page.locator("#scenario").select_option("d1")
-            page.get_by_label("验证需求").fill("New unsent request.")
-            page.get_by_label("工程目录", exact=True).fill("/new/project")
+            page.locator("#resource-location").select_option("simulink_project")
+            page.get_by_label("任务需求", exact=True).fill("New unsent request.")
+            page.get_by_label("资源目录（可选）", exact=True).fill("/new/project")
             page.get_by_label("输出根目录", exact=True).fill("/new/output")
             with page.expect_response(path):
                 delayed.pop().continue_()
@@ -821,8 +872,8 @@ def test_browser_discards_old_selection_response_after_starting_a_new_conversati
             )
             expect(page.locator("#conversation-status")).to_have_text("新会话")
             expect(page.locator("#messages")).not_to_contain_text("Previous conversation.")
-            expect(page.get_by_label("验证需求")).to_have_value("New unsent request.")
-            expect(page.get_by_label("工程目录", exact=True)).to_have_value("/new/project")
+            expect(page.get_by_label("任务需求", exact=True)).to_have_value("New unsent request.")
+            expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value("/new/project")
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("/new/output")
             expect(page.locator("#baseline-card")).to_be_hidden()
         finally:
@@ -842,6 +893,7 @@ def test_browser_rejects_mismatched_updates_to_the_current_conversation(project,
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.set_default_timeout(5000)
         try:
             page.goto(url)
             page.locator(f'#conversation-history button[data-id="{first.id}"]').click()
@@ -853,19 +905,31 @@ def test_browser_rejects_mismatched_updates_to_the_current_conversation(project,
                     f"{endpoint}/confirm",
                     lambda route: route.fulfill(status=202, json=running.model_dump()),
                 )
+                endpoint += "/view"
             else:
                 endpoint += f"/{action}"
             page.route(endpoint, lambda route: route.fulfill(status=200, json=second.model_dump()))
+            if action == "poll":
+                page.route(
+                    endpoint,
+                    lambda route: route.fulfill(
+                        status=200,
+                        json=to_conversation_view(running).model_dump(mode="json"),
+                    ),
+                    times=1,
+                )
             if action == "messages":
-                page.get_by_label("验证需求").fill("Keep this request.")
+                page.get_by_label("任务需求", exact=True).fill("Keep this request.")
                 page.get_by_role("button", name="发送", exact=True).click()
             else:
-                page.get_by_label("我已核对基线，并确认该工程代码可信").check()
+                page.locator("#trusted").check()
                 page.get_by_role("button", name="确认基线并执行").click()
             expect(page.locator("#notice")).to_contain_text("会话 ID 不匹配")
             expect(page.locator("#messages")).to_contain_text("Current verification request.")
             expect(page.locator("#baseline")).to_contain_text("v1")
             if action == "messages":
-                expect(page.get_by_label("验证需求")).to_have_value("Keep this request.")
+                expect(page.get_by_label("任务需求", exact=True)).to_have_value(
+                    "Keep this request."
+                )
         finally:
             browser.close()

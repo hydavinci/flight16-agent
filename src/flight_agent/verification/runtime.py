@@ -20,6 +20,7 @@ from ..session import _write_json
 from .artifacts import describe_artifact, verify_artifact
 from .backend import AnalysisBackend, RemoteSimulinkBackend
 from .contracts import (
+    AgentTask,
     AnalysisKind,
     AnalysisResult,
     AnalysisRunRequest,
@@ -33,6 +34,7 @@ from .contracts import (
     EvaluationBaseline,
     ExecutionNode,
     GeneralTask,
+    LegacyTask,
     PendingDecision,
     PlanNode,
     PlanProposal,
@@ -62,8 +64,9 @@ class VerificationRuntime:
         *,
         backend: AnalysisBackend | None = None,
         planner: VerificationPlanner | None = None,
+        store: ConversationStore | None = None,
     ):
-        self.store = ConversationStore(root)
+        self.store = store if store is not None else ConversationStore(root)
         self.backend = backend
         self.planner = planner or VerificationPlanner()
         self.lock = threading.Lock()
@@ -292,6 +295,8 @@ class VerificationRuntime:
 
     @staticmethod
     def _task_workflow(task: Task) -> str:
+        if isinstance(task, AgentTask):
+            raise ValueError("Use the generic v2 coordinator for this task")
         return task.workflow if isinstance(task, GeneralTask) else task.scenario
 
     def _propose_workflow(
@@ -489,9 +494,11 @@ class VerificationRuntime:
         )
         self._message(conversation, "assistant", conversation.pending_decision.message)
 
-    def _task(self, conversation: Conversation) -> Task:
+    def _task(self, conversation: Conversation) -> LegacyTask:
         if conversation.task is None:
             raise ValueError("No verification task has been planned")
+        if isinstance(conversation.task, AgentTask):
+            raise ValueError("Use the generic v2 coordinator for this task")
         directory = self.store.task_directory(
             conversation.id, conversation.task.id, conversation.task.output_root
         )

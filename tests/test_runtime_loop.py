@@ -95,7 +95,7 @@ def test_domain_execution_obeys_the_shared_progression_bound(tmp_path, monkeypat
     def limited(**options):
         return loop.run_loop(**{**options, "max_steps": 1})
 
-    module = verification_module("runtime" if scenario == "d1" else "diagnosis")
+    module = verification_module("runtime" if scenario == "d1" else "diagnostic_engine")
     monkeypatch.setattr(module, "run_loop", limited, raising=False)
     if scenario == "d1":
         from tests.test_verification_runtime import proposal, runtime_fixture

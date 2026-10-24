@@ -42,9 +42,9 @@
       </ol>
       <p id="next-action" role="status">直接描述需求；知识问答不需要目录，工程任务执行前需确认基线。</p>
     </div>
-    <p id="scenario-boundary" class="boundary">
-      自动模式先识别意图，只调用已注册能力。知识回答不构成工程证据；
-      工程阶段分别确认输入范围、能力版本、权限与预算，不跨阶段沿用授权。
+    <p id="capability-boundary" class="boundary">
+      仅调用已注册能力；判据来自本次需求及其明确来源，不预设演示阈值。
+      知识回答不是工程证据；执行前分别确认资源、能力版本、权限与预算。
     </p>
     <div id="notice" role="alert" hidden></div>
     <section id="evaluation-card" class="card" aria-labelledby="evaluation-heading" hidden>
@@ -59,16 +59,16 @@
       <div id="artifacts"></div>
     </section>
     <section id="baseline-card" class="card" aria-labelledby="baseline-heading" hidden>
-      <h2 id="baseline-heading">评价基线</h2>
+      <h2 id="baseline-heading">执行方案</h2>
       <div id="baseline"></div>
       <div id="decision-controls" hidden>
         <p id="decision-message"></p>
         <label id="trust-label" class="consent">
           <input id="trusted" type="checkbox">
-          <span id="trust-text">我已核对基线，并确认该工程代码可信</span>
+          <span id="trust-text">我已核对需求、资源、能力版本、权限与预算，同意执行本方案</span>
         </label>
         <p id="trust-warning" class="hint">
-          工程初始化代码以 Worker 用户权限在隔离副本中执行。只允许你已审查并信任的工程。
+          仅授权当前方案，不沿用其他任务的执行授权。
         </p>
         <div class="actions">
           <button id="confirm" type="button" hidden disabled>确认基线并执行</button>
@@ -91,22 +91,20 @@
       <h2 id="conversation-heading">任务会话</h2>
       <div id="messages" aria-live="polite"></div>
       <form id="composer">
-        <label for="scenario">任务类型</label>
-        <select id="scenario">
-          <option value="auto" selected>自动 · 知识与工程任务</option>
-          <option value="d1">D1 · 确认式验证</option>
-          <option value="d2">D2 · 证据驱动诊断</option>
+        <label for="resource-location">资源位置（可选）</label>
+        <select id="resource-location">
+          <option value="">不使用目录或尚未选择</option>
         </select>
-        <label id="project-label" for="project-root">工程目录</label>
+        <label id="project-label" for="project-root">资源目录（可选）</label>
         <div class="directory-field">
           <input id="project-root" type="text" maxlength="4096" autocomplete="off"
-                 placeholder="MATLAB Worker 可见的工程目录，例如 D:\F16_package">
-          <button id="browse-project" type="button" aria-label="浏览工程目录"
+                 placeholder="选择资源位置后填写该位置可见的绝对目录">
+          <button id="browse-project" type="button" aria-label="浏览资源目录"
                   aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
         </div>
         <p id="project-hint" class="hint">
-          路径属于 Worker 所在机器；也可在聊天中写“工程目录：/绝对路径”。
-          路径包含空格时请用引号包围。这里只读取清单，执行前仍需单独确认可信工程。
+          位置只说明资源所在主机与登记方式，不选择任务类型或注入判据。
+          知识问答与显式输入能力不需要目录。
         </p>
         <label for="output-root">输出根目录</label>
         <div class="directory-field">
@@ -117,13 +115,13 @@
         </div>
         <p class="hint">
           不是远程 Worker 路径。每个任务新建独立子目录，不覆盖历史成果。
-          可在聊天中写“输出目录：/绝对路径”；修改或清空目录栏后，随验证需求发送才会生效。
+          可在聊天中写“输出目录：/绝对路径”；修改或清空目录栏后，随任务需求发送才会生效。
         </p>
-        <label id="request-label" for="message">验证需求</label>
+        <label id="request-label" for="message">任务需求</label>
         <textarea id="message" rows="3" maxlength="4000" required
-                  placeholder="说明分析类型、评价阈值和报告分组；也可追问已有结果。"></textarea>
+                  placeholder="描述目标、输入、所需输出；需要合格判定时请注明阈值、单位、工况与来源。"></textarea>
         <div class="composer-actions">
-          <span id="composer-hint" class="hint">更改阈值或报告分组会复用有效证据；增加分析只运行缺失分支。</span>
+          <span id="composer-hint" class="hint">缺少标准时先澄清；能力不足时明确说明，不猜测通过或失败。</span>
           <button id="send" class="primary" type="submit" disabled>发送</button>
         </div>
       </form>
