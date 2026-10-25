@@ -253,6 +253,95 @@ def test_metadata_bounds_and_archives_do_not_extract_or_expand_unboundedly(tmp_p
     assert not (tmp_path / "escape.xml").exists()
 
 
+@pytest.mark.parametrize("assignments", [1000, 60_000])
+def test_expanded_metadata_is_truncated_without_losing_entry_or_file_identity(
+    tmp_path, assignments
+):
+    root = tmp_path / "case"
+    root.mkdir()
+    script = root / "initialize.m"
+    source = "x = 1;\n" * assignments
+    script.write_text(source, encoding="utf-8")
+    project = discover(root)
+    assert [(entry.path, entry.kind) for entry in project.entries] == [("initialize.m", "script")]
+    assert [(item.path, item.size, item.sha256) for item in project.files] == [
+        ("initialize.m", len(source), hashlib.sha256(source.encode()).hexdigest())
+    ]
+    literals = project.settings["matlab_literals"]
+    assert 0 < len(literals) <= assignments
+    assert len(json.dumps(project.settings, ensure_ascii=False).encode("utf-8")) <= 4_000_000
+    if assignments == 1000:
+        assert len(literals) == assignments
+        assert not any("truncated" in note.lower() for note in project.notes)
+    else:
+        assert len(literals) < assignments
+        assert any(
+            "truncated" in note.lower() and "unresolved" in note.lower() for note in project.notes
+        )
+        # A change outside the retained prefix must still change resource identity.
+        script.write_text(source[:-7] + "x = 2;\n", encoding="utf-8")
+        changed = discover(root)
+        assert changed.settings == project.settings
+        assert changed.fingerprint != project.fingerprint
+
+
+@pytest.mark.parametrize("source_kind", ["mdl", "slx", "prj", "readme"])
+def test_serialized_metadata_budget_is_shared_across_sources_and_long_paths(tmp_path, source_kind):
+    root = tmp_path / "case"
+    root.mkdir()
+    (root / "initialize.m").write_text("x = 1;\n" * 30_000, encoding="utf-8")
+    nested = root.joinpath(*(['资源"' + "n" * 90] * 3))
+    nested.mkdir(parents=True)
+    if source_kind == "slx":
+        with ZipFile(nested / "a_model.slx", "w") as archive:
+            archive.writestr(
+                "simulink/config.xml",
+                "<ConfigSet>" + '<P Name="StopTime">1</P>' * 4000 + "</ConfigSet>",
+            )
+    else:
+        name, content = {
+            "mdl": ("a_model.mdl", "Model {\n" + ' StopTime "1"\n' * 4000 + "}\n"),
+            "prj": (
+                "a_project.prj",
+                "<project>" + "<dependency>x</dependency>" * 4000 + "</project>",
+            ),
+            "readme": ("README.md", "\x01" * 250_000),
+        }[source_kind]
+        (nested / name).write_text(content, encoding="utf-8")
+    (nested / "zz_analyze.m").write_text("function result = zz_analyze\nend\n", encoding="utf-8")
+    (nested / "zz_model.mdl").write_text("Model {\n}\n", encoding="utf-8")
+    before = {
+        p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()
+    }
+    project = discover(root)
+    assert {item.path for item in project.files} == set(before)
+    assert all(
+        item.sha256 == hashlib.sha256(before[item.path]).hexdigest() for item in project.files
+    )
+    assert {entry.path for entry in project.entries} == {
+        "initialize.m",
+        (nested / "zz_analyze.m").relative_to(root).as_posix(),
+    }
+    assert (nested / "zz_model.mdl").relative_to(root).as_posix() in project.models
+    assert len(project.settings["matlab_literals"]) == 30_000
+    if source_kind == "readme":
+        assert project.settings["documentation"] == []
+    else:
+        group = "project_metadata" if source_kind == "prj" else "model_parameters"
+        assert 0 < len(project.settings[group]) < 4000
+        candidates = project.project_files if source_kind == "prj" else project.models
+        assert (
+            nested / ("a_project.prj" if source_kind == "prj" else f"a_model.{source_kind}")
+        ).relative_to(root).as_posix() in candidates
+    assert len(json.dumps(project.settings, ensure_ascii=False).encode("utf-8")) <= 4_000_000
+    assert any(
+        "truncated" in note.lower() and "unresolved" in note.lower() for note in project.notes
+    )
+    assert {
+        p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()
+    } == before
+
+
 def test_fingerprint_binds_complete_inventory_and_settings(tmp_path):
     projects = verification_module("matlab_projects")
     from flight_agent.runtime.contracts import fingerprint

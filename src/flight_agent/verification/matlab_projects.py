@@ -10,6 +10,7 @@ from zipfile import BadZipFile, ZipFile
 from pydantic import JsonValue
 
 from ..runtime.contracts import fingerprint
+from ..upload_models import MAX_RESULT
 from .contracts import relative_path
 from .intake import safe_directory
 from .matlab_contracts import MatlabEntry, MatlabProjectDescriptor
@@ -118,11 +119,29 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
         "documentation": [],
     }
     remaining = MAX_METADATA_BYTES
+    settings_size = len(json.dumps(settings, ensure_ascii=False).encode("utf-8"))
+    settings_truncated = False
 
-    def record(group: str, path: str, location: str, name: str, value: JsonValue) -> None:
+    def append_setting(group: str, value: dict[str, JsonValue]) -> bool:
+        nonlocal settings_size, settings_truncated
         records = settings[group]
         assert isinstance(records, list)
-        records.append({"path": path, "location": location, "name": name, "value": value})
+        size = len(json.dumps(value, ensure_ascii=False).encode("utf-8")) + (2 if records else 0)
+        if settings_size + size > MAX_RESULT:
+            settings_truncated = True
+            notes.append(
+                f"{value['path']}: serialized metadata limit exceeded; "
+                "settings truncated and remaining metadata unresolved."
+            )
+            return False
+        records.append(value)
+        settings_size += size
+        return True
+
+    def record(group: str, path: str, location: str, name: str, value: JsonValue) -> bool:
+        return append_setting(
+            group, {"path": path, "location": location, "name": name, "value": value}
+        )
 
     def xml(text: str, path: str, location: str, *, model: bool) -> None:
         try:
@@ -131,19 +150,22 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
             notes.append(f"{path}:{location}: unresolved XML metadata ({exc}).")
             return
         for name, value in values:
-            record(
+            if not record(
                 "model_parameters" if model else "project_metadata",
                 path,
                 f"{location}:{name}",
                 name,
                 value,
-            )
+            ):
+                break
 
     for item in files:
         path = directory / item.path
         suffix = path.suffix.lower()
         is_readme = path.name.lower().startswith("readme")
         if suffix not in {".m", ".mdl", ".slx", ".prj"} and not is_readme:
+            continue
+        if settings_truncated and suffix != ".m":
             continue
         safe_directory(path.parent)
         if path.is_symlink():
@@ -169,6 +191,8 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
                             continue
                         remaining -= len(content)
                         xml(content.decode("utf-8-sig"), item.path, member.filename, model=True)
+                        if settings_truncated:
+                            break
             except (BadZipFile, UnicodeError, RuntimeError, NotImplementedError) as exc:
                 notes.append(f"{item.path}: unresolved model archive ({exc}).")
             continue
@@ -206,6 +230,8 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
                         evidence=[f"{item.path}:{first_line}"],
                     )
                 )
+        if settings_truncated:
+            continue
         if truncated or len(content) > remaining:
             notes.append(f"{item.path}: metadata limit exceeded; settings unresolved.")
             continue
@@ -222,24 +248,24 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
                     except (ValueError, RecursionError):
                         notes.append(f"{item.path}:{line}: unresolved assignment to {name}.")
                         continue
-                    record("matlab_literals", item.path, f"{item.path}:{line}", name, value)
+                    if not record("matlab_literals", item.path, f"{item.path}:{line}", name, value):
+                        break
         elif suffix == ".mdl":
             for line, statement in enumerate(text.splitlines(), 1):
                 parameter = re.fullmatch(r'\s*(\w+)\s+(".*?"|\S+)\s*', statement)
                 if parameter and parameter[1] in _MODEL_PARAMETERS:
-                    record(
+                    if not record(
                         "model_parameters",
                         item.path,
                         f"{item.path}:{line}",
                         parameter[1],
                         parameter[2].strip('"'),
-                    )
+                    ):
+                        break
         elif suffix == ".prj":
             xml(text, item.path, item.path, model=False)
         elif is_readme:
-            documents = settings["documentation"]
-            assert isinstance(documents, list)
-            documents.append({"path": item.path, "text": text})
+            append_setting("documentation", {"path": item.path, "text": text})
 
     for group in ("matlab_literals", "model_parameters"):
         declarations = settings[group]
