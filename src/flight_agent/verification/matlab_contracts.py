@@ -222,3 +222,83 @@ class LocalMatlabResult(_MatlabContract):
         if len({item.path for item in self.artifacts}) != len(self.artifacts):
             raise ValueError("Artifact paths must be unique")
         return self
+
+
+class LocalMatlabCheckpoint(_MatlabContract):
+    id: RunId
+    request_sha256: Digest
+    status: Literal["running", "completed", "failed", "interrupted", "unknown"]
+    interpreter: Nonempty
+    pid: Annotated[int, Field(gt=0)] | None = None
+    worker_exit_confirmed: bool = False
+    receipt_sha256: Digest | None = None
+    result_sha256: Digest | None = None
+
+
+class LocalMatlabExecution(_MatlabContract):
+    id: RunId
+    request_sha256: Digest
+    snapshot_root: Nonempty
+    output_directory: Nonempty
+    inputs: ProjectExecutionInput
+    project_paths: list[str]
+    entry_nargout: Literal[0, 1]
+    initializer_nargout: Literal[0, 1]
+    entry_arguments: list[str]
+    initializer_arguments: list[str]
+
+
+class MatlabExecutionMetadata(_MatlabContract):
+    id: RunId
+    request_sha256: Digest
+    matlab_version: Nonempty
+    matlab_release: Nonempty
+    snapshot_root: Nonempty
+    working_directory: Nonempty
+    inputs: ProjectExecutionInput
+    conditions: dict[str, JsonValue]
+    products: list[dict[str, JsonValue]] | dict[str, JsonValue]
+    settings: dict[str, JsonValue]
+    simulation_model_info: dict[str, JsonValue] | None = None
+    simulation_timing_info: dict[str, JsonValue] | None = None
+
+    @model_validator(mode="after")
+    def bounded_metadata(self) -> Self:
+        _bounded_json(self.model_dump(mode="json"), MAX_RESULT)
+        return self
+
+
+class MatlabSeries(_MatlabContract):
+    time: Annotated[list[FiniteNumber], Field(min_length=2, max_length=100_000)]
+    values: Annotated[list[FiniteNumber], Field(min_length=2, max_length=100_000)]
+    time_unit: Nonempty
+    unit: Nonempty
+    name: Nonempty
+
+    @model_validator(mode="after")
+    def scalar_ordered_samples(self) -> Self:
+        if len(self.time) != len(self.values):
+            raise ValueError("Series time and values must have matching lengths")
+        if any(right <= left for left, right in zip(self.time, self.time[1:])):
+            raise ValueError("Series time must be strictly increasing")
+        return self
+
+
+class MatlabSeriesPair(_MatlabContract):
+    input: MatlabSeries
+    response: MatlabSeries
+
+
+class MatlabProjectOutput(_MatlabContract):
+    id: RunId
+    request_sha256: Digest
+    artifact_paths: Annotated[list[Nonempty], Field(max_length=10)]
+    output_evidence: bool
+    details: dict[str, JsonValue]
+    diagnostics: Annotated[list[str], Field(max_length=200)]
+
+    @field_validator("details")
+    @classmethod
+    def bounded_details(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        _bounded_json(value, MAX_RESULT)
+        return value
