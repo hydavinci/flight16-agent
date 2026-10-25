@@ -1,0 +1,224 @@
+import json
+from pathlib import Path, PurePosixPath
+from typing import Annotated, Literal, Self
+
+from pydantic import ConfigDict, Field, JsonValue, ValidationInfo, field_validator, model_validator
+
+from ..models import Contract, FiniteNumber, Nonempty
+from ..runtime.contracts import Digest, RunId
+from ..runtime.observations import OutputArtifact
+from ..upload_models import MAX_RESULT, finite_json
+from .contracts import FileDigest, SteadyStatePolicy, matlab_identifier, relative_path
+from .intake import safe_directory
+
+
+def _bounded_json(value: JsonValue, limit: int = 100_000) -> None:
+    finite_json(value)
+    if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > limit:
+        raise ValueError(f"JSON exceeds the {limit}-byte limit")
+
+
+def _entry_path(value: str, suffixes: set[str]) -> str:
+    relative_path(value)
+    path = PurePosixPath(value)
+    if path.suffix.lower() not in suffixes:
+        raise ValueError(f"Expected an existing {'/'.join(sorted(suffixes))} entry")
+    return value
+
+
+class _MatlabContract(Contract):
+    model_config = ConfigDict(strict=True, revalidate_instances="always")
+
+
+class MatlabEntry(_MatlabContract):
+    path: Nonempty
+    kind: Literal["script", "function"]
+    arguments: Annotated[list[JsonValue], Field(max_length=100)] = []
+    signature: Annotated[str, Field(max_length=4096)] | None = None
+    evidence: Annotated[list[str], Field(max_length=20)] = []
+
+    @field_validator("path")
+    @classmethod
+    def safe_path(cls, value: str) -> str:
+        return _entry_path(value, {".m"})
+
+    @model_validator(mode="after")
+    def finite_arguments(self) -> Self:
+        _bounded_json(self.arguments)
+        if self.kind == "script" and self.arguments:
+            raise ValueError("A script cannot accept positional arguments")
+        return self
+
+
+class MatlabProjectDescriptor(_MatlabContract):
+    host: Literal["agent"] = "agent"
+    root: Nonempty
+    fingerprint: Digest
+    files: list[FileDigest]
+    models: list[str] = []
+    entries: list[MatlabEntry] = []
+    project_files: list[str] = []
+    notes: list[str] = []
+    settings: dict[str, JsonValue] = {}
+
+    @field_validator("root")
+    @classmethod
+    def safe_root(cls, value: str) -> str:
+        safe_directory(Path(value))
+        return value
+
+    @field_validator("settings")
+    @classmethod
+    def finite_settings(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        _bounded_json(value, MAX_RESULT)
+        return value
+
+    @model_validator(mode="after")
+    def inventoried_candidates(self) -> Self:
+        paths = {item.path for item in self.files}
+        if len(paths) != len(self.files):
+            raise ValueError("Project inventory paths must be unique")
+        for path in self.models:
+            _entry_path(path, {".slx", ".mdl"})
+        for path in self.project_files:
+            relative_path(path)
+            if PurePosixPath(path).suffix.lower() != ".prj":
+                raise ValueError("Expected an existing .prj project file")
+        candidates = [*self.models, *self.project_files, *(entry.path for entry in self.entries)]
+        if not set(candidates) <= paths or len(candidates) != len(set(candidates)):
+            raise ValueError("Candidates must be unique inventoried files")
+        return self
+
+
+class SignalSelection(_MatlabContract):
+    source: Literal["logsout", "workspace", "return"]
+    path: Annotated[list[str], Field(min_length=1, max_length=32)]
+    unit: Nonempty
+
+    @field_validator("path")
+    @classmethod
+    def explicit_fields(cls, value: list[str]) -> list[str]:
+        for name in value:
+            matlab_identifier(name)
+        return value
+
+
+class ProjectExecutionInput(_MatlabContract):
+    mode: Literal["simulink", "entry"]
+    model: str | None = None
+    entry: MatlabEntry | None = None
+    initializer: MatlabEntry | None = None
+    project_file: str | None = None
+    working_directory: str | None = None
+    input_signal: SignalSelection | None = None
+    response_signal: SignalSelection | None = None
+    conditions: dict[str, JsonValue] = {}
+
+    @field_validator("model")
+    @classmethod
+    def safe_model(cls, value: str | None) -> str | None:
+        return _entry_path(value, {".slx", ".mdl"}) if value is not None else None
+
+    @field_validator("project_file", "working_directory")
+    @classmethod
+    def safe_relative(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is not None:
+            relative_path(value)
+            if info.field_name == "project_file" and PurePosixPath(value).suffix.lower() != ".prj":
+                raise ValueError("Expected an existing .prj project file")
+        return value
+
+    @field_validator("conditions")
+    @classmethod
+    def finite_conditions(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        _bounded_json(value)
+        return value
+
+    @model_validator(mode="after")
+    def explicit_execution(self) -> Self:
+        if self.mode == "simulink" and (self.model is None or self.entry is not None):
+            raise ValueError("Simulink mode requires only an explicit model")
+        if self.mode == "entry" and (self.entry is None or self.model is not None):
+            raise ValueError("Entry mode requires only an explicit entry")
+        if self.model is not None:
+            matlab_identifier(PurePosixPath(self.model).stem)
+        for entry in (self.entry, self.initializer):
+            if entry is not None and entry.kind == "function":
+                matlab_identifier(PurePosixPath(entry.path).stem)
+        if (self.input_signal is None) != (self.response_signal is None):
+            raise ValueError("Input and response selectors must be provided as a pair")
+        return self
+
+
+class StepinfoInput(_MatlabContract):
+    series: OutputArtifact
+    settling_band: Annotated[FiniteNumber, Field(gt=0, lt=1)]
+    steady_state: SteadyStatePolicy = SteadyStatePolicy()
+    conditions: dict[str, JsonValue] = {}
+
+    @field_validator("conditions")
+    @classmethod
+    def finite_conditions(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        _bounded_json(value)
+        return value
+
+
+class LocalMatlabRequest(_MatlabContract):
+    id: RunId
+    operation: Literal["execute_project", "stepinfo"]
+    inputs: ProjectExecutionInput | StepinfoInput
+    project: MatlabProjectDescriptor | None = None
+    input_evidence: Annotated[list[OutputArtifact], Field(max_length=200)] = []
+    timeout_seconds: Annotated[int, Field(ge=1, le=1800)] = 300
+
+    @model_validator(mode="after")
+    def matched_operation(self) -> Self:
+        if self.operation == "stepinfo":
+            if not isinstance(self.inputs, StepinfoInput):
+                raise ValueError("stepinfo requires StepinfoInput")
+            return self
+        if not isinstance(self.inputs, ProjectExecutionInput) or self.project is None:
+            raise ValueError("execute_project requires ProjectExecutionInput and a project")
+        inputs = self.inputs
+        if inputs.model is not None and inputs.model not in self.project.models:
+            raise ValueError("Model must be an inventoried candidate")
+        if (
+            inputs.project_file is not None
+            and inputs.project_file not in self.project.project_files
+        ):
+            raise ValueError("Project file must be an inventoried candidate")
+        for entry in (inputs.entry, inputs.initializer):
+            if entry is not None and not any(
+                (entry.path, entry.kind, entry.signature) == (item.path, item.kind, item.signature)
+                for item in self.project.entries
+            ):
+                raise ValueError("Entry must match a discovered candidate and its signature")
+        if inputs.working_directory is not None and not any(
+            item.path.startswith(inputs.working_directory + "/") for item in self.project.files
+        ):
+            raise ValueError("Working directory must contain inventoried project files")
+        return self
+
+
+class LocalMatlabResult(_MatlabContract):
+    id: RunId
+    request_sha256: Digest
+    execution_status: Literal["completed", "failed", "interrupted", "unknown"]
+    valid: bool
+    details: dict[str, JsonValue] = {}
+    diagnostics: Annotated[list[str], Field(max_length=200)] = []
+    artifacts: Annotated[list[OutputArtifact], Field(max_length=200)] = []
+
+    @field_validator("details")
+    @classmethod
+    def finite_details(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        _bounded_json(value, MAX_RESULT)
+        return value
+
+    @model_validator(mode="after")
+    def terminal_validity(self) -> Self:
+        if self.valid and self.execution_status != "completed":
+            raise ValueError("Only a completed execution can be valid")
+        if len({item.path for item in self.artifacts}) != len(self.artifacts):
+            raise ValueError("Artifact paths must be unique")
+        return self
