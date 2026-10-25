@@ -153,7 +153,9 @@ def _verify_result(request: LocalMatlabRequest, result: LocalMatlabResult, direc
     if not result.valid:
         return
     paths = {item.path for item in result.artifacts}
-    if not {"raw.mat", "metadata.json"} <= paths or not result.details.get("output_evidence"):
+    if not {"raw.mat", "runtime-metadata.json", "metadata.json"} <= paths or not result.details.get(
+        "output_evidence"
+    ):
         raise ValueError("Missing actual output evidence")
     metadata = _read_model(directory / "metadata.json", MatlabExecutionMetadata)
     if (
@@ -282,6 +284,13 @@ class LocalMatlabBackend:
             for entry in (request.inputs.entry, request.inputs.initializer):
                 if entry is not None:
                     _signature(entry)
+                    if entry.kind == "script" and any(
+                        item.path == Path(entry.path).with_suffix(".p").as_posix()
+                        for item in request.project.files
+                    ):
+                        raise ValueError(
+                            f"Unsupported selected script with same-stem P-file: {entry.path}"
+                        )
             available = self.availability()
             if available.state != "available":
                 raise ValueError(available.reason)

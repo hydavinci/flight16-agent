@@ -119,6 +119,7 @@ def test_execution_records_original_identity_and_snapshot_evidence(
     assert {item.path for item in result.artifacts} == {
         "raw.mat",
         "series.json",
+        "runtime-metadata.json",
         "metadata.json",
         "matlab.log",
     }
@@ -478,3 +479,150 @@ def test_receipt_without_confirmed_owned_exit_is_not_enough(local_backend, local
     assert result.execution_status == "unknown" and not result.valid
     assert "unconfirmed worker termination" in " ".join(result.diagnostics).lower()
     assert (directory / "engine-starts.txt").read_text() == "1"
+
+
+@pytest.mark.parametrize("mode", ["entry", "simulink"])
+def test_runtime_metadata_preserves_exact_canonical_json(
+    local_backend, local_request, tmp_path, mode
+):
+    data = local_request.model_dump(mode="json")
+    shapes = {"null": None, "empty": [], "singleton": [7], "nested": [[None], [], [1, 2]]}
+    data["inputs"]["conditions"] = shapes
+    data["inputs"]["entry"]["arguments"] = [shapes]
+    if mode == "simulink":
+        data["inputs"].update(mode="simulink", model="plant.slx", entry=None)
+    request = LocalMatlabRequest.model_validate(data)
+    directory = tmp_path / "run"
+    result = local_backend.execute(request, directory)
+    assert result.valid, result.diagnostics
+    metadata = json.loads((directory / "metadata.json").read_text())
+    runtime = json.loads((directory / "runtime-metadata.json").read_text())
+    assert "inputs" not in runtime and "conditions" not in runtime
+    assert metadata["input_provenance"] == "canonical_request"
+    assert metadata["inputs"] == data["inputs"]
+    assert metadata["conditions"] == shapes
+    assert metadata["matlab_version"] == runtime["matlab_version"] == "test-only-engine"
+    assert metadata["settings"] == runtime["settings"] == {"StopTime": "12", "Solver": "ode45"}
+    assert metadata["request_sha256"] == fingerprint(request.model_dump(mode="json"))
+    assert local_backend.execute(request, directory, resume=True) == result
+
+
+@pytest.mark.parametrize(
+    "mode", ["wrong_runtime_id", "wrong_runtime_digest", "contradictory_runtime_inputs"]
+)
+def test_runtime_metadata_claims_are_rejected_not_overwritten(
+    local_backend, local_request, tmp_path, monkeypatch, mode
+):
+    monkeypatch.setenv("TEST_LOCAL_MODE", mode)
+    directory = tmp_path / "run"
+    result = local_backend.execute(local_request, directory)
+    assert result.execution_status == "unknown" and not result.valid
+    diagnostic = " ".join(result.diagnostics).lower()
+    assert ("inputs" if mode == "contradictory_runtime_inputs" else "identity") in diagnostic
+    assert not (directory / "metadata.json").exists()
+    assert (directory / "runtime-metadata.json").exists()
+    assert local_backend.execute(local_request, directory, resume=True) == result
+
+
+@pytest.mark.parametrize("role", ["entry", "initializer"])
+def test_script_pfile_is_rejected_before_engine_start(local_backend, local_request, tmp_path, role):
+    root = Path(local_request.project.root)
+    path = "analyze.m" if role == "entry" else "initialize.m"
+    (root / path).write_text("result = 42;\n")
+    (root / path).with_suffix(".p").write_bytes(b"unselected P-file")
+    project = discover_matlab_project(str(root))
+    data = local_request.model_dump(mode="json")
+    data["project"] = project.model_dump(mode="json")
+    data["inputs"][role] = next(
+        item.model_dump(mode="json") for item in project.entries if item.path == path
+    )
+    directory = tmp_path / "run"
+    result = local_backend.execute(LocalMatlabRequest.model_validate(data), directory)
+    assert not (directory / "engine-starts.txt").exists()
+    assert result.execution_status == "failed" and not result.valid
+    assert "P-file" in " ".join(result.diagnostics)
+    assert not (directory / "calls.json").exists()
+
+
+@pytest.fixture
+def real_local_backend(monkeypatch):
+    if os.environ.get("RUN_MATLAB_TESTS") != "1":
+        pytest.skip("Live MATLAB is opt-in")
+    assert os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") == "1"
+    from flight_agent.verification.local_matlab import LocalMatlabBackend
+
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
+    return LocalMatlabBackend.from_environment()
+
+
+@pytest.mark.matlab
+def test_real_packaged_bridge_preserves_json_provenance(real_local_backend, tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "analyze.m").write_text(
+        "function result = analyze(options)\n"
+        "assert(isfield(options, 'nested'));\n"
+        "result = 42;\nend\n"
+    )
+    project = discover_matlab_project(str(root))
+    shapes = {"null": None, "empty": [], "singleton": [7], "nested": [[None], [], [1, 2]]}
+    request = LocalMatlabRequest(
+        id="c" * 32,
+        operation="execute_project",
+        project=project,
+        inputs=ProjectExecutionInput(
+            mode="entry",
+            entry=project.entries[0].model_copy(update={"arguments": [shapes]}),
+            conditions=shapes,
+        ),
+        timeout_seconds=120,
+    )
+    directory = tmp_path / "run"
+    result = real_local_backend.execute(request, directory)
+    assert result.valid, result.diagnostics
+    metadata = json.loads((directory / "metadata.json").read_text())
+    runtime = json.loads((directory / "runtime-metadata.json").read_text())
+    assert metadata["input_provenance"] == "canonical_request"
+    assert metadata["inputs"] == request.inputs.model_dump(mode="json")
+    assert metadata["conditions"] == shapes
+    assert metadata["inputs"]["model"] is None
+    assert metadata["inputs"]["entry"]["arguments"][0]["singleton"] == [7]
+    assert metadata["matlab_version"] == runtime["matlab_version"] != "test-only-engine"
+    assert runtime["settings"] == {}
+    assert "inputs" not in runtime and "conditions" not in runtime
+    assert json.loads((directory / "return.json").read_text()) == {"result": 42}
+    assert real_local_backend.execute(request, directory, resume=True) == result
+    assert discover_matlab_project(str(root)) == project
+    print(f"Actual MATLAB: {metadata['matlab_version']} ({metadata['matlab_release']})")
+
+
+@pytest.mark.matlab
+def test_real_packaged_bridge_rejects_initializer_created_pfile(real_local_backend, tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "initialize.m").write_text(
+        "pcode(fullfile(fileparts(mfilename('fullpath')), 'analyze.m'), '-inplace');\n"
+    )
+    (root / "analyze.m").write_text(
+        "marker = fopen('unintended.txt', 'w');\n"
+        "fprintf(marker, 'unintended script execution');\nfclose(marker);\nresult = 42;\n"
+    )
+    project = discover_matlab_project(str(root))
+    request = LocalMatlabRequest(
+        id="d" * 32,
+        operation="execute_project",
+        project=project,
+        inputs=ProjectExecutionInput(
+            mode="entry",
+            entry=next(item for item in project.entries if item.path == "analyze.m"),
+            initializer=next(item for item in project.entries if item.path == "initialize.m"),
+        ),
+        timeout_seconds=120,
+    )
+    directory = tmp_path / "run"
+    result = real_local_backend.execute(request, directory)
+    assert (directory / "project" / "analyze.p").is_file(), result.diagnostics
+    assert not (directory / "project" / "unintended.txt").exists(), result.diagnostics
+    assert result.execution_status == "failed" and not result.valid
+    assert "P-file" in " ".join(result.diagnostics)
+    assert discover_matlab_project(str(root)) == project

@@ -20,6 +20,8 @@ fa_initializer_return = [];
 if ~isempty(fa_inputs.initializer)
     fa_path = fullfile(fa_root, fa_inputs.initializer.path);
     if strcmp(fa_inputs.initializer.kind, 'script')
+        assert(~isfile([fa_path(1:end-2) '.p']), ...
+            'Unsupported selected initializer script with same-stem P-file');
         run(fa_path);
     else
         fa_initializer_return = call_existing(fa_path, fa_request.initializer_arguments, ...
@@ -30,8 +32,6 @@ fa_before_names = who;
 fa_metadata.matlab_version = version;
 fa_metadata.matlab_release = version('-release');
 fa_metadata.products = ver;
-fa_metadata.conditions = fa_inputs.conditions;
-fa_metadata.inputs = fa_inputs;
 fa_metadata.id = fa_request.id;
 fa_metadata.request_sha256 = fa_request.request_sha256;
 fa_metadata.snapshot_root = fa_root;
@@ -41,6 +41,8 @@ fa_log_name = 'logsout';
 if strcmp(fa_inputs.mode, 'entry')
     fa_path = fullfile(fa_root, fa_inputs.entry.path);
     if strcmp(fa_inputs.entry.kind, 'script')
+        assert(~isfile([fa_path(1:end-2) '.p']), ...
+            'Unsupported selected entry script with same-stem P-file');
         run(fa_path);
     else
         fa_return = call_existing(fa_path, fa_request.entry_arguments, fa_request.entry_nargout);
@@ -76,7 +78,7 @@ fa_raw_path = fullfile(fa_output, 'raw.mat');
 save(fa_raw_path, fa_names{:}, 'fa_return', 'fa_initializer_return', '-v7');
 fa_receipt.id = fa_request.id;
 fa_receipt.request_sha256 = fa_request.request_sha256;
-fa_receipt.artifact_paths = {'raw.mat', 'metadata.json'};
+fa_receipt.artifact_paths = {'raw.mat', 'runtime-metadata.json'};
 fa_receipt.output_evidence = has_result(fa_return) || ~isempty(fa_new_names);
 fa_receipt.details.mode = fa_inputs.mode;
 fa_receipt.diagnostics = {};
@@ -97,7 +99,7 @@ else
         fa_receipt.diagnostics = {'Returned shape is retained as raw MAT only.'};
     end
 end
-write_json(fullfile(fa_output, 'metadata.json'), fa_metadata);
+write_json(fullfile(fa_output, 'runtime-metadata.json'), fa_metadata);
 write_json(fullfile(fa_output, 'bridge.json'), fa_receipt);
 end
 

@@ -20,7 +20,9 @@ from .matlab_contracts import (
     LocalMatlabExecution,
     LocalMatlabRequest,
     LocalMatlabResult,
+    MatlabExecutionMetadata,
     MatlabProjectOutput,
+    MatlabRuntimeMetadata,
     ProjectExecutionInput,
 )
 from .matlab_projects import discover_matlab_project
@@ -67,7 +69,7 @@ def _child(directory: Path) -> None:
         output = _read_model(directory / "bridge.json", MatlabProjectOutput)
         if output.id != request.id or output.request_sha256 != digest:
             raise ValueError("Bridge output identity mismatch")
-        allowed = {"raw.mat", "metadata.json", "series.json", "return.json"}
+        allowed = {"raw.mat", "runtime-metadata.json", "series.json", "return.json"}
         if len(set(output.artifact_paths)) != len(output.artifact_paths):
             raise ValueError("Duplicate output artifact")
         if not set(output.artifact_paths) <= allowed:
@@ -78,8 +80,28 @@ def _child(directory: Path) -> None:
             if "series.json" not in output.artifact_paths:
                 raise ValueError("Missing requested series")
             _normalize_series(request, directory)
+        if "runtime-metadata.json" not in output.artifact_paths:
+            raise ValueError("Missing runtime metadata artifact")
+        runtime = _read_model(directory / "runtime-metadata.json", MatlabRuntimeMetadata)
+        if (
+            runtime.id != request.id
+            or runtime.request_sha256 != digest
+            or runtime.snapshot_root != execution.snapshot_root
+        ):
+            raise ValueError("Runtime metadata identity differs from the confirmed request")
+        # MATLAB supplies measured runtime fields only; canonical JSON never round-trips
+        # through MATLAB null/array conversion. Unexpected provenance claims are rejected.
+        metadata = MatlabExecutionMetadata.model_validate(
+            {
+                **runtime.model_dump(mode="json"),
+                "inputs": request.inputs.model_dump(mode="json"),
+                "conditions": request.inputs.conditions,
+                "input_provenance": "canonical_request",
+            }
+        )
+        _write_json(directory / "metadata.json", metadata.model_dump(mode="json"))
         artifacts = []
-        for name in output.artifact_paths:
+        for name in [*output.artifact_paths, "metadata.json"]:
             item = describe_artifact(directory, name)
             artifacts.append(OutputArtifact(path=item.path, sha256=item.sha256, size=item.size))
         details = {**output.details, "output_evidence": output.output_evidence}

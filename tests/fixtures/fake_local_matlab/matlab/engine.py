@@ -114,25 +114,26 @@ class Engine:
             Path("bridge.json").write_text("x" * 4_100_000)
             return
         Path("raw.mat").write_bytes(b"MATLAB 5.0 MAT-file, test-only actual-result placeholder")
-        Path("metadata.json").write_text(
-            json.dumps(
-                {
-                    "matlab_version": "test-only-engine",
-                    "matlab_release": "test-only",
-                    "id": execution["id"],
-                    "request_sha256": execution["request_sha256"],
-                    "snapshot_root": execution["snapshot_root"],
-                    "working_directory": execution["snapshot_root"],
-                    "inputs": execution["inputs"],
-                    "conditions": execution["inputs"]["conditions"],
-                    "products": [{"Name": "test-only", "Version": "test-only"}],
-                    "settings": {"StopTime": "12", "Solver": "ode45"},
-                }
-            )
-        )
+        runtime = {
+            "matlab_version": "test-only-engine",
+            "matlab_release": "test-only",
+            "id": execution["id"],
+            "request_sha256": execution["request_sha256"],
+            "snapshot_root": execution["snapshot_root"],
+            "working_directory": execution["snapshot_root"],
+            "products": [{"Name": "test-only", "Version": "test-only"}],
+            "settings": {"StopTime": "12", "Solver": "ode45"},
+        }
+        if mode() == "wrong_runtime_id":
+            runtime["id"] = "b" * 32
+        if mode() == "wrong_runtime_digest":
+            runtime["request_sha256"] = "b" * 64
+        if mode() == "contradictory_runtime_inputs":
+            runtime["inputs"] = {"model": []}
+        Path("runtime-metadata.json").write_text(json.dumps(runtime))
         if mode() == "bad_metadata":
-            Path("metadata.json").write_text("{}")
-        paths = ["raw.mat", "metadata.json"]
+            Path("runtime-metadata.json").write_text("{}")
+        paths = ["raw.mat", "runtime-metadata.json"]
         evidence = True
         if mode() == "no_evidence":
             evidence = False

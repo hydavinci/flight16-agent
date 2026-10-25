@@ -248,15 +248,13 @@ class LocalMatlabExecution(_MatlabContract):
     initializer_arguments: list[str]
 
 
-class MatlabExecutionMetadata(_MatlabContract):
+class MatlabRuntimeMetadata(_MatlabContract):
     id: RunId
     request_sha256: Digest
     matlab_version: Nonempty
     matlab_release: Nonempty
     snapshot_root: Nonempty
     working_directory: Nonempty
-    inputs: ProjectExecutionInput
-    conditions: dict[str, JsonValue]
     products: list[dict[str, JsonValue]] | dict[str, JsonValue]
     settings: dict[str, JsonValue]
     simulation_model_info: dict[str, JsonValue] | None = None
@@ -266,6 +264,12 @@ class MatlabExecutionMetadata(_MatlabContract):
     def bounded_metadata(self) -> Self:
         _bounded_json(self.model_dump(mode="json"), MAX_RESULT)
         return self
+
+
+class MatlabExecutionMetadata(MatlabRuntimeMetadata):
+    inputs: ProjectExecutionInput
+    conditions: dict[str, JsonValue]
+    input_provenance: Literal["canonical_request"]
 
 
 class MatlabSeries(_MatlabContract):
