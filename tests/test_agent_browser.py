@@ -45,10 +45,12 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
             expect(page.locator("#confirm")).to_be_disabled()
             expect(page.locator("#baseline")).to_contain_text("offline_rmse")
             expect(page.locator("#trust-warning")).not_to_contain_text("工程初始化代码")
+            expect(page.locator("#evaluation-card")).to_be_hidden()
             assert not calls
             page.locator("#trusted").check()
             page.locator("#confirm").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成")
+            expect(page.locator("#evaluation-heading")).to_have_text("分析结果")
             expect(page.locator("#evaluation")).to_contain_text("本任务未要求合格判定")
             expect(page.locator("#evaluation")).to_contain_text("RMSE")
             expect(page.locator("#evaluation")).to_contain_text("1.414")
@@ -96,10 +98,12 @@ def test_failed_check_and_missing_condition_remain_visible_with_sourced_criteria
             page.locator("#send").click()
             expect(page.locator("#baseline")).to_contain_text(source["reference"])
             expect(page.locator("#baseline")).to_contain_text("unobserved")
+            expect(page.locator("#evaluation-card")).to_be_hidden()
             assert not calls
             page.locator("#trusted").check()
             page.locator("#confirm").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成")
+            expect(page.locator("#evaluation-heading")).to_have_text("评价结果")
             expect(page.locator("#evaluation .verdict")).to_have_text("UNDETERMINED")
             expect(page.locator("#evaluation tbody tr").filter(has_text="FAIL")).to_have_count(1)
             expect(page.locator("#evaluation")).to_contain_text(source["quote"])
@@ -161,6 +165,72 @@ def test_capability_gap_is_displayed_without_execution_and_old_consent_is_reset(
                 not record.task or not record.task.baseline.confirmed
                 for record in runtime.store.recent()
             )
+        finally:
+            browser.close()
+
+
+def test_plan_gaps_remain_visible_without_claiming_analysis_results(tmp_path):
+    from tests.agent_helpers import gap_data
+
+    draft = draft_data()
+    draft["nodes"] = []
+    draft["requirements"]["requested_outputs"][0].update(node_id=None, item_id=None)
+    draft["gaps"] = [gap_data()]
+    app, _, calls, _ = make_agent_web(
+        tmp_path, [{"action": "plan", "text": "Missing input.", "plan": draft}]
+    )
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.goto(url)
+            page.get_by_label("任务需求", exact=True).fill("Analyze missing input.")
+            page.locator("#send").click()
+            expect(page.locator("#evaluation-heading")).to_have_text("需求缺项")
+            expect(page.locator("#evaluation-card")).to_be_visible()
+            expect(page.locator("#evaluation")).to_contain_text("Supply the observed array")
+            expect(page.locator("#evaluation")).not_to_contain_text("本任务未要求合格判定")
+            assert not calls
+        finally:
+            browser.close()
+
+
+def test_invalid_findings_remain_visible_without_an_evaluation(tmp_path):
+    from flight_agent.runtime.capabilities import CapabilityRegistry
+    from flight_agent.runtime.observations import CapabilityOutcome, Finding
+    from tests.agent_helpers import register_rmse
+
+    app, runtime, calls, _ = make_agent_web(
+        tmp_path, [{"action": "plan", "text": "Analyze data.", "plan": draft_data()}]
+    )
+    tools = CapabilityRegistry(agent_mode=True)
+
+    def invalid(context, inputs):
+        calls.append(context.call_id)
+        return CapabilityOutcome(findings=[
+            Finding(id="not-steady", node_id=context.node_id, status="invalid",
+                    text="Initial or final response is not reliably steady.")
+        ])
+
+    register_rmse(tools, calls, operation=invalid)
+    runtime.executor.tools = tools
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.goto(url)
+            page.get_by_label("任务需求", exact=True).fill("Analyze data without acceptance.")
+            page.locator("#send").click()
+            expect(page.locator("#confirm")).to_be_visible()
+            expect(page.locator("#evaluation-card")).to_be_hidden()
+            page.locator("#trusted").check()
+            page.locator("#confirm").click()
+            expect(page.locator("#conversation-status")).to_have_text("已完成")
+            expect(page.locator("#evaluation-heading")).to_have_text("分析结果")
+            expect(page.locator("#evaluation-card")).to_be_visible()
+            expect(page.locator("#evaluation")).to_contain_text("not reliably steady")
+            expect(page.locator("#evaluation .verdict")).to_have_count(0)
+            assert len(calls) == 1
         finally:
             browser.close()
 

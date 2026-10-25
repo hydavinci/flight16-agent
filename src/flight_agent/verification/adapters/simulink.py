@@ -1,7 +1,7 @@
 from math import floor
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import JsonValue, field_validator
 
 from ...remote import RemoteError
 from ...runtime.budget import BudgetExhausted
@@ -213,7 +213,7 @@ def simulink_capabilities(
         metrics = (
             [
                 MetricDefinition(id="overshoot", label="Overshoot", unit="%"),
-                MetricDefinition(id="settling_time", label="Settling time", unit="s"),
+                MetricDefinition(id="settling_time", label="Settling time (5% band)", unit="s"),
             ]
             if kind == "step_response"
             else [
@@ -231,6 +231,68 @@ def simulink_capabilities(
                 ),
             ]
         )
+        policy: dict[str, JsonValue] = {
+            "version": "1",
+            "source": "Worker metric and analysis validity",
+        }
+        if kind == "step_response":
+            policy.update(
+                configuration_sources={
+                    "simulation_settings": "initialized_model",
+                    "signals": "resource.metadata.config.input_signal/response_signal",
+                    "steady_state": "resource.metadata.config.steady_state",
+                    "step": "single_change_in_logged_input",
+                },
+                metric_definitions={
+                    "settling_time": {
+                        "settling_band": 0.05,
+                        "time_origin": "detected_step",
+                        "initial_reference": "mean_pre_step_response",
+                        "final_reference": "mean_verified_steady_state_tail",
+                        "method": "stepinfo",
+                    },
+                    "overshoot": {"method": "stepinfo", "unit": "%"},
+                },
+            )
+            notes = (
+                "Use the bound project's initialized model without overriding its step stimulus, "
+                "stop time, solver or sampling. The Worker reads scalar timeseries from logsout "
+                "using config.input_signal and config.response_signal, identifies a single input "
+                "step and records its actual time, baseline and final input. Initial response is "
+                "the pre-step mean; final response is the verified tail-window mean under "
+                "config.steady_state. stepinfo uses SettlingTimeThreshold=0.05 and time relative "
+                "to the detected step, so settling_time is the 5% settling time. These are metric "
+                "definitions and validity checks, not acceptance thresholds. Actual stimulus "
+                "and simulation settings are observed during execution, not missing planner "
+                "inputs. Missing logs, ambiguous steps or unreliable steady state produce "
+                "explicit failure or invalid evidence, not guessed values. "
+            )
+        else:
+            policy.update(
+                configuration_sources={
+                    "linearization_points": "getlinio(model)",
+                    "operating_point": "resource.metadata.config.operating_point_mode",
+                    "feedback_sign": "resource.metadata.config.feedback_sign",
+                },
+                metric_definitions={
+                    "gain_margin": {"method": "minimum_20_log10_allmargin_gain_margins"},
+                    "phase_margin": {"method": "minimum_allmargin_phase_margins"},
+                },
+            )
+            notes = (
+                "The Worker reads existing linearization points with getlinio(model); exactly "
+                "one active openinput and one active openoutput are required. It never guesses "
+                "breakpoints. For config.operating_point_mode=initialized it uses operpoint(model) "
+                "after project initialization; for workspace it uses the registered "
+                "config.operating_point_variable. The SISO loop is config.feedback_sign times "
+                "linearize(model, operatingPoint, io). allmargin supplies all crossings "
+                "(margin fallback if missing); gain_margin is the minimum 20*log10 gain "
+                "multiplier in dB and phase_margin the minimum phase margin in degrees. "
+                "The existing model points are checked at execution, not additional planner "
+                "inputs. Invalid or missing points cause explicit failure, never guessed "
+                "results. Actual operating point and crossing evidence belong to execution, "
+                "not pre-execution claims. "
+            )
         return Capability(
             name=f"simulink_{kind}",
             version="1",
@@ -256,9 +318,9 @@ def simulink_capabilities(
                     "required": ["trim_point"],
                     "additionalProperties": False,
                 },
-                validity_policy={"version": "1", "source": "Worker metric and analysis validity"},
+                validity_policy=policy,
                 planning_notes=(
-                    "Only trim point 1 is supported. Bind the Worker project role. "
+                    notes + "Only trim point 1 is supported. Bind the Worker project role. "
                     "Metrics are analysis evidence, not acceptance standards. "
                     "Criteria must use conditions {trim_point: 1}; no thresholds are supplied."
                 ),

@@ -344,6 +344,195 @@ def test_decision_branches_have_no_ambiguous_executable_payload(payload):
         module().AgentDecision.model_validate(payload)
 
 
+def test_model_visible_decision_schema_includes_branch_constraints():
+    schema = module().AgentDecision.model_json_schema()
+    branches = schema["oneOf"]
+    assert len(branches) == 3
+    non_plan, gap, plan = [branch["properties"] for branch in branches]
+    assert non_plan["action"]["enum"] == ["answer", "clarify"]
+    assert non_plan["plan"] == {"type": "null"}
+    assert non_plan["gaps"]["maxItems"] == 0
+    assert gap["action"]["const"] == "capability_gap"
+    assert gap["plan"] == {"type": "null"}
+    assert gap["gaps"]["minItems"] == 1
+    assert branches[1]["required"] == ["gaps"]
+    assert plan["action"]["const"] == "plan"
+    assert plan["plan"] == {"not": {"type": "null"}}
+    assert plan["gaps"]["maxItems"] == 0
+    assert branches[2]["required"] == ["plan"]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"action": "clarify", "text": "Need thresholds.", "plan": None, "gaps": [gap_data()]},
+        {"action": "answer", "text": "private-invalid-response", "plan": draft()},
+        {"action": "plan", "text": "private-invalid-response"},
+    ],
+)
+def test_invalid_model_decision_stops_after_one_correction_without_execution(tmp_path, response):
+    planner, store, conversation, tools, calls, model = setup(tmp_path, response)
+    with pytest.raises(ValueError, match="模型返回.*格式") as error:
+        planner.propose(
+            "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+        )
+    assert "未生成新方案或触发执行" in str(error.value)
+    assert "private-invalid-response" not in str(error.value)
+    assert "input_value" not in str(error.value)
+    assert len(model._seen) == 2
+    assert calls == []
+    assert store.get(conversation.id).task is None
+
+
+def test_missing_output_producer_is_corrected_with_feedback_and_original_request(tmp_path):
+    request = "Report RMSE and its validity without inventing missing values."
+    corrected = draft()
+    corrected["requirements"]["requested_outputs"][0]["description"] = request
+    broken = draft()
+    broken["requirements"]["requested_outputs"].append({
+        "id": "validity_explanation", "kind": "finding",
+        "node_id": None, "item_id": None, "description": "private-invalid-response",
+    })
+    planner, store, conversation, tools, calls, model = setup(tmp_path, {}, request)
+    model.responses = [
+        tool_message("propose_agent", {"action": "plan", "text": "Invalid.", "plan": broken}),
+        tool_message("propose_agent", {"action": "plan", "text": "Corrected.", "plan": corrected}),
+    ]
+    decision = planner.propose(
+        request, conversation, catalog=tools.catalog(), resources={}, sources={}
+    )
+    assert decision.action == "plan"
+    assert decision.plan.requirements.requested_outputs[0].description == request
+    assert len(model._seen) == 2
+    original = json.loads(model._seen[0][-1].content)
+    repair = json.loads(model._seen[1][-1].content)
+    assert repair.pop("validation_feedback")["errors"][0]["message"].find(
+        "validity_explanation"
+    ) >= 0
+    assert repair == original
+    assert "private-invalid-response" not in str(model._seen)
+    assert not calls
+    assert store.get(conversation.id).task is None
+
+
+@pytest.mark.parametrize("elapsed,expected_calls", [(4, 2), (11, 1)])
+def test_correction_shares_the_original_timeout(tmp_path, monkeypatch, elapsed, expected_calls):
+    clock = [100.0]
+    monkeypatch.setattr(module(), "monotonic", lambda: clock[0])
+    planner, _, conversation, tools, calls, _ = setup(tmp_path, {})
+
+    class TimedModel(CapturingModel):
+        _timeouts: list = PrivateAttr(default_factory=list)
+
+        def _generate(self, messages, **kwargs):
+            self._timeouts.append(kwargs.get("timeout"))
+            clock[0] += elapsed
+            return super()._generate(messages, **kwargs)
+
+    model = TimedModel(responses=[
+        tool_message("propose_agent", {"action": "plan", "text": "Missing draft."}),
+        tool_message("propose_agent", {"action": "clarify", "text": "Provide input."}),
+    ])
+    planner.model = model
+    bounded = planner.with_timeout(10)
+    if expected_calls == 1:
+        with pytest.raises(ValueError, match="总超时"):
+            bounded.propose(
+                "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+            )
+        assert model._timeouts == [10]
+    else:
+        decision = bounded.propose(
+            "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+        )
+        assert decision.action == "clarify"
+        assert model._timeouts == [10, 6]
+    assert len(model._seen) == expected_calls
+    assert planner._timeout_seconds is None
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "failure", [TimeoutError("Model timed out"), RuntimeError("Transport error")]
+)
+def test_model_transport_failure_is_not_retried(tmp_path, failure):
+    planner, _, conversation, tools, calls, _ = setup(tmp_path, {})
+
+    class FailingModel(CapturingModel):
+        def _generate(self, messages, **kwargs):
+            self._seen.append(messages)
+            raise failure
+
+    model = FailingModel(responses=[])
+    planner.model = model
+    with pytest.raises(type(failure), match=str(failure)):
+        planner.propose(
+            "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+        )
+    assert len(model._seen) == 1
+    assert calls == []
+
+
+def test_correction_feedback_excludes_payload_values_and_redacts_local_paths(tmp_path):
+    planner, _, conversation, tools, calls, model = setup(tmp_path, {})
+    conversation.project_root = "/private/project"
+    model.responses = [
+        tool_message("propose_agent", {
+            "action": "clarify", "text": "Provide input.",
+            "/private/project": {"api_key": "private-invalid-secret"},
+        }),
+        tool_message("propose_agent", {"action": "clarify", "text": "Provide input."}),
+    ]
+    decision = planner.propose(
+        "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+    )
+    assert decision.action == "clarify"
+    feedback = json.loads(model._seen[1][-1].content)["validation_feedback"]
+    assert feedback["errors"][0]["code"] == "extra_forbidden"
+    assert "/private/project" not in str(model._seen)
+    assert "private-invalid-secret" not in str(model._seen)
+    assert calls == []
+
+
+def test_correction_does_not_truncate_request_to_fit_feedback(tmp_path, monkeypatch):
+    planner, _, conversation, tools, calls, _ = setup(tmp_path, {})
+
+    class SizeLimitedModel(CapturingModel):
+        def _generate(self, messages, **kwargs):
+            monkeypatch.setattr(
+                module(), "MAX_CONTEXT_BYTES", len(messages[-1].content.encode("utf-8")) + 1
+            )
+            return super()._generate(messages, **kwargs)
+
+    model = SizeLimitedModel(responses=[
+        tool_message("propose_agent", {"action": "plan", "text": "Missing draft."}),
+        tool_message("propose_agent", {"action": "clarify", "text": "Unused."}),
+    ])
+    planner.model = model
+    with pytest.raises(ValueError, match="大小限制"):
+        planner.propose(
+            "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+        )
+    assert len(model._seen) == 1
+    assert calls == []
+
+
+def test_corrected_plan_still_cannot_use_an_unregistered_capability(tmp_path):
+    planner, _, conversation, tools, calls, model = setup(tmp_path, {})
+    forged = draft()
+    forged["nodes"][0]["tool"] = "unregistered"
+    model.responses = [
+        tool_message("propose_agent", {"action": "plan", "text": "Missing draft."}),
+        tool_message("propose_agent", {"action": "plan", "text": "Forged.", "plan": forged}),
+    ]
+    with pytest.raises(ValueError, match="not registered"):
+        planner.propose(
+            "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+        )
+    assert len(model._seen) == 2
+    assert calls == []
+
+
 def test_shared_structured_boundary_rejects_plain_text_instead_of_guessing_a_plan(tmp_path):
     planner, _, conversation, tools, _, model = setup(tmp_path, {})
     model.responses = [AIMessage(content="I computed a passing result.")]

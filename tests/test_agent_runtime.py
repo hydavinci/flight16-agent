@@ -53,6 +53,40 @@ def test_analysis_executes_once_without_forced_judgment_delivery_or_design_pair(
     assert len(calls) == 1
 
 
+def test_new_proposal_rejects_insufficient_rounds_before_saving_a_task(tmp_path):
+    runtime, store, conversation, calls = setup(tmp_path)
+    data = analysis_plan_data()
+    data["nodes"].append({**data["nodes"][0], "id": "second-analysis"})
+    data["budget"].update(max_rounds=1, max_calls=2)
+    with pytest.raises(ValueError, match="round budget"):
+        propose(runtime, conversation, data)
+    assert store.get(conversation.id).task is None
+    assert store.get(conversation.id).pending_decision is None
+    assert calls == []
+
+
+def test_historical_insufficient_rounds_remain_readable_without_budget_changes(tmp_path):
+    runtime, store, conversation, calls = setup(tmp_path)
+    data = analysis_plan_data()
+    data["nodes"].append({**data["nodes"][0], "id": "second-analysis"})
+    pending = propose(runtime, conversation, data)
+    pending.task.baseline = pending.task.baseline.model_copy(
+        update={"budget": ResourceBudget(max_rounds=1, max_calls=2)}
+    )
+    pending.status = "failed"
+    pending.error = "The confirmed round budget is exhausted"
+    store.save(pending)
+    restored = ConversationStore(store.root).get(pending.id)
+    assert restored.task.baseline.budget.max_rounds == 1
+    assert len(restored.task.baseline.nodes) == 2
+    assert restored.error == "The confirmed round budget is exhausted"
+    assert restored.task.budget_state.rounds == 0
+    with pytest.raises(ValueError, match="round budget"):
+        confirm(runtime, restored)
+    assert not store.get(pending.id).task.baseline.confirmed
+    assert calls == []
+
+
 def test_dispatch_ledger_and_charged_budget_exist_before_operation(tmp_path):
     observed = []
 

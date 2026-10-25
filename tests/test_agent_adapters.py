@@ -1,4 +1,5 @@
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,62 @@ def test_registered_resource_locations_inspect_and_browse_without_execution(tmp_
     locations = runtime.resources.locations()
     assert len({item.id for item in locations}) == len(locations)
     assert all(item.display_name for item in locations)
+
+
+def test_planner_receives_project_owned_simulink_configuration_without_execution(tmp_path):
+    from flight_agent.verification.agent_planner import AgentPlanner
+    from tests.helpers import tool_message
+    from tests.test_agent_planner import CapturingModel
+
+    backend = ControlledBackend()
+    runtime, store = assembled(tmp_path, backend)
+    resource = runtime.resources.inspect(
+        "simulink_project", str(project_tree(tmp_path / "project"))
+    )
+    model = CapturingModel(responses=[
+        tool_message("propose_agent", {"action": "clarify", "text": "Test boundary only."})
+    ])
+    AgentPlanner(model=model).propose(
+        "Analyze trim point 1 using the prepared project; no acceptance.",
+        store.create(),
+        catalog=runtime.tools.catalog((resource,)),
+        resources={resource.id: resource},
+        sources={},
+    )
+    context = json.loads(model._seen[0][-1].content)
+    catalog = {item["name"]: item for item in context["catalog"]}
+    step = catalog["simulink_step_response"]
+    policy = step["metadata"]["validity_policy"]
+    assert policy["configuration_sources"] == {
+        "simulation_settings": "initialized_model",
+        "signals": "resource.metadata.config.input_signal/response_signal",
+        "steady_state": "resource.metadata.config.steady_state",
+        "step": "single_change_in_logged_input",
+    }
+    assert policy["metric_definitions"]["settling_time"] == {
+        "settling_band": 0.05,
+        "time_origin": "detected_step",
+        "initial_reference": "mean_pre_step_response",
+        "final_reference": "mean_verified_steady_state_tail",
+        "method": "stepinfo",
+    }
+    margin = catalog["simulink_stability_margins"]["metadata"]["validity_policy"]
+    assert margin["configuration_sources"] == {
+        "linearization_points": "getlinio(model)",
+        "operating_point": "resource.metadata.config.operating_point_mode",
+        "feedback_sign": "resource.metadata.config.feedback_sign",
+    }
+    assert margin["metric_definitions"] == {
+        "gain_margin": {"method": "minimum_20_log10_allmargin_gain_margins"},
+        "phase_margin": {"method": "minimum_allmargin_phase_margins"},
+    }
+    config = context["resources"][0]["metadata"]["config"]
+    assert config["input_signal"] == {"name": "stick", "unit": "lb"}
+    assert config["response_signal"] == {"name": "response", "unit": "deg/s"}
+    assert config["operating_point_mode"] == "initialized"
+    assert set(step["input_schema"]["properties"]) == {"trim_point"}
+    assert str(resource.locator) not in str(context)
+    assert backend.calls == []
 
 
 def test_registered_resource_rejects_fingerprint_change_before_confirmation(tmp_path):

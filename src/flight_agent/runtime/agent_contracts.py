@@ -9,6 +9,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 from .capability_metadata import CapabilitySnapshot
 from .contracts import (
@@ -68,7 +69,14 @@ class _PlanFields(AgentContract):
     nodes: Annotated[list[AgentNode], Field(max_length=40)]
     evaluation_node: Name | None = None
     allowed_effects: tuple[Effect, ...] = ("read_only",)
-    budget: ResourceBudget = ResourceBudget()
+    budget: ResourceBudget = Field(
+        default=ResourceBudget(),
+        description=(
+            "Each node dispatch consumes one round and one call, including evaluation, "
+            "delivery and cached nodes. max_rounds and max_calls must each cover all nodes; "
+            "rounds are not parallel dependency layers. Nested analysis may consume more."
+        ),
+    )
     gaps: Annotated[list[CapabilityGap], Field(max_length=80)] = []
 
     @field_validator("budget", mode="before")
@@ -77,6 +85,16 @@ class _PlanFields(AgentContract):
         if isinstance(value, ResourceBudget):
             return value.model_dump(mode="json")
         return value
+
+    def check_dispatch_budget(self) -> None:
+        # Validate new proposals, not historical baselines whose evidence must remain readable.
+        if len(self.nodes) > self.budget.max_rounds:
+            raise PydanticCustomError(
+                "plan_round_budget",
+                "Plan exceeds its round budget: {nodes} nodes require at least {nodes} rounds, "
+                "but the proposed budget has {rounds}",
+                {"nodes": len(self.nodes), "rounds": self.budget.max_rounds},
+            )
 
     @model_validator(mode="after")
     def valid_graph(self) -> Self:
@@ -103,7 +121,12 @@ class _PlanFields(AgentContract):
             if output.node_id is not None and output.node_id not in by_id:
                 raise ValueError("Output refers to an unknown producer")
             if (output.node_id is None or output.item_id is None) and output.id not in gap_ids:
-                raise ValueError("Unresolved producer requires an explicit gap")
+                raise PydanticCustomError(
+                    "plan_output_producer",
+                    "Requested output {output_id} requires node_id and item_id identifying its "
+                    "producer, or an explicit gap",
+                    {"output_id": output.id},
+                )
         if any(item.metric.node_id not in by_id for item in self.requirements.criteria):
             raise ValueError("Criterion refers to an unknown producer")
         if self.requirements.mode == "analysis" and self.evaluation_node is not None:
@@ -118,6 +141,7 @@ class AgentPlanDraft(_PlanFields):
 
     @model_validator(mode="after")
     def referenced_resources(self) -> Self:
+        self.check_dispatch_budget()
         if len(set(self.resource_ids)) != len(self.resource_ids):
             raise ValueError("Resource IDs must be unique")
         if any(

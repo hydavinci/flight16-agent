@@ -9,6 +9,7 @@ from flight_agent.verification.agent_runtime import AgentExecutor
 from flight_agent.verification.store import ConversationStore
 from tests.agent_helpers import (
     draft_data,
+    gap_data,
     make_agent_web,
     wait_for_conversation,
 )
@@ -78,6 +79,128 @@ def test_missing_standard_clarifies_without_creating_or_executing_a_plan(tmp_pat
         assert record["task"] is None
         assert record["pending_decision"]["kind"] == "clarify"
         assert not calls
+
+
+def test_round_budget_is_rejected_before_confirmation_and_replanned_with_consent(tmp_path):
+    from copy import deepcopy
+
+    from tests.agent_helpers import delivery_draft
+
+    draft = delivery_draft()
+    draft["nodes"].insert(1, {**draft["nodes"][0], "id": "second-analysis"})
+    draft["nodes"][-1]["depends_on"].append("second-analysis")
+    draft["budget"].update(max_rounds=3, max_calls=3)
+    insufficient = deepcopy(draft)
+    insufficient["budget"]["max_rounds"] = 2
+    app, _, calls, _ = make_agent_web(tmp_path, [
+        {"action": "plan", "text": "Insufficient budget.", "plan": insufficient},
+        {"action": "plan", "text": "Still insufficient.", "plan": insufficient},
+        {"action": "plan", "text": "Confirm all three nodes.", "plan": draft},
+    ])
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = auth(client)
+        identifier = post_message(client, headers)
+        failed = wait_for_conversation(
+            client, identifier, headers, lambda item: item["status"] == "failed"
+        )
+        assert "轮次预算不足" in failed["error"]
+        assert failed["task"] is None
+        assert not calls
+        response = client.post(
+            f"{API}/{identifier}/messages",
+            headers=headers,
+            json={"message": "Propose a new plan with budget for analysis and delivery."},
+        )
+        assert response.status_code == 202
+        record = pending(client, identifier, headers)
+        assert record["task"]["baseline"]["budget"]["max_rounds"] == 3
+        assert not record["task"]["baseline"]["confirmed"]
+        assert not calls
+        response = client.post(
+            f"{API}/{identifier}/confirm", headers=headers, json={"version": 1, "trusted": True}
+        )
+        assert response.status_code == 202
+        done = wait_for_conversation(
+            client, identifier, headers, lambda item: item["status"] == "completed"
+        )
+        assert done["task"]["budget_state"]["rounds"] == 3
+        assert done["task"]["budget_state"]["calls"] == 3
+        assert any(item.get("id") == "json" for item in done["task"]["artifacts"])
+
+
+def test_mixed_clarification_shows_safe_error_and_accepts_a_followup(tmp_path):
+    app, _, calls, _ = make_agent_web(
+        tmp_path,
+        [
+            {"action": "clarify", "text": "private-invalid-response", "gaps": [gap_data()]},
+            {"action": "clarify", "text": "private-invalid-response", "gaps": [gap_data()]},
+            {"action": "clarify", "text": "请明确需要采用的阈值和单位。"},
+        ],
+    )
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = auth(client)
+        identifier = post_message(client, headers, "Verify using demo criteria.")
+        failed = wait_for_conversation(
+            client, identifier, headers, lambda item: item["status"] == "failed"
+        )
+        assert "模型返回的决策格式" in failed["error"]
+        assert "private-invalid-response" not in failed["error"]
+        assert "input_value" not in failed["error"]
+        assert failed["pending_decision"]["message"] == failed["error"]
+        assert failed["task"] is None
+        response = client.post(
+            f"{API}/{identifier}/messages",
+            headers=headers,
+            json={"message": "Which thresholds are missing?"},
+        )
+        assert response.status_code == 202
+        recovered = wait_for_conversation(
+            client, identifier, headers, lambda item: item["status"] == "waiting_for_user"
+        )
+        assert recovered["error"] is None
+        assert recovered["messages"][-1]["content"] == "请明确需要采用的阈值和单位。"
+        assert recovered["task"] is None
+        assert not calls
+
+
+def test_output_binding_correction_still_requires_confirmation_before_execution(tmp_path):
+    from copy import deepcopy
+
+    from tests.agent_helpers import delivery_draft
+
+    valid = delivery_draft()
+    broken = deepcopy(valid)
+    unresolved = {
+        "id": "validity_explanation", "kind": "finding", "node_id": None, "item_id": None,
+        "description": "Explain validity without inventing data.",
+    }
+    broken["requirements"]["requested_outputs"].append(unresolved)
+    broken["nodes"][-1]["inputs"]["requirements"] = deepcopy(broken["requirements"])
+    app, runtime, calls, _ = make_agent_web(tmp_path, [
+        {"action": "plan", "text": "Incomplete binding.", "plan": broken},
+        {"action": "plan", "text": "Corrected bindings.", "plan": valid},
+    ])
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = auth(client)
+        identifier = post_message(
+            client, headers, "Analyze arrays, explain validity, deliver JSON without acceptance."
+        )
+        record = pending(client, identifier, headers)
+        assert record["error"] is None
+        assert not record["task"]["baseline"]["confirmed"]
+        assert record["task"]["calls"] == []
+        assert not calls
+        response = client.post(
+            f"{API}/{identifier}/confirm", headers=headers, json={"version": 1, "trusted": True}
+        )
+        assert response.status_code == 202
+        done = wait_for_conversation(
+            client, identifier, headers, lambda item: item["status"] == "completed"
+        )
+        assert len(calls) == 1
+        assert done["task"]["result"]["evaluation"] is None
+        assert any(item.get("id") == "json" for item in done["task"]["artifacts"])
+        assert len(runtime.store.recent()) == 1
 
 
 def test_generic_api_confirmation_uses_v2_and_rejects_stale_or_untrusted_actions(tmp_path):

@@ -39,8 +39,20 @@ class Criterion(AgentContract):
 class OutputRequirement(AgentContract):
     id: Name
     kind: Literal["metric", "finding", "table", "artifact"]
-    node_id: Name | None = None
-    item_id: Name | None = None
+    node_id: Name | None = Field(
+        default=None,
+        description=(
+            "ID of the plan node producing this output. Required for a fulfilled output; "
+            "null is allowed only with an explicit plan.gaps entry for this requirement ID."
+        ),
+    )
+    item_id: Name | None = Field(
+        default=None,
+        description=(
+            "Metric, finding, table or artifact ID produced by node_id. Required for a fulfilled "
+            "output; null requires an explicit plan.gaps entry for this requirement ID."
+        ),
+    )
     description: Text
 
 

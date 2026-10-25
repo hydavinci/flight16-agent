@@ -402,6 +402,7 @@ class AgentExecutor:
                     "Reconcile unresolved or unknown calls before proposing a new plan"
                 )
             plan = AgentPlan.model_validate(plan)
+            plan.check_dispatch_budget()
             validate_bindings(plan, self.tools)
             self.resources.verify(plan.resources)
             output_root = validate_output_root(conversation.output_root)
@@ -467,6 +468,7 @@ class AgentExecutor:
                 if conversation.status == "completed":
                     return conversation
                 raise ValueError("The baseline is already confirmed; resume the original task")
+            task.baseline.check_dispatch_budget()
             validate_bindings(task.baseline, self.tools)
             self.resources.verify(task.baseline.resources)
             self._validate_resource_boundary(task.baseline, task.result_directory)

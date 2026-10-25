@@ -21,11 +21,14 @@ def copilot_cli(tmp_path, monkeypatch):
         "import json, os, sys, time\n"
         "from pathlib import Path\n"
         "capture = Path(os.environ['PROBE_CAPTURE'])\n"
+        "attempt = json.loads(capture.read_text()).get('calls', 0) if capture.exists() else 0\n"
         "capture.write_text(json.dumps({'args': sys.argv[1:], 'cwd': os.getcwd(), "
+        "'calls': attempt + 1, "
         "'has_worker_secret': 'MATLAB_WORKER_TOKEN' in os.environ, "
         "'has_api_secret': 'LLM_API_KEY' in os.environ}))\n"
         "time.sleep(float(os.environ.get('PROBE_DELAY', '0')))\n"
-        "print(os.environ['PROBE_EVENTS'])\n"
+        "sequence = os.environ.get('PROBE_EVENTS_SEQUENCE')\n"
+        "print(json.loads(sequence)[attempt] if sequence else os.environ['PROBE_EVENTS'])\n"
         "sys.exit(int(os.environ.get('PROBE_EXIT', '0')))\n",
         encoding="utf-8",
     )
@@ -199,5 +202,61 @@ def test_copilot_accepts_new_agent_schema_without_running_capabilities(
         sources={},
     )
     assert result.plan.requirements.criteria == []
+    assert calls == []
+    assert store.get(conversation.id).task is None
+
+
+def test_copilot_agent_rejects_mixed_clarification_with_safe_error(
+    copilot_cli, monkeypatch, tmp_path
+):
+    from tests.agent_helpers import gap_data
+    from tests.test_agent_planner import setup
+
+    planner, store, conversation, tools, calls, _ = setup(tmp_path, {})
+    planner.model = None
+    monkeypatch.setenv(
+        "PROBE_EVENTS",
+        events(json.dumps({
+            "action": "clarify",
+            "text": "private-invalid-response",
+            "plan": None,
+            "gaps": [gap_data()],
+        })),
+    )
+    with pytest.raises(ValueError, match="模型返回.*格式") as error:
+        planner.propose(
+            "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+        )
+    assert "private-invalid-response" not in str(error.value)
+    assert json.loads(copilot_cli.read_text())["calls"] == 2
+    assert calls == []
+    assert store.get(conversation.id).task is None
+
+
+def test_copilot_corrects_missing_output_binding_without_executing(
+    copilot_cli, monkeypatch, tmp_path
+):
+    from tests.test_agent_planner import draft, setup
+
+    planner, store, conversation, tools, calls, _ = setup(tmp_path, {})
+    planner.model = None
+    broken = draft()
+    broken["requirements"]["requested_outputs"].append({
+        "id": "validity_explanation", "kind": "finding", "node_id": None, "item_id": None,
+        "description": "Validity of actual metrics.",
+    })
+    monkeypatch.setenv("PROBE_EVENTS_SEQUENCE", json.dumps([
+        events(json.dumps({"action": "plan", "text": "Unbound.", "plan": broken})),
+        events(json.dumps({"action": "plan", "text": "Bound.", "plan": draft()})),
+    ]))
+    decision = planner.propose(
+        "Report RMSE and explain validity.", conversation,
+        catalog=tools.catalog(), resources={}, sources={},
+    )
+    assert decision.action == "plan"
+    capture = json.loads(copilot_cli.read_text())
+    assert capture["calls"] == 2
+    assert "plan_output_producer" in capture["args"][-1]
+    assert "--deny-tool=shell" in capture["args"]
     assert calls == []
     assert store.get(conversation.id).task is None

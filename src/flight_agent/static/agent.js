@@ -308,13 +308,18 @@ function renderChecks(view) {
 }
 
 function renderEvaluation(view) {
-  $("evaluation-card").hidden = false;
+  const hasResults = Boolean(view.evaluation || view.observations.length
+    || view.findings.length || view.tables.length);
+  $("evaluation-card").hidden = !hasResults && !view.gaps.length;
   $("evaluation").replaceChildren();
+  $("evaluation-heading").textContent = view.evaluation
+    ? "评价结果" : hasResults ? "分析结果" : "需求缺项";
+  if ($("evaluation-card").hidden) return;
   $("explanation").textContent = "执行状态、数值有效性和合格判定彼此独立；证据不足时不推断通过。";
-  if (!view.evaluation) {
+  if (!view.evaluation && hasResults) {
     $("evaluation").append(element("p", view.requirements.mode === "analysis"
       ? "本任务未要求合格判定" : "尚无可用评价，详见任务状态与缺项"));
-  } else {
+  } else if (view.evaluation) {
     const verdict = element("p", view.evaluation.status
       ? view.evaluation.status.toUpperCase() : "仅判定逐项条件，未要求总体结论", "verdict");
     verdict.dataset.verdict = view.evaluation.status || "";

@@ -36,6 +36,20 @@ def test_analysis_requires_neither_design_pair_nor_criteria():
     assert not hasattr(result, "design")
 
 
+def test_draft_rejects_round_budget_below_node_count_including_delivery():
+    from tests.agent_helpers import delivery_draft
+
+    data = delivery_draft()
+    data["nodes"].insert(1, {**data["nodes"][0], "id": "second-analysis"})
+    data["nodes"][-1]["depends_on"].append("second-analysis")
+    data["budget"].update(max_rounds=2, max_calls=3)
+    model = contract("agent_contracts", "AgentPlanDraft")
+    with pytest.raises(ValidationError, match="round budget"):
+        model.model_validate(data)
+    data["budget"]["max_rounds"] = 3
+    assert len(model.model_validate(data).nodes) == 3
+
+
 def test_verification_without_criteria_is_rejected():
     data = analysis_plan_data()
     data["requirements"]["mode"] = "verification"
