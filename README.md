@@ -4,13 +4,14 @@
 提供 Web 和 CLI 入口。核心分工是：**大模型理解请求、提出计划和解释证据，
 已注册适配器负责计算，Python 程序负责授权、不可变证据和有来源的判据比较。**
 
-Web 首页只有一个 **任务需求** 入口，不再选择 D1/D2 或自动模式。
+Web 首页提供 **任务需求**、可选的 **评价指标** 和工程目录，不再选择 D1/D2 场景。
 知识问答不要求目录、MATLAB 或 Worker；工程任务从已注册能力目录生成 v2 方案，
 列明需求、资源、指标、条件、判据来源、能力版本、权限和预算，确认前不执行。
 纯分析可以只报告观测、发现或表格，不强制阈值、合格结论、图形或 Word；
 要求验证却未给标准时先澄清，缺少工具或输入时明确报告能力缺口，不虚构结果。
 
-现有注册项包括 Worker 上已准备工程的 Simulink 阶跃响应/稳定裕度，
+现有注册项包括本机已准备 MATLAB/Simulink 工程的已有入口执行与独立 stepinfo，
+Worker 上已准备工程的 Simulink 阶跃响应/稳定裕度，
 以及 Agent 主机已登记 JSON 数据的**有界离线诊断**。
 配平点 1、信号约定、稳态筛选和诊断假设循环属于这些适配器，不是通用核心限制。
 通用框架不等于已经支持任意飞控算法；离线诊断不主动补跑 Simulink，不执行设计修改。
@@ -30,6 +31,7 @@ Web 首页只有一个 **任务需求** 入口，不再选择 D1/D2 或自动模
 | 能力 | 当前实现 |
 |---|---|
 | Web 首页 | 统一需求与确认入口；按通用视图显示观测、发现、表格、来源和缺口，无场景或指标名称分支；手机端折叠历史 |
+| 本机 MATLAB 工程 | 静态发现已有入口/模型；确认后在工程副本执行；显式时序工件 → 独立 stepinfo → 有来源评价 → Word/JSON，不要求 HTTP Worker |
 | Simulink 数值适配器 | 已准备的 Simulink 工程、配平点 1、阶跃响应和开环稳定裕度 |
 | 离线诊断适配器 | 窗口统计、显式对齐信号比较、已记录参数敏感性、局部环路裕度；不调用 MATLAB worker |
 | 诊断证据循环 | 保留初始基线；引用证据追加假设修订、优先级及下一轮计划，最多 8 个假设且不删除已有 ID；共享预算、缺项或未知执行状态明确停止 |
@@ -41,7 +43,7 @@ Web 首页只有一个 **任务需求** 入口，不再选择 D1/D2 或自动模
 | 失败恢复 | 原调用对账、已知失败显式重试、新需求重新规划；旧 v1 任务保留原有有界恢复方案 |
 | 受控工具扩展 | 开发者注册带输入/输出 schema 和能力依赖的只读工具，不开放模型动态导入或任意执行 |
 | 兼容工作台 | `/workbench` 上传单个 UTF-8 `.m` 脚本或函数 + JSON 参数 |
-| 执行后端 | 安装 MATLAB 的本机或远程 worker，通过 MATLAB Engine 执行 |
+| 执行后端 | 本机专用 Python 子进程 + MATLAB Engine；或显式选择的本机/远程 HTTP Worker |
 | 上传工作台输出 | JSON 数据、运行日志、最多 5 张 PNG、结果与报告下载 |
 | CLI / 上传后分析 | LangChain 工具调用、演示判据、带知识来源的中文解释 |
 | 模型接口 | 默认使用支持工具调用的 OpenAI 兼容 Chat Completions；目录工作流也可显式使用本机 Copilot CLI |
@@ -62,8 +64,8 @@ D3-D6 仅预留设计版本、能力效果、候选写入与采纳的共享契�
 尚未实现优化、拓扑编辑或设计候选采纳工作流。
 
 统一入口的需求理解和工程任务规划需要大模型；旧工作台的普通 MATLAB 计算不依赖大模型。
-Web 所在机器无需安装 MATLAB，
-**worker 所在机器仍须安装并许可 MATLAB**；同一台机器可以同时运行 Web 和 worker。
+选择本机 `matlab_project` 时，Web 主机须有已许可 MATLAB 和兼容 Engine 解释器，
+不必启动 Worker；选择远程 `simulink_project` 时 Web 不需 MATLAB，但 Worker 主机需要。
 D2 的已登记 JSON 数据分析只需要 Web/Agent 和模型服务，不要求 MATLAB 或 worker。
 项目不附带 MATLAB、模型权重或可直接使用的 API 凭据。
 
@@ -81,6 +83,9 @@ D2 的已登记 JSON 数据分析只需要 Web/Agent 和模型服务，不要求
   共享有界驱动 / 权限 / 固定能力版本 / 不可变证据 / 版本化会话
               |
               +-> 注册计算：严格 schema -> 确认的依赖图 -> 观测 / 发现 / 表格
+              |
+              +-> 本机 matlab_project：工程副本 -> 专用兼容 Python -> MATLAB Engine
+              |       已有入口/模型 -> 时序工件 -> 独立 stepinfo -> 评价/交付
               |
               +-> 离线诊断：Agent 主机上的已登记 JSON 数据
               |       只读分析 -> 引用证据的审查 -> 下一轮或明确停止
@@ -112,6 +117,7 @@ CLI analyze：固定 MATLAB 算例 -> 演示规则检查 / 本地知识检索
 |---|---|
 | Web / Python 项目 | Python 3.11+；Web 与 worker 可以使用不同的兼容虚拟环境 |
 | MATLAB worker | 已安装并激活 MATLAB，安装与发行版匹配的 MATLAB Engine Python 包 |
+| 本机 MATLAB 工程 | 已许可 MATLAB；已有兼容 Python 环境及匹配 Engine/项目包；stepinfo 需 Control System Toolbox，模型仿真另需 Simulink 及工程自己的产品 |
 | D1 工具箱 | Simulink、Control System Toolbox、Simulink Control Design |
 | Python 与 MATLAB | 必须同时满足 MATLAB 发行版的 Python 兼容性要求，不能只看 Python 3.11+ |
 | 模型服务 | 默认 API 需支持 `tools` / `tool_calls`；目录工作流也可使用已登录的本机 Copilot CLI |
@@ -137,15 +143,83 @@ flight-agent web --port 8000
 ```
 
 在浏览器打开 `http://127.0.0.1:8000`，进入目录会话；单文件上传入口为 `/workbench`。
-未配置 worker 或模型服务时仍可查看页面，但目录任务会明确报错，不会生成模拟结果。
+未配置模型服务时仍可查看页面和浏览目录；计算后端不可用时明确报告缺口，不会生成模拟结果。
 D2 不依赖 worker；模型服务仍需配置，数据必须满足 `docs/d2-agent.md` 的登记契约。
 旧工作台可以选择本地文件，其普通 MATLAB 执行不需要模型配置。
 `.env.example` 中的模型名称、地址和 Key 都是占位内容，不代表已经连接模型服务。
 已有 `.env` 时不要再次复制覆盖，应保留自己的配置并按需编辑。
 
-### B. 在有 MATLAB 的执行机器启动 worker
+### A1. 本机通用 MATLAB / Simulink 工程（无需 Worker）
 
-本节用于 D1 和旧上传工作台；只使用 D2 时无需配置 worker，可直接按 C2 节操作。
+使用已有、已人工核验的工程，不上传单个文件。三个输入是：
+
+1. **工程目录**：Web 主机可见的绝对目录，资源位置选 `matlab_project`。
+2. **任务需求**：已有分析入口或模型、初始化入口（分别标明角色）、分析方法、工况。
+3. **评价指标**：可选；要求判定时给出有来源阈值及计算带，例如超调量 ≤10%、
+   调节时间 ≤3 s，stepinfo 调节带 5%。5% 是计算参数，不是验收阈值。
+
+服务启动命令形状如下（配置示例，不表示该命令已在你的环境运行）：
+
+```bash
+MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
+MATLAB_PYTHON_EXECUTABLE=/absolute/path/to/compatible/python \
+flight-agent web --port 8000
+```
+
+所选解释器须已经安装本项目及匹配 Engine；未设置时使用 Web 当前解释器。
+探测与执行使用同一解释器。首页“可用”只证明有界导入探测成功，不验证启动或许可。
+首页与能力目录共享环境未变时的导入探测；执行前仍重新探测并检查授权。
+MATLAB 缺失、许可/启动失败、未知执行状态会明确停止，不会自动安装或改系统配置。
+本机工程和旧 Worker 共用 `MATLAB_ALLOW_TRUSTED_PROJECTS=1` 开关；
+仍须确认准确基线版本及可信工程，工程代码/回调拥有服务账户权限，不是沙箱。
+
+无需强制登记文件；静态发现读取有界 `.m`、模型元数据和工程文档，不执行工程。
+工程已明确提供的配置直接沿用；缺少入口、模型歧义、信号或带宽来源冲突才澄清。
+例如工程 README 与请求应明确提供：
+
+```text
+Existing model: models/limited_loop.slx
+Existing initializer: setup/prepare.m
+logsout input signal: lever (1)
+logsout response signal: stroke (m)
+condition: limited
+stepinfo settling band 5%
+```
+
+这是合成测试夹具的命名示例，不是可直接运行的用户工程，也不是飞机参数。
+MATLAB-only 可声明 `Existing analysis entry: analysis/thermal_response.m`、
+`return input signal: signals.excitation (V)`、
+`return response signal: signals.temperature (K)`、`condition: bench`，
+或用 `workspace` 显式选择已有脚本输出。工程自己的实际名称/单位才是依据。
+可选 `flight-agent.project.json` 沿用既有发现配置；其中历史
+`input_signal` / `response_signal` 名称和单位表示 **logsout**，不是 workspace。
+
+CLI 连接已启动的本机 Web，结构化输入使用同一确认/下载链路，例如：
+
+```bash
+flight-agent directory-task propose \
+  --location matlab_project --project-root /absolute/path/to/prepared-project \
+  --analysis-request '按工程文档的已有入口和信号配置执行阶跃分析，调用 stepinfo，交付 Word 和 JSON' \
+  --criteria '超调量 <=10%；调节时间 <=3 s；stepinfo settling band 5%'
+```
+
+旧 `--request` 仍可用；`--scenario d1` 明确选择旧 Worker 路径，不是本机默认。
+
+确认后只调用已有入口/已有模型，不生成分析脚本，不补建激励、日志或控制器，
+不修改源模型。原工程与输出目录不得重叠；结果写入独立任务目录/指定成果目录，
+节点之间只传带生产者、摘要、大小的时序工件，不共享隐藏 base workspace，
+也不接受 LLM 提供的数组充当实测结果。已知失败要求显式重试；未知状态只能核对原
+调用 ID，不能自动重发。`.prj` 启动和会清空桥接工作区的脚本未完成实际验收。
+
+本机合成全链路已用 Python 3.12.14 / MATLAB R2025b 验证：MATLAB-only 解析响应，
+以及含饱和器的真正非线性闭环 Simulink 模型（依赖初始化局部变量）；
+实际执行、独立 stepinfo、评价、Word 曲线和 JSON 下载均走注册能力与确认接口。
+5% / 2% 带分别与独立解析参考比较；数值和容差见 `docs/d1-agent.md`。
+规划器是测试替身；未提供真实用户工程及其人工参考，也未运行在线模型服务联调。
+
+### B. 可选：在有 MATLAB 的执行机器启动 worker
+
+本节用于旧 Simulink 适配器/远程执行和上传工作台；本机通用工程按 A1，D2 按 C2。
 
 真实 Simulink 集成已在 macOS 运行。目录执行包含 Windows 专用进程清理路径，
 但尚未在 Windows 实机验证；旧上传和 CLI 执行仍要求 macOS/Linux。
@@ -217,7 +291,8 @@ flight-agent web --native-directory-picker --port 8000
 
 可先直接输入“增益裕度是什么？”，无需填写目录；回答不会触发数值计算。
 表单中的“资源位置”来自受信任适配器注册表，只说明目录在哪个主机、如何登记，
-不是任务类型或验收标准。Simulink 资源选择 `simulink_project`（Worker），
+不是任务类型或验收标准。本机工程默认 `matlab_project`（Agent）；
+旧/远程 Simulink 资源选择 `simulink_project`（Worker），
 离线诊断选择 `diagnostic_data`（Agent）；无目录能力可以留空。
 切换已知资源位置会清空源目录，不会把验证报告当成诊断数据；输出根目录独立保留，
 需自行核对。新任务仍需确认，未知调用未对账前不能切换或重派。
@@ -711,6 +786,18 @@ RUN_MATLAB_TESTS=1 python -m pytest tests/test_matlab.py -m matlab -v
 RUN_MATLAB_TESTS=1 python -m pytest tests/test_verification_matlab.py -m matlab -v
 ```
 
+本机通用工程验收（已有兼容环境；不自动安装）：
+
+```bash
+RUN_MATLAB_TESTS=1 MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
+MATLAB_PYTHON_EXECUTABLE=/absolute/path/to/compatible/python \
+/absolute/path/to/compatible/python -m pytest \
+  tests/test_local_matlab.py tests/test_local_matlab_integration.py -m matlab -v
+```
+
+默认离线测试中的受控规划器/fake Engine 不代表真实 MATLAB；
+上述可选集成用测试夹具准备工程，不会让生产 Agent 生成缺失脚本或模型。
+
 Web 与远程 worker 的 HTTP 测试也在默认测试中，Engine 替身仅存在于测试目录。
 另可运行真实浏览器检查统一入口、注册扩展、历史任务、上传、错误与下载：
 
@@ -793,12 +880,12 @@ flight16-agent/
 | D2 是否需要 MATLAB 或 worker？ | 不需要；配置工具调用模型服务，使用 Agent 主机上的已登记 JSON 数据目录 |
 | D2 续接后显示 `unknown_execution` | 在途调用没有可核验回执，不能确认是否执行；保留记录并人工核查，不自动补跑 |
 | 页面显示模型“已配置”，但分析失败 | 只表示配置格式完整，不代表端点可达或 Key 有效；确认真实模型服务支持工具调用 |
-| MATLAB Engine 导入或启动失败 | 检查 worker 使用的 Python、Engine 包、MATLAB 发行版及许可，不要把 MATLAB Runtime 当作替代品 |
+| MATLAB Engine 导入或启动失败 | 本机检查 `MATLAB_PYTHON_EXECUTABLE` 所选环境；Worker 检查其 Python、Engine、MATLAB 发行版及许可，Runtime 不能替代 |
 | 普通计算成功，Agent 显示 `undetermined` | 通用 `result` 不一定符合现有飞行器指标契约；先使用 `web_metrics.m` 和配套参数验证数据格式 |
 | HTTP 409 / Another task is running | 当前服务已有计算或分析任务，等待完成；不要启动多个实例共享同一运行目录 |
 | Web API 令牌失效 / HTTP 403 | 服务重启后刷新页面获取新的页面令牌 |
 | D1 网络断开后是否可以直接重试？ | 先用远程任务 ID 核查 worker；客户端超时不代表远程计算已经终止 |
-| 可以直接使用 MATLAB Online 吗？ | 当前项目没有接入公共 MATLAB Online，执行仍需要安装 MATLAB 的 worker |
+| 可以直接使用 MATLAB Online 吗？ | 当前没有接入；需本机已许可 MATLAB，或显式选择安装 MATLAB 的 Worker |
 | 可以直接上传 Simulink `.slx` 吗？ | 目前不支持；模型封装、依赖部署和结果适配需另行实现并联调 |
 | 可以直接复用 Copilot 对话吗？ | 当前没有 Copilot SDK 适配；应配置受支持的模型 API，而不是把对话地址当作接口 |
 

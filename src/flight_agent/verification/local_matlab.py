@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -149,9 +150,14 @@ def _output_bounds(directory: Path) -> None:
                 raise ValueError("Output directory symlink is not allowed")
         for name in files:
             path = Path(current) / name
-            if path.is_symlink() or not path.is_file():
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                # Atomic publication can rename a temporary after os.walk lists it.
+                continue
+            if not stat.S_ISREG(info.st_mode):
                 raise ValueError(f"Output symlink or special file: {name}")
-            size = path.stat().st_size
+            size = info.st_size
             limit = (
                 MAX_REQUEST_BYTES
                 if name in {"request.json", "execution.json"}
@@ -254,10 +260,18 @@ def _verify_result(request: LocalMatlabRequest, result: LocalMatlabResult, direc
 class LocalMatlabBackend:
     def __init__(self, interpreter: str):
         self.interpreter = interpreter
+        self._readiness: tuple[str, dict[str, str], Availability] | None = None
 
     @classmethod
     def from_environment(cls) -> "LocalMatlabBackend":
         return cls(os.environ.get("MATLAB_PYTHON_EXECUTABLE") or sys.executable)
+
+    def readiness(self) -> Availability:
+        """Share import-only UI/catalog probes; execution still checks availability afresh."""
+        environment = _environment()
+        if self._readiness is None or self._readiness[:2] != (self.interpreter, environment):
+            self._readiness = (self.interpreter, environment, self.availability())
+        return self._readiness[2]
 
     def availability(self) -> Availability:
         if os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") != "1":

@@ -20,6 +20,7 @@ from ..local_matlab import LocalMatlabBackend, _read_model, _verify_result
 from ..matlab_contracts import (
     LocalMatlabRequest,
     LocalMatlabResult,
+    MatlabExecutionMetadata,
     MatlabProjectDescriptor,
     ProjectExecutionInput,
     StepinfoInput,
@@ -136,6 +137,15 @@ def _outcome(
         "call_id": context.call_id,
         "conditions": request.inputs.conditions,
     }
+    metadata = _read_model(directory / "metadata.json", MatlabExecutionMetadata)
+    details.update(
+        matlab_version=metadata.matlab_version,
+        matlab_release=metadata.matlab_release,
+        settings=metadata.settings,
+        inputs=request.inputs.model_dump(mode="json"),
+    )
+    if request.project is not None:
+        details["project_fingerprint"] = request.project.fingerprint
     for artifact in artifacts:
         if artifact.id == "series":
             details["series"] = artifact.model_dump(mode="json")
@@ -180,7 +190,7 @@ def local_matlab_capabilities(
     backend: LocalMatlabBackend,
 ) -> list[Capability[AgentContext, ProjectExecutionInput | StepinfoInput, CapabilityOutcome]]:
     def readiness(resources: tuple[ResourceReference, ...]) -> Availability:
-        return backend.availability()
+        return backend.readiness()
 
     def execute(
         context: AgentContext, inputs: ProjectExecutionInput | StepinfoInput, *, resume: bool

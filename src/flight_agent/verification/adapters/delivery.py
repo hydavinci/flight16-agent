@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Annotated, Literal, Protocol, Self
 
 from docx import Document
+from docx.shared import Inches
 from pydantic import Field, JsonValue, TypeAdapter, model_validator
 
 from ...runtime.agent_contracts import AgentNode, AgentPlan
@@ -73,7 +74,9 @@ def _dependencies(context: DeliveryContext) -> dict[str, CapabilityOutcome]:
     return outputs
 
 
-def _write_word(inputs: DeliveryInput, evidence: CapabilityOutcome, result: TaskResult) -> bytes:
+def _write_word(
+    inputs: DeliveryInput, evidence: CapabilityOutcome, result: TaskResult, directory: Path
+) -> bytes:
     document = Document()
     document.add_heading(inputs.title, 0)
     document.add_heading("Execution", 1)
@@ -83,6 +86,9 @@ def _write_word(inputs: DeliveryInput, evidence: CapabilityOutcome, result: Task
         "This report is not flight qualification."
     )
     document.add_paragraph(inputs.requirements.objective)
+    if evidence.details:
+        document.add_heading("Execution and calculation details", 1)
+        document.add_paragraph(json.dumps(evidence.details, ensure_ascii=False, indent=2))
     document.add_heading("Observations and Validity", 1)
     for item in evidence.observations:
         document.add_paragraph(
@@ -143,6 +149,8 @@ def _write_word(inputs: DeliveryInput, evidence: CapabilityOutcome, result: Task
         document.add_paragraph(
             f"Evidence file: {artifact.path}; SHA-256: {artifact.sha256}; bytes: {artifact.size}"
         )
+        if Path(artifact.path).suffix.lower() == ".png":
+            document.add_picture(str(verify_evidence(directory, artifact)), width=Inches(6))
     stream = BytesIO()
     document.save(stream)
     return stream.getvalue()
@@ -228,7 +236,7 @@ def _deliver(context: DeliveryContext, inputs: DeliveryInput) -> CapabilityOutco
                 "utf-8"
             )
             if format == "json"
-            else _write_word(inputs, evidence, result)
+            else _write_word(inputs, evidence, result, context.directory)
         )
         name = f"{_prefix(context)}/result.{format}"
         artifact = OutputArtifact(

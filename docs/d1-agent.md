@@ -8,6 +8,84 @@ proposals below apply only to saved v1 tasks and the explicitly injected legacy
 runtime, not to new tasks. They are retained for compatibility, not global policy.
 The registration and HTTP sections below describe the current v2 entry.
 
+## Generic local MATLAB / Simulink projects
+
+This is a separate registered resource, `matlab_project` on the Agent/Web host,
+not the historical Worker profile below. Supply three inputs: project directory,
+analysis request, and optional evaluation criteria. Existing role-labeled model /
+analysis entry / initializer, explicit signal namespace (`logsout`, `workspace`,
+`return`), field path, unit, named condition/value and calculation band must be
+attributed to the request or existing project documentation/configuration.
+Known settings are reused, not repeatedly requested. Missing entries, ambiguous
+models or conflicting sources require clarification. A discovery manifest is
+optional; existing `flight-agent.project.json` signal names/units mean **logsout**.
+
+Configure an **existing** compatible interpreter with this package and matching
+Engine installed; default is the Web interpreter. Command shape (example only,
+not a claim that it ran):
+
+```bash
+MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
+MATLAB_PYTHON_EXECUTABLE=/absolute/path/to/compatible/python \
+flight-agent web --port 8000
+```
+
+No HTTP Worker is required for this resource. Worker instructions below remain
+an alternative for the old/remote adapter. Local execution needs licensed
+MATLAB, Control System Toolbox for `stepinfo`, Simulink for models, and products
+required by the existing project. Readiness is a bounded import-only probe
+using the selected interpreter, not startup/license verification. Missing
+interpreter/Engine, startup/license errors and unsupported inputs stop explicitly;
+there is no automatic dependency installation or permission expansion.
+Bootstrap and capability readiness share the import result for unchanged
+filtered environment; execution still checks availability and trust afresh.
+
+Discovery never runs project code. Exact-version trusted confirmation precedes
+execution in a fingerprint-checked copy. Source and output must not overlap.
+Only existing entries/models run: no production-generated analysis scripts,
+excitation, logging, controller or model repair. Each of execute, independent
+stepinfo, sourced scalar evaluation and requested delivery consumes a dispatch.
+Series cross nodes as immutable producer/path/SHA/size artifacts, never model
+arrays or hidden base-workspace state. Stepinfo uses seconds from the detected
+step, pre-step mean and verified finite-tail mean. Missing, multistep or
+nonsteady evidence cannot pass; display rounding is never used for comparison.
+Unknown execution reconciles the original ID only, without redispatch; known
+failure requires explicit retry and confirmation.
+
+### Local synthetic acceptance evidence
+
+Actual R2025b / Python 3.12.14 tests use a **controlled planner only**, real Engine
+processes, registered strict capabilities, the HTTP proposal/confirmation routes,
+four dispatches and integrity-checked Word/JSON downloads. Fixture preparation
+creates source/model files before discovery; production does not generate them.
+
+| Prepared project / sources | Actual 5% observations | Independent reference / tolerance |
+|---|---|---|
+| MATLAB-only `analysis/thermal_response.m`, return `signals.excitation` V / `signals.temperature` K, `condition=bench` | Overshoot 9.478027688258383%; settling 2.6145253501892025 s; initial 0, tail final 0.9999999083967565 | ζ=.6, ω=2 analytic response: 9.478022484215485%; last true-final crossing independently bisected at 2.614524220308886 s; tolerances .01 percentage point / .005 s, final 1e-6 |
+| `models/limited_loop.slx`, initializer `setup/prepare.m`, logsout `lever` (1) / `stroke` m, `condition=limited` | Overshoot 0.00016405099156902025%; settling 2.995362339962207 s; initial 0, tail final 0.49999902684646197 | Saturated feedback `ydot=-y+sat(2*(r-y),-.5,.5)`: true final .5, overshoot 0%, settling log(20)=2.995732273553991 s; tolerances .001 percentage point / .005 s, final 2e-6 |
+
+The second model is genuinely nonlinear: saturation lies inside the feedback
+loop. Its saved block settings require initializer-created local gain/limit/time
+variables, exercising existing `SrcWorkspace='current'` behavior. Under this
+excitation saturation remains active and `y=.5*(1-exp(-elapsed))`. Changing the
+band to 2% measures 3.911594575396202 s versus log(50)=3.912023005428146 s,
+changing the unrounded 3 s check from PASS to FAIL. Tolerances allow 2 ms
+sampling/solver and finite-tail effects; they do not relax the evaluator.
+Actual multistep/nonsteady inputs produce partial, UNDETERMINED reports; a
+missing selected signal fails execution. Offline boundary/recovery tests use
+an explicitly fake Engine and prescribed observations, not actual metrics.
+
+Run with `RUN_MATLAB_TESTS=1`, trusted-project opt-in and the compatible Python:
+`python -m pytest tests/test_local_matlab.py tests/test_local_matlab_integration.py -m matlab -v`.
+Default/offline runs skip these actual tests. Browser regressions cover structured
+inputs, retained raw text, local defaults, consent and existing downloads/UI;
+they do not run a live planner or MATLAB themselves.
+
+No actual user engineering project/reference or live model-service acceptance
+was supplied for this task. `.prj` startup and scripts that clear the bridge's
+workspace remain unverified. Synthetic fixtures prove software composition,
+not aircraft qualification or arbitrary-project compatibility.
+
 ## Scope
 
 The user supplies a project **directory**, a natural-language verification request,
@@ -65,14 +143,16 @@ directory-based conversation becomes `/`. Existing upload APIs and CLI demo
 analysis remain compatible.
 The Web/CLI entry needs no scenario. A knowledge answer requires neither a project
 nor MATLAB. Directory inputs require an explicit registered resource location:
-`simulink_project` on Worker or `diagnostic_data` on Agent. A later task gets its
+`matlab_project` on Agent, `simulink_project` on Worker or `diagnostic_data` on Agent.
+A later task gets its
 own baseline, authorization and delivery directory; the chosen output root may
 remain selected and must be reviewed. Old tasks and deliveries remain archived.
 Missing D2 registered data cannot fall back to the D1 project/report directory
 or resume the already finished D1 task. An unknown call blocks stage switching
 and redispatch until its original execution has been reconciled.
 
-The engineering directory is on the **worker's filesystem**. With a local
+For the historical `simulink_project` adapter below, the engineering directory
+is on the **worker's filesystem**. With a local
 worker this is the user's local directory. With a remote worker it must be a
 worker-visible directory; submitting a path does not transfer files. Output
 files on the Web host and numerical artifacts on the worker have explicit,
@@ -88,9 +168,10 @@ Windows drive or UNC syntax appropriate to the worker. An output root must be
 an absolute path usable on the **Agent/Web host**, not a remote worker path.
 Later messages can select a different project or output root.
 
-Both directory fields also offer **浏览…** (Browse). By default, the in-page picker lists
-engineering directories on the **Worker host** and output directories on the
-**Agent/Web host**; it does not open the browser computer's filesystem or
+Both directory fields also offer **浏览…** (Browse). The in-page picker lists
+`matlab_project` directories on the **Agent/Web host**, or `simulink_project`
+directories on the **Worker host**; output directories are always on the
+**Agent/Web host**. It does not open the browser computer's filesystem or
 transfer files. On a same-machine deployment these are local directories.
 The picker starts at the field's current path, or the service account's home
 directory when empty. It supports parent/child navigation, home, and a manually
@@ -100,8 +181,9 @@ Browsing is read-only: only immediate, non-symlink subdirectories are listed,
 sorted by name, with at most 500 entries and a visible truncation notice.
 No file contents are read and no directories are created. Invalid paths,
 permission failures and unavailable workers produce errors rather than a
-fallback to a different host. Project browsing requires the existing Worker
-credentials and `MATLAB_ALLOW_TRUSTED_PROJECTS=1`. Web listing requests also
+fallback to a different host. Worker project browsing requires existing Worker
+credentials and `MATLAB_ALLOW_TRUSTED_PROJECTS=1`; local static browsing does not
+require Engine execution permission. Web listing requests also
 retain the Web token and same-origin checks.
 
 For a **same-machine macOS desktop** deployment, start Web with
@@ -109,7 +191,8 @@ For a **same-machine macOS desktop** deployment, start Web with
 buttons then open the system folder chooser on the Web host, starting at the
 field's current directory or the service account's home when empty. Confirming
 fills the canonical absolute path; cancelling leaves the field unchanged.
-Browser, Web and Worker must actually be on that same desktop: a loopback
+For Worker project selection, Browser, Web and Worker must actually be on that
+same desktop: a loopback
 Worker URL routed through an SSH tunnel does not qualify. The explicit flag
 asserts this topology; non-loopback Worker URLs are rejected for project
 selection. Remote, headless and non-macOS deployments should keep the default

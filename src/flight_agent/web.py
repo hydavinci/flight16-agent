@@ -75,6 +75,7 @@ def create_web_app(
 ) -> FastAPI:
     if verification_runtime is not None and engineering_runtime is not None:
         raise ValueError("Inject only one conversation runtime")
+    local_backend = LocalMatlabBackend.from_environment()
     resources = (
         engineering_runtime.resources if engineering_runtime is not None else ResourceRegistry()
     )
@@ -91,7 +92,9 @@ def create_web_app(
             legacy = verification_runtime
             backend = legacy.backend
         tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
-        register_builtin_plugins(tools, resources, backend=backend, planner=legacy.planner)
+        register_builtin_plugins(
+            tools, resources, backend=backend, planner=legacy.planner, local_backend=local_backend,
+        )
         if verification_runtime is None:
             engineering_runtime = EngineeringRuntime(
                 conversations, AgentPlanner(),
@@ -171,7 +174,7 @@ def create_web_app(
 
     @app.get("/api/bootstrap")
     def bootstrap() -> dict[str, object]:
-        local = LocalMatlabBackend.from_environment().availability()
+        local = local_backend.readiness()
         worker_error = model_error = None
         try:
             RemoteWorker.from_environment()
