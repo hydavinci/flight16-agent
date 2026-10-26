@@ -320,6 +320,8 @@ def _schema_path(
             properties = variant.get("properties", {})
             if isinstance(properties, dict):
                 child = properties.get(part)
+            if child is None:
+                child = variant.get("additionalProperties")
         elif type(part) is int and variant.get("type") == "array":
             maximum = variant.get("maxItems")
             if isinstance(maximum, int) and part >= maximum:

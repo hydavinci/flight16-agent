@@ -45,6 +45,9 @@ def resolve_location(
     by_id = {item.id: item for item in locations}
     if location is not None:
         matches = [item.id for item in locations if item.id == location]
+        legacy_alias = {"agent": "diagnostic_data", "worker": "simulink_project"}.get(location)
+        if not matches and legacy_alias in by_id:
+            matches = [legacy_alias]
         if not matches:
             matches = [item.id for item in locations if item.location == location]
         if len(matches) != 1:

@@ -11,7 +11,9 @@ from ..runtime.capability_metadata import Availability, CapabilitySnapshot
 from ..runtime.contracts import fingerprint
 from ..runtime.requirements import CapabilityGap, CriterionSource, TaskRequirements
 from ..runtime.resources import AgentContract, ResourceReference, Text
-from .contracts import AgentTask, Conversation
+from .contracts import AgentTask, Conversation, SteadyStatePolicy
+from .local_matlab import _signature
+from .matlab_contracts import LocalMatlabRequest, MatlabProjectDescriptor, ProjectExecutionInput
 from .planner import StructuredPlanner, _conversation_paths, redact_text
 
 MAX_CONTEXT_BYTES = 240_000
@@ -39,6 +41,15 @@ quote 含脱敏标记时完整复制该来源提供的 quote，不得自行还�
 输入标准不完整时先澄清，不能用常见阈值填空。未要求整体判定时 overall_requested=false。
 仅服务端绑定资源：计划使用 resource_ids 与节点 resource_bindings，禁止回传 locator 或资源指纹。
 节点写明 depends_on；bindings 只引用直接依赖的输出路径，不生成表达式。
+本机 matlab_project 的 metadata.project 是静态候选与来源，不是执行授权。
+只选择已有且签名/参数/输出受支持的入口；真正的多候选歧义先澄清，不按文件名猜测。
+沿用已归属的 matlab_literals/model_parameters/project_metadata/documentation 及可选显式配置，
+保留未解析/截断说明；不反复索取已知设置。clarification_context 保留原文问答和先前选择。
+stepinfo 的 settling_band 必须与用户/工程原始来源一致；5% 调节带是 0.05 计算输入，
+不是 10% 超调量或 3 s 调节时间验收阈值。来源冲突先澄清，不把阈值当作计算设置。
+典型验证为 execute → stepinfo → evaluate → deliver，至少四次派发/四轮；
+series 只能绑定执行节点的 ["details","series"]，不能填写数组或伪造工件描述。
+指标生产者是 matlab_stepinfo，工况必须与执行来源相同；纯已有入口分析不强加 stepinfo。
 每个节点派发都消耗一轮和一次调用，包括分析、评价、报告交付与缓存复用；
 budget.max_rounds 和 max_calls 都必须至少覆盖全部节点数，轮数不是并行依赖层数。
 内部多轮分析还需额外预算；不能靠缓存、并行或省略交付节点来缩减所需轮次。
@@ -59,33 +70,35 @@ requested_outputs 的每项必须有实际生产节点 node_id 及其产出 item
 
 
 class AgentDecision(AgentContract):
-    model_config = ConfigDict(json_schema_extra={
-        "oneOf": [
-            {
-                "properties": {
-                    "action": {"enum": ["answer", "clarify"]},
-                    "plan": {"type": "null"},
-                    "gaps": {"maxItems": 0},
+    model_config = ConfigDict(
+        json_schema_extra={
+            "oneOf": [
+                {
+                    "properties": {
+                        "action": {"enum": ["answer", "clarify"]},
+                        "plan": {"type": "null"},
+                        "gaps": {"maxItems": 0},
+                    },
                 },
-            },
-            {
-                "properties": {
-                    "action": {"const": "capability_gap"},
-                    "plan": {"type": "null"},
-                    "gaps": {"minItems": 1},
+                {
+                    "properties": {
+                        "action": {"const": "capability_gap"},
+                        "plan": {"type": "null"},
+                        "gaps": {"minItems": 1},
+                    },
+                    "required": ["gaps"],
                 },
-                "required": ["gaps"],
-            },
-            {
-                "properties": {
-                    "action": {"const": "plan"},
-                    "plan": {"not": {"type": "null"}},
-                    "gaps": {"maxItems": 0},
+                {
+                    "properties": {
+                        "action": {"const": "plan"},
+                        "plan": {"not": {"type": "null"}},
+                        "gaps": {"maxItems": 0},
+                    },
+                    "required": ["plan"],
                 },
-                "required": ["plan"],
-            },
-        ],
-    })
+            ],
+        }
+    )
 
     action: Literal["answer", "clarify", "capability_gap", "plan"]
     text: Text
@@ -103,6 +116,315 @@ class AgentDecision(AgentContract):
         elif self.plan is not None or self.gaps:
             raise ValueError("Answer and clarification decisions cannot include execution payloads")
         return self
+
+
+class _LocalPlanningIssue(ValueError):
+    def __init__(self, message: str, *, gap: bool = False):
+        super().__init__(message)
+        self.gap = gap
+
+
+def _setting_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _band_values(text: str) -> list[float]:
+    number = r"([0-9]+(?:\.[0-9]+)?)\s*(%|％|percent|百分比)?"
+    label = (
+        r"(?:settling[\s_-]*(?:time[\s_-]*)?(?:band|threshold)|band|"
+        r"调节带|调节时间带|稳态误差带|误差带)"
+    )
+    return [
+        float(match[1]) / (100 if match[2] else 1)
+        for expression in (
+            label + r"\s*(?:为|是|[:=]|of)?\s*" + number,
+            number + r"\s*" + label,
+        )
+        for match in re.finditer(expression, text, re.IGNORECASE)
+    ]
+
+
+def _local_facts(
+    project: MatlabProjectDescriptor, sources: dict[str, CriterionSource]
+) -> tuple[list[str], list[dict[str, JsonValue]], dict[str, JsonValue]]:
+    texts = [source.quote for source in sources.values() if source.kind == "user_message"]
+    records: list[dict[str, JsonValue]] = []
+    for group in ("matlab_literals", "model_parameters", "project_metadata"):
+        declarations = project.settings.get(group, [])
+        if isinstance(declarations, list):
+            records.extend(item for item in declarations if isinstance(item, dict))
+    documentation = project.settings.get("documentation", [])
+    if isinstance(documentation, list):
+        for item in documentation:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    texts.append(text)
+    explicit = project.settings.get("explicit_configuration", {})
+    configuration = explicit.get("value", {}) if isinstance(explicit, dict) else {}
+    return texts, records, configuration if isinstance(configuration, dict) else {}
+
+
+def _signal_declarations(text: str, label: str) -> list[tuple[str | None, str, str]]:
+    name = r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*"
+    field = (
+        r"(?:input[\s_-]*signal|输入信号)"
+        if label == "input_signal"
+        else (r"(?:response[\s_-]*signal|响应信号|输出信号)")
+    )
+    return [
+        (match[1] or match[2], match[3], match[4].strip())
+        for match in re.finditer(
+            r"(?:(workspace|logsout|return)\s+)?" + field + r"\s*[:=：]\s*"
+            r"(?:(workspace|logsout|return)\s+)?(" + name + r")\s*[(（]([^()（）]+)[)）]",
+            text,
+            re.IGNORECASE,
+        )
+    ]
+
+
+def _select_candidate(
+    label: str,
+    selected: str | None,
+    candidates: list[str],
+    sources: dict[str, CriterionSource],
+    texts: list[str],
+    configured: JsonValue = None,
+) -> None:
+    if selected is not None and selected not in candidates:
+        raise _LocalPlanningIssue(f"{label}: selected path is not a discovered candidate")
+    # A later explicit selection resolves the earlier question, without rewriting its source.
+    user_choices = [
+        [path for path in candidates if path in source.quote]
+        for source in sources.values()
+        if source.kind == "user_message"
+    ]
+    choices = next((items for items in reversed(user_choices) if items), [])
+    if not choices and isinstance(configured, str):
+        choices = [configured]
+    if not choices:
+        labels = {
+            "model": r"(?:model|模型)",
+            "initializer": r"(?:existing initializer|initializer|startup|初始化入口)",
+            "entry": r"(?:existing entry|analysis entry|entry|分析入口)",
+            "project_file": r"(?:project file|工程文件)",
+        }
+        choices = list(
+            dict.fromkeys(
+                path
+                for text in texts
+                for path in candidates
+                if re.search(
+                    labels[label] + r"\s*[:=：]\s*" + re.escape(path) + r"(?![\w./])",
+                    text,
+                    re.IGNORECASE,
+                )
+            )
+        )
+    if not choices and len(candidates) == 1:
+        choices = candidates
+    if selected is None and not choices and not candidates:
+        return
+    if len(choices) != 1 or selected != choices[0]:
+        raise _LocalPlanningIssue(
+            f"Please clarify {label} selection from discovered candidates: {', '.join(candidates)}"
+        )
+
+
+def _validate_local_execution(
+    inputs: ProjectExecutionInput,
+    project: MatlabProjectDescriptor,
+    sources: dict[str, CriterionSource],
+) -> None:
+    texts, records, configuration = _local_facts(project, sources)
+    if configuration.get("backend", "simulink") != "simulink":
+        raise _LocalPlanningIssue("Unsupported explicit project backend", gap=True)
+    if "working_directory" in configuration and (
+        inputs.working_directory != configuration["working_directory"]
+    ):
+        raise _LocalPlanningIssue("Working directory conflicts with explicit project configuration")
+    if inputs.mode == "simulink":
+        _select_candidate(
+            "model", inputs.model, project.models, sources, texts, configuration.get("model")
+        )
+    for label, selected in (("entry", inputs.entry), ("initializer", inputs.initializer)):
+        if label == "entry" and inputs.mode != "entry":
+            continue
+        if label == "initializer" and inputs.mode == "entry" and selected is None:
+            continue
+        _select_candidate(
+            label,
+            selected.path if selected else None,
+            [entry.path for entry in project.entries],
+            sources,
+            texts,
+            configuration.get(label),
+        )
+        if selected is not None:
+            try:
+                outputs = _signature(selected)
+            except ValueError as exc:
+                raise _LocalPlanningIssue(str(exc), gap=True) from exc
+            if selected.arguments and not any(
+                re.search(
+                    r"(?:arguments|参数)\s*[:=：]\s*" + re.escape(json.dumps(selected.arguments)),
+                    text,
+                )
+                for text in texts
+            ):
+                raise _LocalPlanningIssue("Entry arguments require their explicit original source")
+            if (
+                label == "entry"
+                and not outputs
+                and any(
+                    signal is not None and signal.source == "return"
+                    for signal in (inputs.input_signal, inputs.response_signal)
+                )
+            ):
+                raise _LocalPlanningIssue("Selected entry has no supported return output", gap=True)
+    if inputs.project_file is not None or project.project_files:
+        _select_candidate(
+            "project_file",
+            inputs.project_file,
+            project.project_files,
+            sources,
+            texts,
+            configuration.get("project_file"),
+        )
+    for label, signal in (
+        ("input_signal", inputs.input_signal),
+        ("response_signal", inputs.response_signal),
+    ):
+        if signal is None:
+            continue
+        configured = configuration.get(label)
+        if isinstance(configured, dict) and (
+            configured.get("name") != ".".join(signal.path) or configured.get("unit") != signal.unit
+        ):
+            raise _LocalPlanningIssue(f"{label} conflicts with explicit project configuration")
+        declarations = [
+            declaration for text in texts for declaration in _signal_declarations(text, label)
+        ]
+        if any(
+            path != ".".join(signal.path)
+            or unit != signal.unit
+            or (source is not None and source.lower() != signal.source)
+            for source, path, unit in declarations
+        ):
+            raise _LocalPlanningIssue(f"{label} conflicts with its attributed signal sources")
+        if not isinstance(configured, dict) and not declarations:
+            raise _LocalPlanningIssue(f"Please clarify the original source of {label}")
+        if not any(source is not None for source, _, _ in declarations):
+            raise _LocalPlanningIssue(f"Please clarify workspace/logsout/return source of {label}")
+        if signal.source == "return" and inputs.mode != "entry":
+            raise _LocalPlanningIssue("Simulink has no entry return output", gap=True)
+    for name, value in inputs.conditions.items():
+        known = [
+            record.get("value")
+            for record in records
+            if _setting_name(str(record.get("name"))) == _setting_name(name)
+        ]
+        if known and any(str(item) != str(value) for item in known):
+            raise _LocalPlanningIssue(f"Execution setting {name} conflicts with project sources")
+        if not known and not any(str(value) in text for text in texts):
+            raise _LocalPlanningIssue(f"Execution condition {name} requires its original source")
+
+
+def _validate_local_nodes(
+    draft: AgentPlanDraft,
+    resources: dict[str, ResourceReference],
+    sources: dict[str, CriterionSource],
+) -> None:
+    nodes = {node.id: node for node in draft.nodes}
+    executions: dict[str, tuple[ProjectExecutionInput, MatlabProjectDescriptor]] = {}
+    for node in draft.nodes:
+        if node.tool != "matlab_execute_project":
+            continue
+        try:
+            resource = resources[node.resource_bindings["project"]]
+            project = MatlabProjectDescriptor.model_validate(resource.metadata.get("project"))
+            if (resource.kind, resource.location, resource.version) != (
+                "matlab_project",
+                "agent",
+                "1",
+            ):
+                raise ValueError("Local execution requires project role at agent, version 1")
+            if (project.root, project.fingerprint) != (resource.locator, resource.fingerprint):
+                raise ValueError("Local descriptor differs from its exact bound resource")
+            if node.bindings:
+                raise ValueError("Execution selections must be explicit source-backed inputs")
+            request = LocalMatlabRequest(
+                id="0" * 32,
+                operation="execute_project",
+                project=project,
+                inputs=ProjectExecutionInput.model_validate(node.inputs),
+            )
+            assert isinstance(request.inputs, ProjectExecutionInput)
+            _validate_local_execution(request.inputs, project, sources)
+        except (ValueError, KeyError) as exc:
+            if isinstance(exc, _LocalPlanningIssue):
+                raise
+            raise _LocalPlanningIssue(f"Please clarify discovered entry/selection: {exc}") from exc
+        executions[node.id] = (request.inputs, project)
+    for node in draft.nodes:
+        if node.tool != "matlab_stepinfo":
+            continue
+        reference = node.bindings.get("series")
+        if (
+            reference is None
+            or reference.path != ["details", "series"]
+            or reference.node_id not in executions
+            or reference.node_id not in node.depends_on
+            or set(node.bindings) != {"series"}
+            or "series" in node.inputs
+        ):
+            raise _LocalPlanningIssue(
+                "stepinfo series must bind a real direct execution details.series"
+            )
+        inputs, project = executions[reference.node_id]
+        if inputs.input_signal is None or inputs.response_signal is None:
+            raise _LocalPlanningIssue("stepinfo requires paired explicit source signal selections")
+        if node.inputs.get("conditions", {}) != inputs.conditions:
+            raise _LocalPlanningIssue("stepinfo conditions differ from the producing execution")
+        texts, records, configuration = _local_facts(project, sources)
+        bands = [value for text in texts for value in _band_values(text)]
+        bands.extend(
+            float(str(record["value"]))
+            for record in records
+            if _setting_name(str(record.get("name"))) in {"settlingband", "settlingthreshold"}
+        )
+        if not bands or any(value != node.inputs.get("settling_band") for value in bands):
+            raise _LocalPlanningIssue(
+                "settling_band conflicts with or lacks its original band source"
+            )
+        policy = node.inputs.get("steady_state", {})
+        if not isinstance(policy, dict):
+            raise _LocalPlanningIssue("steady_state requires a published or explicit policy")
+        defaults = SteadyStatePolicy().model_dump(mode="json")
+        configured_policy = configuration.get("steady_state", {})
+        for name, value in {**defaults, **policy}.items():
+            declared = [
+                record.get("value")
+                for record in records
+                if _setting_name(str(record.get("name"))) == _setting_name(name)
+            ]
+            if isinstance(configured_policy, dict) and name in configured_policy:
+                declared.append(configured_policy[name])
+            if declared and any(item != value for item in declared):
+                raise _LocalPlanningIssue(f"steady_state.{name} conflicts with project sources")
+            expected = declared[0] if declared else defaults.get(name)
+            if value != expected and not any(
+                re.search(re.escape(name) + r"\s*[:=]\s*" + re.escape(str(value)), text)
+                for text in texts
+            ):
+                raise _LocalPlanningIssue(f"steady_state.{name} differs from its published source")
+        for criterion in draft.requirements.criteria:
+            if criterion.metric.node_id == node.id and criterion.conditions != inputs.conditions:
+                raise _LocalPlanningIssue(
+                    "Criterion conditions differ from their exact metric producer"
+                )
+        if nodes[reference.node_id].tool != "matlab_execute_project":
+            raise _LocalPlanningIssue("stepinfo requires its exact registered execution producer")
 
 
 def validate_sources(requirements: TaskRequirements, sources: dict[str, CriterionSource]) -> None:
@@ -171,6 +493,8 @@ def bind_plan(
             raise ValueError(f"Capability effect is outside the plan: {node.tool}")
         # needs_input may become available after binding specific resources.
         if availability[node.tool].state == "unavailable":
+            if node.tool in {"matlab_execute_project", "matlab_stepinfo"}:
+                raise _LocalPlanningIssue(availability[node.tool].reason, gap=True)
             raise ValueError(availability[node.tool].reason)
         roles = {item.role: item for item in entry.metadata.resources}
         for role, resource_id in node.resource_bindings.items():
@@ -186,6 +510,7 @@ def bind_plan(
             item.required and item.role not in node.resource_bindings for item in roles.values()
         ):
             raise ValueError(f"Capability requires additional resource bindings: {node.tool}")
+    _validate_local_nodes(draft, resources, sources)
     by_node = {node.id: entries[node.tool] for node in draft.nodes}
     for criterion in draft.requirements.criteria:
         metrics = {item.id: item for item in by_node[criterion.metric.node_id].metadata.metrics}
@@ -305,9 +630,7 @@ def _restore_source_quotes(
 
 
 class AgentPlanner(StructuredPlanner):
-    def _decision(
-        self, context: dict[str, object], paths: list[str | None]
-    ) -> AgentDecision:
+    def _decision(self, context: dict[str, object], paths: list[str | None]) -> AgentDecision:
         timeout = self._timeout_seconds
         if timeout is None:
             timeout = (
@@ -345,12 +668,12 @@ class AgentPlanner(StructuredPlanner):
                     **context,
                     "validation_feedback": _redact_context(feedback, paths),
                 }
-                if len(json.dumps(
-                    context, ensure_ascii=False, allow_nan=False
-                ).encode("utf-8")) > MAX_CONTEXT_BYTES:
+                if (
+                    len(json.dumps(context, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+                    > MAX_CONTEXT_BYTES
+                ):
                     raise ValueError(
-                        "方案校验反馈超过上下文大小限制，未截断需求；"
-                        "本次未生成新方案或触发执行。"
+                        "方案校验反馈超过上下文大小限制，未截断需求；本次未生成新方案或触发执行。"
                     ) from exc
         assert last_error is not None
         codes = {error["type"] for error in last_error.errors()}
@@ -408,6 +731,11 @@ class AgentPlanner(StructuredPlanner):
                 {"role": item.role, "content": item.content} for item in conversation.messages[-6:]
             ],
             "history_omitted": len(conversation.messages) > 6,
+            "clarification_context": [
+                {"role": item.role, "content": item.content}
+                for item in conversation.messages
+                if item.role == "user" or item.response_kind == "clarify"
+            ],
         }
         context = {key: _redact_context(value, paths) for key, value in raw_context.items()}
         if (
@@ -421,7 +749,28 @@ class AgentPlanner(StructuredPlanner):
         decision = self._decision(context, paths)
         if decision.plan is not None:
             plan = _restore_source_quotes(decision.plan, sources, paths)
-            bind_plan(plan, resources, sources, catalog)
+            try:
+                bind_plan(plan, resources, sources, catalog)
+            except _LocalPlanningIssue as exc:
+                text = redact_text(str(exc), paths)
+                return AgentDecision(
+                    action="capability_gap" if exc.gap else "clarify",
+                    text=text,
+                    gaps=[
+                        CapabilityGap(
+                            requirement_id=plan.requirements.requested_outputs[0].id
+                            if plan.requirements.requested_outputs
+                            else "local-analysis",
+                            missing_capability="local_matlab",
+                            limitation=text,
+                            next_step=(
+                                "Provide a supported existing entry and a ready local backend."
+                            ),
+                        )
+                    ]
+                    if exc.gap
+                    else [],
+                )
             decision = AgentDecision.model_validate(
                 {
                     **decision.model_dump(mode="json"),

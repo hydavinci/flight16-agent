@@ -11,7 +11,7 @@ from pydantic import JsonValue
 
 from ..runtime.contracts import fingerprint
 from ..upload_models import MAX_RESULT
-from .contracts import relative_path
+from .contracts import ProjectConfig, relative_path
 from .intake import safe_directory
 from .matlab_contracts import MatlabEntry, MatlabProjectDescriptor
 from .projects import file_digest, inventory_project_files
@@ -163,9 +163,10 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
         path = directory / item.path
         suffix = path.suffix.lower()
         is_readme = path.name.lower().startswith("readme")
-        if suffix not in {".m", ".mdl", ".slx", ".prj"} and not is_readme:
+        is_configuration = item.path == "flight-agent.project.json"
+        if suffix not in {".m", ".mdl", ".slx", ".prj"} and not is_readme and not is_configuration:
             continue
-        if settings_truncated and suffix != ".m":
+        if settings_truncated and suffix != ".m" and not is_configuration:
             continue
         safe_directory(path.parent)
         if path.is_symlink():
@@ -191,7 +192,7 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
                             continue
                         remaining -= len(content)
                         xml(content.decode("utf-8-sig"), item.path, member.filename, model=True)
-                        if settings_truncated:
+                        if settings_truncated and not is_configuration:
                             break
             except (BadZipFile, UnicodeError, RuntimeError, NotImplementedError) as exc:
                 notes.append(f"{item.path}: unresolved model archive ({exc}).")
@@ -231,12 +232,35 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
                     )
                 )
         if settings_truncated:
+            if is_configuration:
+                raise ValueError("Explicit project configuration exceeds the metadata limit")
             continue
         if truncated or len(content) > remaining:
+            if is_configuration:
+                raise ValueError("Explicit project configuration exceeds the metadata limit")
             notes.append(f"{item.path}: metadata limit exceeded; settings unresolved.")
             continue
         remaining -= len(content)
-        if suffix == ".m":
+        if is_configuration:
+            config = ProjectConfig.model_validate_json(text)
+            configuration: JsonValue = {
+                "path": item.path,
+                "sha256": item.sha256,
+                "quote": text,
+                "value": config.model_dump(mode="json", exclude_unset=True),
+            }
+            if (
+                len(
+                    json.dumps(
+                        {**settings, "explicit_configuration": configuration}, ensure_ascii=False
+                    ).encode("utf-8")
+                )
+                > MAX_RESULT
+            ):
+                raise ValueError("Explicit project configuration exceeds the metadata limit")
+            settings["explicit_configuration"] = configuration
+            settings_size = len(json.dumps(settings, ensure_ascii=False).encode("utf-8"))
+        elif suffix == ".m":
             for line, statement in _matlab_statements(text):
                 if re.match(r"^(function|classdef)\b", statement):
                     break
