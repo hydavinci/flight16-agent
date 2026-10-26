@@ -189,7 +189,7 @@ def _current_user_calculation_values(
         if any(
             _calculation_values(clause, name)
             and re.search(
-                r"\b(?:maybe|perhaps|or|if|not)\b|不要|是否|还是|或者|[?？]",
+                r"\b(?:maybe|perhaps|or|if|not|don['’]t)\b|不要|是否|还是|或者|[?？]",
                 clause,
                 re.IGNORECASE,
             )

@@ -3,7 +3,7 @@
 日期：2026-10-25
 
 状态：实施、Task 6 软件验收与最终规划修正复验完成（2026-10-26 UTC）：
-离线 1428 passed / 97 skipped，
+离线 1436 passed / 97 skipped，
 浏览器 14 passed，真实 MATLAB R2025b 9 passed / 76 deselected。两套合成准备工程
 覆盖 MATLAB-only 与真正非线性闭环 Simulink 的完整确认、计算、评价和 Word/JSON 交付；
 规划器为测试替身。真实用户工程/人工参考及在线模型服务联调未提供、未验收；

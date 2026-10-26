@@ -956,6 +956,46 @@ def test_unresolved_user_band_conflicts_still_require_clarification(
     assert not backend.requests
 
 
+@pytest.mark.parametrize("negation", ["Don't", "don't", "DON'T", "Don’t"])
+@pytest.mark.parametrize("setting", ["settling_band", "maximum_relative_range"])
+def test_bind_plan_rejects_contracted_negation_of_calculation_correction(
+    local_planning_case, negation, setting
+):
+    from flight_agent.verification.agent_planner import message_sources
+
+    _, runtime, resource, backend, contexts, proposal, _ = local_planning_case
+    message = REQUEST
+    if setting == "maximum_relative_range":
+        message += " maximum_relative_range: 0.005;"
+
+    def initial(context):
+        data = local_draft(context)
+        if setting == "maximum_relative_range":
+            data["nodes"][1]["inputs"]["steady_state"] = {"maximum_relative_range": 0.005}
+        return data
+
+    proposal["build"] = initial
+    record = submit(local_planning_case, message)
+    data = initial(contexts[-1])
+    if setting == "settling_band":
+        followup = f"{negation} change the settling band to 2%."
+        data["nodes"][1]["inputs"]["settling_band"] = 0.02
+    else:
+        followup = f"{negation} change maximum_relative_range to 0.01."
+        data["nodes"][1]["inputs"]["steady_state"]["maximum_relative_range"] = 0.01
+    queued = runtime.queue_message(record.id, followup)
+    with pytest.raises(ValueError, match="ambiguous"):
+        bind_plan(
+            AgentPlanDraft.model_validate(data),
+            {resource.id: resource},
+            message_sources(queued),
+            runtime.executor.tools.catalog((resource,)),
+        )
+    assert record.task.baseline.nodes[1].inputs["settling_band"] == 0.05
+    assert queued.messages[-1].content == followup
+    assert record.task.calls == [] and not backend.requests
+
+
 def test_unrelated_question_does_not_invalidate_an_explicit_band_correction(local_planning_case):
     _, runtime, _, backend, _, proposal, _ = local_planning_case
     first = submit(local_planning_case)
