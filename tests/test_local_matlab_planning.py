@@ -702,6 +702,362 @@ def test_omitted_policy_cannot_override_known_project_setting(local_planning_cas
     assert not backend.requests
 
 
+@pytest.mark.parametrize(
+    "name,value,default",
+    [
+        ("tail_fraction", 0.3, 0.2),
+        ("minimum_window_seconds", 2.0, 1.0),
+        ("maximum_relative_range", 0.005, 0.02),
+        ("maximum_relative_drift", 0.005, 0.01),
+    ],
+)
+@pytest.mark.parametrize("selection", ["explicit", "omitted", "mismatch", "conflict"])
+def test_user_policy_is_not_silently_replaced_by_defaults_or_project(
+    local_planning_case, name, value, default, selection
+):
+    _, _, _, backend, _, proposal, project = local_planning_case
+    message = REQUEST + f" steady_state {name}: {value};"
+    if selection == "conflict":
+        with (project / "initialize.m").open("a") as stream:
+            stream.write(f"{name} = {default};\n")
+
+    def policy(context):
+        data = local_draft(context)
+        if selection != "omitted":
+            data["nodes"][1]["inputs"]["steady_state"] = {
+                name: value if selection == "explicit" else default
+            }
+        return data
+
+    proposal["build"] = policy
+    record = submit(local_planning_case, message)
+    if selection == "explicit":
+        assert record.task is not None, record.pending_decision
+        assert record.task.baseline.nodes[1].inputs["steady_state"][name] == value
+        assert record.task.baseline.requirements.criteria[0].source.quote == message
+        assert record.messages[0].content == message
+    else:
+        assert record.task is None
+        assert record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
+@pytest.mark.parametrize("authority", ["documentation", "configuration"])
+@pytest.mark.parametrize("selection", ["explicit", "omitted", "user-conflict"])
+def test_attributed_project_policy_cannot_be_ignored(
+    local_planning_case, authority, selection
+):
+    _, _, _, backend, contexts, proposal, project = local_planning_case
+    quote = "steady_state maximum_relative_range: 0.005;"
+    if authority == "documentation":
+        with (project / "README.md").open("a") as stream:
+            stream.write(quote)
+    else:
+        (project / "flight-agent.project.json").write_text(
+            json.dumps(
+                {
+                    "name": "Explicit validity policy",
+                    "model": "plant.slx",
+                    "initializer": "initialize.m",
+                    "input_signal": {"name": "command", "unit": "deg"},
+                    "response_signal": {"name": "response", "unit": "deg/s"},
+                    "steady_state": {"maximum_relative_range": 0.005},
+                }
+            )
+        )
+
+    def policy(context):
+        data = local_draft(context)
+        if authority == "configuration":
+            for label in ("input_signal", "response_signal"):
+                data["nodes"][0]["inputs"][label]["source"] = "logsout"
+        if selection != "omitted":
+            data["nodes"][1]["inputs"]["steady_state"] = {"maximum_relative_range": 0.005}
+        return data
+
+    proposal["build"] = policy
+    message = REQUEST.replace("workspace", "logsout") if authority == "configuration" else REQUEST
+    if selection == "user-conflict":
+        message += " maximum_relative_range: 0.01;"
+    record = submit(local_planning_case, message)
+    if selection == "explicit":
+        assert record.task is not None, record.pending_decision
+        assert record.task.baseline.nodes[1].inputs["steady_state"] == {
+            "maximum_relative_range": 0.005
+        }
+        facts = contexts[-1]["resources"][0]["metadata"]["project"]["settings"]
+        if authority == "documentation":
+            assert any(quote in item["text"] for item in facts["documentation"])
+        else:
+            assert '"maximum_relative_range": 0.005' in facts["explicit_configuration"]["quote"]
+    else:
+        assert record.task is None
+        assert record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
+def _raw_entry_draft(context):
+    data = local_draft(context)
+    entries = context["resources"][0]["metadata"]["project"]["entries"]
+    data["requirements"] = {
+        "objective": "Existing raw analysis",
+        "mode": "analysis",
+        "requested_outputs": [
+            {
+                "id": "raw",
+                "kind": "artifact",
+                "node_id": "execute",
+                "item_id": "raw",
+                "description": "Existing analysis output",
+            }
+        ],
+    }
+    data.pop("evaluation_node")
+    data["nodes"] = data["nodes"][:1]
+    data["nodes"][0]["inputs"] = {
+        "mode": "entry",
+        "entry": next(entry for entry in entries if entry["path"] == "analyze.m"),
+    }
+    return data
+
+
+@pytest.mark.parametrize("authority", ["user", "documentation", "configuration"])
+@pytest.mark.parametrize("selection", ["explicit", "omitted", "signature"])
+def test_entry_mode_requires_only_the_attributed_initializer(
+    local_planning_case, authority, selection
+):
+    _, _, _, backend, _, proposal, project = local_planning_case
+    (project / "analyze.m").write_text("result = 1;\n")
+    (project / "README.md").write_text("Existing raw analysis entry: analyze.m\n")
+    message = "Run analysis entry: analyze.m; retain its raw result."
+    quote = "initializer: initialize.m"
+    if authority == "user":
+        message += " " + quote
+    elif authority == "documentation":
+        with (project / "README.md").open("a") as stream:
+            stream.write(quote)
+    else:
+        (project / "flight-agent.project.json").write_text(
+            json.dumps(
+                {
+                    "name": "Explicit initialization",
+                    "model": "plant.slx",
+                    "initializer": "initialize.m",
+                    "input_signal": {"name": "command", "unit": "deg"},
+                    "response_signal": {"name": "response", "unit": "deg/s"},
+                }
+            )
+        )
+
+    def analysis(context):
+        data = _raw_entry_draft(context)
+        if selection != "omitted":
+            entries = context["resources"][0]["metadata"]["project"]["entries"]
+            initializer = deepcopy(next(e for e in entries if e["path"] == "initialize.m"))
+            if selection == "signature":
+                initializer["signature"] = "function invented()"
+            data["nodes"][0]["inputs"]["initializer"] = initializer
+        return data
+
+    proposal["build"] = analysis
+    record = submit(local_planning_case, message)
+    if selection == "explicit":
+        assert record.task is not None, record.pending_decision
+        assert record.task.baseline.nodes[0].inputs["initializer"]["path"] == "initialize.m"
+    else:
+        assert record.task is None
+        assert record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
+def test_raw_entry_with_other_candidates_needs_no_unspecified_initializer(local_planning_case):
+    _, _, _, backend, _, proposal, project = local_planning_case
+    (project / "analyze.m").write_text("result = 1;\n")
+    (project / "README.md").unlink()
+    proposal["build"] = _raw_entry_draft
+    record = submit(local_planning_case, "Run analysis entry: analyze.m; retain its raw result.")
+    assert record.task is not None, record.pending_decision
+    assert record.task.baseline.nodes[0].inputs.get("initializer") is None
+    assert len(record.task.baseline.nodes) == 1
+    assert not backend.requests
+
+
+@pytest.mark.parametrize(
+    "initial_band,correction",
+    [
+        ("Use stepinfo settling band 5%;", "Correction: use stepinfo settling band 2%."),
+        ("Use stepinfo settling band 5%;", "Change the settling band from 5% to 2%."),
+        ("Use a 5% settling band;", "Replace the 5% settling band with 2%."),
+        ("采用5%误差带；", "将5%误差带改为2%误差带。"),
+        ("调节带为5%；", "调节带从5%改为2%。"),
+        (
+            "Use SettlingTimeThreshold = 0.05;",
+            "Change SettlingTimeThreshold from 0.05 to 0.02.",
+        ),
+    ],
+)
+def test_runtime_band_correction_preserves_sources_and_baseline_history(
+    local_planning_case, initial_band, correction
+):
+    _, runtime, _, backend, contexts, proposal, _ = local_planning_case
+    message = REQUEST.replace("Use stepinfo settling band 5%;", initial_band)
+    first = submit(local_planning_case, message)
+    original_baseline = first.task.baseline.model_dump(mode="json")
+
+    def corrected(context):
+        data = local_draft(context)
+        data["nodes"][1]["inputs"]["settling_band"] = 0.02
+        return data
+
+    proposal["build"] = corrected
+    record = runtime.continue_submission(runtime.queue_message(first.id, correction).id)
+    assert record.task is not None, record.pending_decision
+    assert record.task.baseline.version == 2
+    assert record.task.baseline.nodes[1].inputs["settling_band"] == 0.02
+    assert record.archived_tasks[0].baseline.model_dump(mode="json") == original_baseline
+    assert record.archived_tasks[0].baseline.nodes[1].inputs["settling_band"] == 0.05
+    for text in ["Retain my previous calculation settings."] * 4:
+        record = runtime.continue_submission(runtime.queue_message(record.id, text).id)
+        assert record.task is not None, record.pending_decision
+        assert record.task.baseline.nodes[1].inputs["settling_band"] == 0.02
+    assert record.task.baseline.requirements.criteria[0].source.quote == message
+    assert [item.threshold for item in record.task.baseline.requirements.criteria] == [10.0, 3.0]
+    quotes = [source["quote"] for source in contexts[-1]["sources"]]
+    assert message in quotes and correction in quotes
+    assert any(item.content == correction for item in record.messages)
+    assert all(not task.baseline.confirmed for task in [record.task, *record.archived_tasks])
+    assert record.task.calls == [] and not backend.requests
+
+
+@pytest.mark.parametrize(
+    "followup",
+    [
+        "Use stepinfo settling band 2%.",
+        "Maybe change the settling band to 2% or 5%?",
+        "Correction: use settling band 2% and settling band 5%.",
+        "Do not change the settling band to 2%.",
+        "If approved, change the settling band to 2%.",
+    ],
+)
+def test_unresolved_user_band_conflicts_still_require_clarification(
+    local_planning_case, followup
+):
+    _, runtime, _, backend, _, proposal, _ = local_planning_case
+    first = submit(local_planning_case)
+
+    def conflicting(context):
+        data = local_draft(context)
+        data["nodes"][1]["inputs"]["settling_band"] = 0.02
+        return data
+
+    proposal["build"] = conflicting
+    record = runtime.continue_submission(runtime.queue_message(first.id, followup).id)
+    assert record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
+def test_unrelated_question_does_not_invalidate_an_explicit_band_correction(local_planning_case):
+    _, runtime, _, backend, _, proposal, _ = local_planning_case
+    first = submit(local_planning_case)
+
+    def corrected(context):
+        data = local_draft(context)
+        data["nodes"][1]["inputs"]["settling_band"] = 0.02
+        return data
+
+    proposal["build"] = corrected
+    record = runtime.continue_submission(
+        runtime.queue_message(
+            first.id, "Change the settling band to 2%; can the report be JSON or Word?"
+        ).id
+    )
+    assert record.pending_decision.kind == "confirm_baseline"
+    assert record.task.baseline.nodes[1].inputs["settling_band"] == 0.02
+    assert not backend.requests
+
+
+def test_user_band_correction_does_not_override_active_project_band(local_planning_case):
+    _, runtime, _, backend, _, proposal, project = local_planning_case
+    with (project / "initialize.m").open("a") as stream:
+        stream.write("SettlingTimeThreshold = 0.02;\n")
+    def current(context):
+        data = local_draft(context)
+        data["nodes"][1]["inputs"]["settling_band"] = 0.02
+        return data
+
+    proposal["build"] = current
+    first = submit(local_planning_case, REQUEST.replace("settling band 5%", "settling band 2%"))
+    assert first.task is not None
+    proposal["build"] = local_draft
+    record = runtime.continue_submission(
+        runtime.queue_message(first.id, "Change the settling band from 2% to 5%.").id
+    )
+    assert record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
+def test_policy_correction_is_per_field_and_survives_unrelated_followups(local_planning_case):
+    _, runtime, _, backend, contexts, proposal, _ = local_planning_case
+
+    def policy(context):
+        data = local_draft(context)
+        data["nodes"][1]["inputs"]["steady_state"] = {
+            "maximum_relative_range": 0.005,
+            "tail_fraction": 0.3,
+        }
+        return data
+
+    proposal["build"] = policy
+    message = REQUEST + " maximum_relative_range: 0.005; tail_fraction: 0.3;"
+    first = submit(local_planning_case, message)
+    assert first.task is not None
+
+    def corrected(context):
+        data = policy(context)
+        data["nodes"][1]["inputs"]["steady_state"]["maximum_relative_range"] = 0.01
+        return data
+
+    proposal["build"] = corrected
+    correction = "Change maximum_relative_range from 0.005 to 0.01."
+    record = runtime.continue_submission(runtime.queue_message(first.id, correction).id)
+    assert record.task is not None, record.pending_decision
+    for text in ["Keep the same outputs."] * 4:
+        record = runtime.continue_submission(runtime.queue_message(record.id, text).id)
+        assert record.task is not None, record.pending_decision
+        assert record.task.baseline.nodes[1].inputs["steady_state"] == {
+            "maximum_relative_range": 0.01,
+            "tail_fraction": 0.3,
+        }
+    assert record.task.baseline.nodes[1].inputs["settling_band"] == 0.05
+    assert record.task.baseline.requirements.criteria[0].source.quote == message
+    assert message in [source["quote"] for source in contexts[-1]["sources"]]
+    assert not backend.requests
+
+
+def test_policy_resolution_does_not_admit_unknown_contract_fields(local_planning_case):
+    _, _, _, backend, _, proposal, _ = local_planning_case
+
+    def unknown_policy(context):
+        data = local_draft(context)
+        data["nodes"][1]["inputs"]["steady_state"] = {"invented_policy": 1}
+        return data
+
+    proposal["build"] = unknown_policy
+    record = submit(local_planning_case)
+    assert record.task is None
+    assert record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
+@pytest.mark.parametrize("value", ["-0.005", "+0.005"])
+def test_signed_policy_declaration_cannot_fall_back_to_default(local_planning_case, value):
+    _, _, _, backend, *_ = local_planning_case
+    record = submit(local_planning_case, REQUEST + f" maximum_relative_range: {value};")
+    assert record.task is None
+    assert record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
 def test_explicit_working_directory_cannot_be_silently_omitted(local_planning_case):
     _, _, _, backend, _, _, project = local_planning_case
     (project / "flight-agent.project.json").write_text(

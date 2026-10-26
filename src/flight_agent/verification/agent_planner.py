@@ -47,6 +47,9 @@ quote 含脱敏标记时完整复制该来源提供的 quote，不得自行还�
 保留未解析/截断说明；不反复索取已知设置。clarification_context 保留原文问答和先前选择。
 stepinfo 的 settling_band 必须与用户/工程原始来源一致；5% 调节带是 0.05 计算输入，
 不是 10% 超调量或 3 s 调节时间验收阈值。来源冲突先澄清，不把阈值当作计算设置。
+用户明确且无歧义的后续更正仅更新对应计算设置，保留全部原消息和判据引用；
+不能覆盖仍有效的工程设置冲突。稳态策略逐字段沿用用户/工程声明，无声明才用公布默认值。
+entry 模式也必须保留明确指定的初始化入口；未指定时不强加初始化。
 典型验证为 execute → stepinfo → evaluate → deliver，至少四次派发/四轮；
 series 只能绑定执行节点的 ["details","series"]，不能填写数组或伪造工件描述。
 指标生产者是 matlab_stepinfo，工况必须与执行来源相同；纯已有入口分析不强加 stepinfo。
@@ -128,20 +131,81 @@ def _setting_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
-def _band_values(text: str) -> list[float]:
-    number = r"([0-9]+(?:\.[0-9]+)?)\s*(%|％|percent|百分比)?"
-    label = (
-        r"(?:settling[\s_-]*(?:time[\s_-]*)?(?:band|threshold)|band|"
-        r"调节带|调节时间带|稳态误差带|误差带)"
-    )
+_BAND_LABEL = (
+    r"(?:settling[\s_-]*(?:time[\s_-]*)?(?:band|threshold)|band|"
+    r"调节带|调节时间带|稳态误差带|误差带)"
+)
+_NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+
+
+def _calculation_values(text: str, name: str) -> list[float]:
+    band = name == "settling_band"
+    label = _BAND_LABEL if band else r"""(?<![\w])["']?""" + name + r"""["']?"""
+    number = "(" + _NUMBER + r")\s*(%|％|percent|百分比)?" if band else "(" + _NUMBER + ")()"
     return [
         float(match[1]) / (100 if match[2] else 1)
-        for expression in (
-            label + r"\s*(?:为|是|[:=]|of)?\s*" + number,
-            number + r"\s*" + label,
-        )
+        for expression in [
+            label + r"\s*(?:为|是|[:=：]|of)?\s*" + number,
+            *([number + r"\s*" + label] if band else []),
+        ]
         for match in re.finditer(expression, text, re.IGNORECASE)
     ]
+
+
+def _current_user_calculation_values(
+    sources: dict[str, CriterionSource], name: str
+) -> list[float]:
+    label = _BAND_LABEL if name == "settling_band" else re.escape(name)
+    number = _NUMBER + (r"\s*(?:%|％|percent|百分比)?" if name == "settling_band" else "")
+    replacements = [
+        r"(?:change|correct|update|revise|set)\s+(?:the\s+)?"
+        + label + r"\s+(?:from\s+" + number + r"\s+)?to\s+(?P<value>" + number + ")",
+        r"replace\s+(?:the\s+)?" + number + r"\s*" + label
+        + r"\s+with\s+(?P<value>" + number + ")",
+        number + r"\s*" + label
+        + r"\s*(?:改为|改成|更正为|修正为|调整为|替换为)\s*(?P<value>" + number + ")"
+        + r"(?:\s*" + label + ")?",
+        label + r"\s*(?:从\s*" + number + r"\s*)?"
+        + r"(?:改为|改成|更正为|修正为|调整为|替换为)\s*(?P<value>" + number + ")",
+    ]
+    current: list[float] = []
+    for source in sources.values():
+        if source.kind != "user_message":
+            continue
+        text = source.quote
+        corrected = False
+        # Normalize only a local parsing copy; authorized quotes/history are never changed.
+        for expression in replacements:
+            text, count = re.subn(
+                expression,
+                lambda match: f"{name}: {match['value']}",
+                text,
+                flags=re.IGNORECASE,
+            )
+            corrected = corrected or bool(count)
+        values = _calculation_values(text, name)
+        if not values:
+            continue
+        if any(
+            _calculation_values(clause, name)
+            and re.search(
+                r"\b(?:maybe|perhaps|or|if|not)\b|不要|是否|还是|或者|[?？]",
+                clause,
+                re.IGNORECASE,
+            )
+            for clause in re.split(r"[;\n。]|(?<=[.!?])\s+", text)
+        ):
+            raise _LocalPlanningIssue(f"Please clarify ambiguous {name} declaration")
+        corrected = corrected or bool(
+            re.match(r"\s*(?:correction|clarification|更正|澄清)\s*[:：]", text, re.IGNORECASE)
+        )
+        if corrected:
+            if len(set(values)) != 1:
+                raise _LocalPlanningIssue(f"Please clarify conflicting {name} correction")
+            current = values
+        else:
+            current.extend(values)
+    return current
 
 
 def _local_facts(
@@ -190,6 +254,8 @@ def _select_candidate(
     sources: dict[str, CriterionSource],
     texts: list[str],
     configured: JsonValue = None,
+    *,
+    optional: bool = False,
 ) -> None:
     if selected is not None and selected not in candidates:
         raise _LocalPlanningIssue(f"{label}: selected path is not a discovered candidate")
@@ -220,7 +286,7 @@ def _select_candidate(
         labeled_choices(source.quote, label)
         or (
             []
-            if any(labeled_choices(source.quote, role) for role in labels)
+            if optional or any(labeled_choices(source.quote, role) for role in labels)
             else [
                 path
                 for path in candidates
@@ -237,6 +303,11 @@ def _select_candidate(
         choices = list(
             dict.fromkeys(path for text in texts for path in labeled_choices(text, label))
         )
+    if optional and selected is None and not choices and configured is None and not any(
+        re.search(labels[label] + r"\s*(?:[:=：]\s*)?\S+\.m\b", text, re.IGNORECASE)
+        for text in texts
+    ):
+        return
     if not choices and len(candidates) == 1:
         choices = candidates
     if selected is None and not choices and not candidates:
@@ -266,8 +337,6 @@ def _validate_local_execution(
     for label, selected in (("entry", inputs.entry), ("initializer", inputs.initializer)):
         if label == "entry" and inputs.mode != "entry":
             continue
-        if label == "initializer" and inputs.mode == "entry" and selected is None:
-            continue
         _select_candidate(
             label,
             selected.path if selected else None,
@@ -275,6 +344,7 @@ def _validate_local_execution(
             sources,
             texts,
             configuration.get(label),
+            optional=label == "initializer" and inputs.mode == "entry",
         )
         if selected is not None:
             try:
@@ -417,8 +487,13 @@ def _validate_local_nodes(
             raise _LocalPlanningIssue("stepinfo requires paired explicit source signal selections")
         if node.inputs.get("conditions", {}) != inputs.conditions:
             raise _LocalPlanningIssue("stepinfo conditions differ from the producing execution")
-        texts, records, configuration = _local_facts(project, sources)
-        bands = [value for text in texts for value in _band_values(text)]
+        documentation, records, configuration = _local_facts(project, {})
+        bands = _current_user_calculation_values(sources, "settling_band")
+        bands.extend(
+            value
+            for text in documentation
+            for value in _calculation_values(text, "settling_band")
+        )
         bands.extend(
             float(str(record["value"]))
             for record in records
@@ -433,26 +508,32 @@ def _validate_local_nodes(
             raise _LocalPlanningIssue(
                 "settling_band conflicts with or lacks its original band source"
             )
-        policy = node.inputs.get("steady_state", {})
-        if not isinstance(policy, dict):
-            raise _LocalPlanningIssue("steady_state requires a published or explicit policy")
+        try:
+            policy = SteadyStatePolicy.model_validate(
+                node.inputs.get("steady_state", {})
+            ).model_dump(mode="json")
+        except ValueError as exc:
+            raise _LocalPlanningIssue("steady_state requires a supported explicit policy") from exc
         defaults = SteadyStatePolicy().model_dump(mode="json")
         configured_policy = configuration.get("steady_state", {})
-        for name, value in {**defaults, **policy}.items():
-            declared = [
+        for name, default in defaults.items():
+            value = policy[name]
+            declared: list[JsonValue] = list(_current_user_calculation_values(sources, name))
+            declared.extend(
+                value for text in documentation for value in _calculation_values(text, name)
+            )
+            declared.extend(
                 record.get("value")
                 for record in records
                 if _setting_name(str(record.get("name"))) == _setting_name(name)
-            ]
+            )
             if isinstance(configured_policy, dict) and name in configured_policy:
                 declared.append(configured_policy[name])
             if declared and any(item != value for item in declared):
-                raise _LocalPlanningIssue(f"steady_state.{name} conflicts with project sources")
-            expected = declared[0] if declared else defaults.get(name)
-            if value != expected and not any(
-                re.search(re.escape(name) + r"\s*[:=]\s*" + re.escape(str(value)), text)
-                for text in texts
-            ):
+                raise _LocalPlanningIssue(
+                    f"steady_state.{name} conflicts with its original sources"
+                )
+            if not declared and value != default:
                 raise _LocalPlanningIssue(f"steady_state.{name} differs from its published source")
         for criterion in draft.requirements.criteria:
             if criterion.metric.node_id == node.id and criterion.conditions != inputs.conditions:
