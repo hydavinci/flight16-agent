@@ -88,13 +88,23 @@ def directory_task(args: argparse.Namespace) -> int:
         client.headers["X-Flight-Token"] = token
         base = "/api/conversations"
         if args.action == "propose":
-            body: dict[str, JsonValue] = {"message": args.request}
-            for field in ("project_root", "output_root", "scenario"):
+            structured = args.analysis_request is not None or args.criteria is not None
+            body: dict[str, JsonValue] = (
+                {"analysis_request": (
+                    args.analysis_request if args.analysis_request is not None else args.request
+                )}
+                if structured else {"message": args.request}
+            )
+            if args.criteria is not None:
+                body["evaluation_criteria"] = args.criteria
+            for field in ("project_root", "output_root", "scenario", "location"):
                 value = getattr(args, field)
                 if value is not None:
                     body[field] = value
             if identifier is None and args.scenario is None:
                 body["scenario"] = "auto"
+                if structured and args.location is None:
+                    body["location"] = "matlab_project"
             record = request(
                 "POST", f"{base}/{identifier}/messages" if identifier else base, body
             )
@@ -152,7 +162,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     propose.add_argument("--output-root", help="Agent-visible delivery directory")
     propose.add_argument("--conversation", help="Continue an existing conversation")
-    propose.add_argument("--request", required=True)
+    propose.add_argument(
+        "--location", help="Explicit registered resource location or legacy host alias",
+    )
+    request_form = propose.add_mutually_exclusive_group(required=True)
+    request_form.add_argument("--request", help="Compatible single-message request")
+    request_form.add_argument("--analysis-request", help="Existing project analysis requirements")
+    propose.add_argument(
+        "--criteria", help="Optional evaluation criteria, preserved as user source",
+    )
     confirm = actions.add_parser("confirm", help="Confirm a recorded baseline and execute")
     confirm.add_argument("--version", type=int, required=True)
     confirm.add_argument("--trusted-project", action="store_true")

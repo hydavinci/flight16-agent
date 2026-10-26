@@ -2,11 +2,11 @@ import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from ..jobs import BusyError, JobManager
 from ..runtime.evidence import verify_evidence
@@ -25,18 +25,41 @@ logger = logging.getLogger(__name__)
 
 class MessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    message: str = Field(min_length=1, max_length=4000)
+    message: str | None = Field(default=None, min_length=1, max_length=4000)
+    analysis_request: str | None = Field(default=None, min_length=1, max_length=4000)
+    evaluation_criteria: str | None = Field(default=None, min_length=1, max_length=4000)
     project_root: str | None = Field(default=None, max_length=4096)
     output_root: str | None = Field(default=None, max_length=4096)
     location: str | None = Field(default=None, min_length=1, max_length=128)
     scenario: Scenario | None = None
 
-    @field_validator("message")
+    @field_validator("message", "analysis_request", "evaluation_criteria")
     @classmethod
-    def nonempty_message(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("A nonempty message is required")
-        return value.strip()
+    def nonempty_text(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("Nonempty request text is required")
+        return value
+
+    @model_validator(mode="after")
+    def message_or_structured_input(self) -> Self:
+        if self.message is not None:
+            if self.analysis_request is not None or self.evaluation_criteria is not None:
+                raise ValueError("message cannot be combined with structured input fields")
+        elif self.analysis_request is None:
+            raise ValueError("Provide message or analysis_request")
+        if len(self.canonical_message()) > 4000:
+            raise ValueError(
+                "Combined message including source labels must not exceed 4000 characters"
+            )
+        return self
+
+    def canonical_message(self) -> str:
+        if self.message is not None:
+            return self.message.strip()
+        text = f"[工程分析要求]\n{self.analysis_request}\n[工程分析要求结束]"
+        if self.evaluation_criteria is not None:
+            text += f"\n\n[评价指标]\n{self.evaluation_criteria}\n[评价指标结束]"
+        return text
 
 
 class ConfirmationRequest(BaseModel):
@@ -113,7 +136,7 @@ class ConversationManager:
         try:
             record = self.runtime.queue_message(
                 conversation_id,
-                request.message,
+                request.canonical_message(),
                 request.project_root,
                 output_root=request.output_root,
                 location=request.location,

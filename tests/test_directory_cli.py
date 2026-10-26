@@ -184,3 +184,68 @@ def test_default_directory_cli_uses_generic_plan_and_explicit_confirmation(tmp_p
         assert done["task"]["result"]["observations"][0]["value"] == pytest.approx(2**0.5)
         assert done["task"]["result"]["evaluation"] is None
         assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        (
+            ["--analysis-request", "  Existing entry 中文  ", "--criteria", "超调量 ≤10%"],
+            {"analysis_request": "  Existing entry 中文  ", "evaluation_criteria": "超调量 ≤10%",
+             "location": "matlab_project", "scenario": "auto"},
+        ),
+        (
+            ["--request", "Keep legacy text", "--criteria", "RMSE <= 2 m"],
+            {"analysis_request": "Keep legacy text", "evaluation_criteria": "RMSE <= 2 m",
+             "location": "matlab_project", "scenario": "auto"},
+        ),
+        (
+            ["--analysis-request", "Existing entry", "--scenario", "d1"],
+            {"analysis_request": "Existing entry", "scenario": "d1"},
+        ),
+        (
+            ["--request", "Worker request", "--scenario", "d1"],
+            {"message": "Worker request", "scenario": "d1"},
+        ),
+        (
+            ["--analysis-request", "Data analysis", "--location", "agent"],
+            {"analysis_request": "Data analysis", "location": "agent", "scenario": "auto"},
+        ),
+        (
+            ["--analysis-request", "Follow up", "--conversation", "b" * 32],
+            {"analysis_request": "Follow up"},
+        ),
+    ],
+)
+def test_directory_cli_structured_and_legacy_resource_payloads(
+    monkeypatch, capsys, arguments, expected,
+):
+    real_client = httpx.Client
+    received = []
+
+    def handler(request):
+        if request.url.path == "/api/bootstrap":
+            return httpx.Response(200, json={"token": "local-test-token"})
+        received.append(json.loads(request.content))
+        assert request.headers["X-Flight-Token"] == "local-test-token"
+        return httpx.Response(202, json={"id": "b" * 32, "status": "waiting_for_user"})
+
+    monkeypatch.setattr(
+        cli.httpx, "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    assert cli.main(["directory-task", "propose", *arguments]) == 0
+    assert received == [expected]
+    capsys.readouterr()
+
+
+def test_directory_cli_request_forms_are_mutually_exclusive_before_contact(monkeypatch):
+    def forbidden(**kwargs):
+        pytest.fail("Conflicting flags must be rejected before contacting the server")
+
+    monkeypatch.setattr(cli.httpx, "Client", forbidden)
+    with pytest.raises(SystemExit) as rejected:
+        cli.main([
+            "directory-task", "propose", "--request", "old", "--analysis-request", "new",
+        ])
+    assert rejected.value.code == 2

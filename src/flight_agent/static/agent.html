@@ -19,6 +19,7 @@
       <details class="environment">
         <summary>运行环境</summary>
         <p id="worker-state">正在检查 Worker 配置…</p>
+        <p id="local-matlab-state">正在检查本机 MATLAB Engine…</p>
         <p id="model-state">正在检查模型配置…</p>
         <a href="/workbench">打开原 MATLAB 分析工作台</a>
       </details>
@@ -119,7 +120,10 @@
         </p>
         <label id="request-label" for="message">任务需求</label>
         <textarea id="message" rows="3" maxlength="4000" required
-                  placeholder="描述目标、输入、所需输出；需要合格判定时请注明阈值、单位、工况与来源。"></textarea>
+                  placeholder="工程分析要求或会话补充：描述目标、已有入口、工况与所需输出。"></textarea>
+        <label for="evaluation-criteria">评价指标（可选）</label>
+        <textarea id="evaluation-criteria" rows="2" maxlength="4000"
+                  placeholder="需要合格判定时填写阈值、单位、工况与来源；纯分析可留空。"></textarea>
         <div class="composer-actions">
           <span id="composer-hint" class="hint">缺少标准时先澄清；能力不足时明确说明，不猜测通过或失败。</span>
           <button id="send" class="primary" type="submit" disabled>发送</button>

@@ -34,6 +34,7 @@ from .verification.agent_runtime import AgentContext, AgentExecutor
 from .verification.backend import AnalysisBackend, RemoteSimulinkBackend
 from .verification.compat import resolve_location
 from .verification.coordinator import EngineeringRuntime
+from .verification.local_matlab import LocalMatlabBackend
 from .verification.planner import VerificationPlanner
 from .verification.plugins import register_builtin_plugins
 from .verification.resources import ResourceLocation, ResourceRegistry
@@ -170,6 +171,7 @@ def create_web_app(
 
     @app.get("/api/bootstrap")
     def bootstrap() -> dict[str, object]:
+        local = LocalMatlabBackend.from_environment().availability()
         worker_error = model_error = None
         try:
             RemoteWorker.from_environment()
@@ -188,6 +190,15 @@ def create_web_app(
             "worker_error": worker_error,
             "model_configured": model_error is None,
             "model_error": model_error,
+            "local_matlab": {
+                "state": local.state,
+                "reason": (
+                    "Import probe only; MATLAB startup and license are not verified."
+                    if local.state == "available"
+                    else "Local MATLAB Engine unavailable; enable MATLAB_ALLOW_TRUSTED_PROJECTS=1 "
+                    "and check the selected Python environment and Engine installation."
+                ),
+            },
             "trusted_code_only": True,
             "native_directory_picker": native_directory_picker,
         }

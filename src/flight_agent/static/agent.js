@@ -73,8 +73,13 @@ async function conversation(path, id, options) {
   if (options?.method === "POST" && generation === selection) {
     pendingView = {id: record.id, selection: generation};
     localStorage.setItem("verification-conversation", record.id);
-    if (options.body?.message !== undefined
-        && $("message").value.trim() === options.body.message) $("message").value = "";
+    const submittedMessage = options.body?.message ?? options.body?.analysis_request;
+    if (submittedMessage !== undefined
+        && $("message").value === submittedMessage) $("message").value = "";
+    if (options.body?.evaluation_criteria !== undefined
+        && $("evaluation-criteria").value === options.body.evaluation_criteria) {
+      $("evaluation-criteria").value = "";
+    }
   }
   return conversation(`${API}/${record.id}/view`, record.id);
 }
@@ -124,7 +129,7 @@ function renderProgress(record = null) {
 
 function controls() {
   const busy = Boolean(!token || sending || active() || nativePicker);
-  for (const id of ["send", "project-root", "output-root", "resource-location", "message", "trusted", "resume"]) {
+  for (const id of ["send", "project-root", "output-root", "resource-location", "message", "evaluation-criteria", "trusted", "resume"]) {
     $(id).disabled = busy;
   }
   for (const id of ["confirm", "retry", "replan"]) {
@@ -567,7 +572,9 @@ function clearConversation() {
   sending = false;
   baselineKey = "";
   $("trusted").checked = false;
-  for (const id of ["message", "project-root", "output-root", "resource-location"]) $(id).value = "";
+  for (const id of ["message", "evaluation-criteria", "project-root", "output-root", "resource-location"]) $(id).value = "";
+  $("resource-location").value = locations.some((item) => item.id === "matlab_project"
+    && item.availability.state === "available") ? "matlab_project" : "";
   $("messages").replaceChildren();
   $("conversation-status").textContent = "新会话";
   delete $("conversation-status").dataset.status;
@@ -607,11 +614,13 @@ async function select(id) {
 async function send(event) {
   event.preventDefault();
   if (sending || active() || nativePicker || !token) return;
-  const message = $("message").value.trim();
-  if (!message) return notice("请输入任务需求。");
+  const message = $("message").value;
+  if (!message.trim()) return notice("请输入任务需求。");
   const generation = selection;
   const id = current?.id || null;
-  const body = {message};
+  const criteria = $("evaluation-criteria").value;
+  const body = criteria.trim()
+    ? {analysis_request: message, evaluation_criteria: criteria} : {message};
   const location = $("resource-location").value;
   if (location && location !== current?.resource_location) body.location = location;
   const root = $("project-root").value.trim();
@@ -624,7 +633,6 @@ async function send(event) {
   try {
     const record = await conversation(id ? `${API}/${id}/messages` : API, id, {method: "POST", body});
     if (generation === selection) {
-      $("message").value = "";
       localStorage.setItem("verification-conversation", record.id);
       render(record, true);
       poll();
@@ -718,6 +726,9 @@ async function start() {
     $("worker-state").textContent = bootstrap.worker_configured
       ? "MATLAB Worker：已配置" : `MATLAB Worker（仅相关能力需要）：${bootstrap.worker_error}`;
     $("model-state").textContent = bootstrap.model_configured ? "LLM：已配置" : `LLM：${bootstrap.model_error}`;
+    $("local-matlab-state").textContent = bootstrap.local_matlab.state === "available"
+      ? "本机 MATLAB Engine：导入探测通过；启动与许可证尚未验证。"
+      : `本机 MATLAB Engine：不可用；仍可浏览目录及静态发现。${bootstrap.local_matlab.reason}`;
     locations = await api("/api/resource-locations");
     locations.forEach((item) => {
       const option = element("option", `${item.display_name} (${item.location})${
@@ -726,10 +737,10 @@ async function start() {
       option.disabled = item.availability.state !== "available";
       $("resource-location").append(option);
     });
-    controls();
-    await history();
     const saved = localStorage.getItem("verification-conversation");
     if (saved) await select(saved);
+    else clearConversation();
+    await history();
   } catch (error) {
     notice(`初始化失败：${error.message}`);
   }
