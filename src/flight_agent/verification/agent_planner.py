@@ -193,9 +193,40 @@ def _select_candidate(
 ) -> None:
     if selected is not None and selected not in candidates:
         raise _LocalPlanningIssue(f"{label}: selected path is not a discovered candidate")
+    labels = {
+        "model": r"(?:model|模型)",
+        "initializer": r"(?:existing initializer|initializer|startup|初始化入口)",
+        "entry": r"(?:existing entry|analysis entry|entry|分析入口)",
+        "project_file": r"(?:project file|工程文件)",
+    }
+
+    def labeled_choices(text: str, role: str) -> list[str]:
+        return [
+            path
+            for path in candidates
+            if re.search(
+                r"(?<![\w])"
+                + labels[role]
+                + r"\s*(?:[:=：]\s*)?"
+                + re.escape(path)
+                + r"(?![\w./])",
+                text,
+                re.IGNORECASE,
+            )
+        ]
+
     # A later explicit selection resolves the earlier question, without rewriting its source.
     user_choices = [
-        [path for path in candidates if path in source.quote]
+        labeled_choices(source.quote, label)
+        or (
+            []
+            if any(labeled_choices(source.quote, role) for role in labels)
+            else [
+                path
+                for path in candidates
+                if re.search(r"(?<![\w./])" + re.escape(path) + r"(?![\w./])", source.quote)
+            ]
+        )
         for source in sources.values()
         if source.kind == "user_message"
     ]
@@ -203,23 +234,8 @@ def _select_candidate(
     if not choices and isinstance(configured, str):
         choices = [configured]
     if not choices:
-        labels = {
-            "model": r"(?:model|模型)",
-            "initializer": r"(?:existing initializer|initializer|startup|初始化入口)",
-            "entry": r"(?:existing entry|analysis entry|entry|分析入口)",
-            "project_file": r"(?:project file|工程文件)",
-        }
         choices = list(
-            dict.fromkeys(
-                path
-                for text in texts
-                for path in candidates
-                if re.search(
-                    labels[label] + r"\s*[:=：]\s*" + re.escape(path) + r"(?![\w./])",
-                    text,
-                    re.IGNORECASE,
-                )
-            )
+            dict.fromkeys(path for text in texts for path in labeled_choices(text, label))
         )
     if not choices and len(candidates) == 1:
         choices = candidates
@@ -299,7 +315,9 @@ def _validate_local_execution(
             continue
         configured = configuration.get(label)
         if isinstance(configured, dict) and (
-            configured.get("name") != ".".join(signal.path) or configured.get("unit") != signal.unit
+            configured.get("name") != ".".join(signal.path)
+            or configured.get("unit") != signal.unit
+            or signal.source != "logsout"
         ):
             raise _LocalPlanningIssue(f"{label} conflicts with explicit project configuration")
         declarations = [
@@ -314,7 +332,9 @@ def _validate_local_execution(
             raise _LocalPlanningIssue(f"{label} conflicts with its attributed signal sources")
         if not isinstance(configured, dict) and not declarations:
             raise _LocalPlanningIssue(f"Please clarify the original source of {label}")
-        if not any(source is not None for source, _, _ in declarations):
+        if not isinstance(configured, dict) and not any(
+            source is not None for source, _, _ in declarations
+        ):
             raise _LocalPlanningIssue(f"Please clarify workspace/logsout/return source of {label}")
         if signal.source == "return" and inputs.mode != "entry":
             raise _LocalPlanningIssue("Simulink has no entry return output", gap=True)
@@ -326,7 +346,18 @@ def _validate_local_execution(
         ]
         if known and any(str(item) != str(value) for item in known):
             raise _LocalPlanningIssue(f"Execution setting {name} conflicts with project sources")
-        if not known and not any(str(value) in text for text in texts):
+        if not known and not any(
+            re.search(
+                r"(?<![\w])"
+                + re.escape(name)
+                + r"""\s*[:=：]\s*['"]?"""
+                + re.escape(str(value))
+                + r"""['"]?(?![\w]|\.\d)""",
+                text,
+                re.IGNORECASE,
+            )
+            for text in texts
+        ):
             raise _LocalPlanningIssue(f"Execution condition {name} requires its original source")
 
 
@@ -391,7 +422,12 @@ def _validate_local_nodes(
         bands.extend(
             float(str(record["value"]))
             for record in records
-            if _setting_name(str(record.get("name"))) in {"settlingband", "settlingthreshold"}
+            if _setting_name(str(record.get("name")))
+            in {
+                "settlingband",
+                "settlingthreshold",
+                "settlingtimethreshold",
+            }
         )
         if not bands or any(value != node.inputs.get("settling_band") for value in bands):
             raise _LocalPlanningIssue(

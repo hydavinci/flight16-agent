@@ -470,7 +470,7 @@ def test_optional_existing_manifest_is_explicit_local_configuration(local_planni
     (project / "flight-agent.project.json").write_text(json.dumps(configuration))
     # The controlled model must choose the configured, not lexically first, candidate.
     local_planning_case[5]["build"] = lambda context: _configured_draft(context)
-    record = submit(local_planning_case)
+    record = submit(local_planning_case, REQUEST.replace("workspace", "logsout"))
     assert record.task is not None
     facts = contexts[-1]["resources"][0]["metadata"]["project"]["settings"]
     assert facts["explicit_configuration"]["value"] == configuration
@@ -482,6 +482,9 @@ def test_optional_existing_manifest_is_explicit_local_configuration(local_planni
 def _configured_draft(context):
     data = local_draft(context)
     data["nodes"][0]["inputs"]["model"] = "plant.slx"
+    if "explicit_configuration" in context["resources"][0]["metadata"]["project"]["settings"]:
+        for label in ("input_signal", "response_signal"):
+            data["nodes"][0]["inputs"][label]["source"] = "logsout"
     return data
 
 
@@ -545,6 +548,100 @@ def test_bind_plan_rejects_source_mismatched_band_even_without_model(local_plann
             message_sources(record),
             runtime.executor.tools.catalog((resource,)),
         )
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_condition_requires_named_source_not_unrelated_threshold(local_planning_case, declared):
+    _, _, _, backend, _, proposal, _ = local_planning_case
+
+    def with_mach(context):
+        data = local_draft(context)
+        for node in data["nodes"][:2]:
+            node["inputs"]["conditions"]["Mach"] = 3
+        for criterion in data["requirements"]["criteria"]:
+            criterion["conditions"]["Mach"] = 3
+        return data
+
+    proposal["build"] = with_mach
+    record = submit(local_planning_case, REQUEST + (" Mach: 3." if declared else ""))
+    if declared:
+        assert record.task is not None
+    else:
+        assert record.task is None and record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
+def test_project_settling_time_threshold_conflict_stops_confirmation(local_planning_case):
+    _, _, _, backend, _, _, project = local_planning_case
+    with (project / "initialize.m").open("a") as stream:
+        stream.write("SettlingTimeThreshold = 0.02;\n")
+    record = submit(local_planning_case)
+    assert record.task is None and record.pending_decision.kind == "clarify"
+    assert not backend.requests
+
+
+def test_labeled_entry_and_initializer_are_selected_independently(local_planning_case):
+    _, _, _, backend, _, proposal, project = local_planning_case
+    (project / "analyze.m").write_text("result = 1;\n")
+
+    def entry_analysis(context):
+        data = local_draft(context)
+        execute = data["nodes"][0]
+        entries = context["resources"][0]["metadata"]["project"]["entries"]
+        execute["inputs"].update(
+            mode="entry",
+            entry=next(entry for entry in entries if entry["path"] == "analyze.m"),
+            initializer=next(entry for entry in entries if entry["path"] == "initialize.m"),
+        )
+        execute["inputs"].pop("model")
+        return data
+
+    proposal["build"] = entry_analysis
+    record = submit(
+        local_planning_case, REQUEST + " analysis entry: analyze.m; initializer: initialize.m"
+    )
+    assert record.task is not None
+    assert record.task.nodes[0].inputs["entry"]["path"] == "analyze.m"
+    assert record.task.nodes[0].inputs["initializer"]["path"] == "initialize.m"
+    assert not backend.requests
+
+
+@pytest.mark.parametrize("signal_source", ["logsout", "workspace"])
+def test_manifest_signal_namespace_is_reused_without_repeated_input(
+    local_planning_case,
+    signal_source,
+):
+    _, _, _, backend, _, proposal, project = local_planning_case
+    (project / "flight-agent.project.json").write_text(
+        json.dumps(
+            {
+                "name": "Existing logged signals",
+                "model": "plant.slx",
+                "initializer": "initialize.m",
+                "initializer_kind": "script",
+                "input_signal": {"name": "command", "unit": "deg"},
+                "response_signal": {"name": "response", "unit": "deg/s"},
+            }
+        )
+    )
+
+    def logged(context):
+        data = local_draft(context)
+        for label in ("input_signal", "response_signal"):
+            data["nodes"][0]["inputs"][label]["source"] = signal_source
+        return data
+
+    proposal["build"] = logged
+    record = submit(
+        local_planning_case,
+        "Use the existing project; condition: cruise. "
+        "stepinfo settling band 5%; overshoot <=10%; settling_time <=3 s.",
+    )
+    if signal_source == "logsout":
+        assert record.task is not None
+    else:
+        assert record.task is None and record.pending_decision.kind == "clarify"
+    assert not backend.requests
 
 
 @pytest.mark.parametrize(
@@ -644,10 +741,12 @@ def test_configured_working_directory_is_reused(local_planning_case):
     def configured(context):
         data = local_draft(context)
         data["nodes"][0]["inputs"]["working_directory"] = "data"
+        for label in ("input_signal", "response_signal"):
+            data["nodes"][0]["inputs"][label]["source"] = "logsout"
         return data
 
     proposal["build"] = configured
-    record = submit(local_planning_case)
+    record = submit(local_planning_case, REQUEST.replace("workspace", "logsout"))
     assert record.task is not None
     assert record.task.nodes[0].inputs["working_directory"] == "data"
     assert not backend.requests
