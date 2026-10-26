@@ -5,6 +5,8 @@ import sys
 import time
 from pathlib import Path
 
+from PIL import Image
+
 
 class EngineError(RuntimeError):
     pass
@@ -53,13 +55,17 @@ class Engine:
         assert nargout == 0 and Path(path) == self.support
 
     def which(self, name, *, nargout):
-        assert nargout == 1 and name == "flight_agent_run_project"
+        assert nargout == 1 and name in {"flight_agent_run_project", "flight_agent_local_stepinfo"}
         if mode() == "helper_shadow":
             return "/another/flight_agent_run_project.m"
         return str(self.support / (name + ".m"))
 
     def feval(self, name, request_path, *, nargout):
-        assert name == "flight_agent_run_project" and nargout == 0
+        assert nargout == 0
+        if name == "flight_agent_local_stepinfo":
+            self.stepinfo(request_path)
+            return
+        assert name == "flight_agent_run_project"
         execution = json.loads(Path(request_path).read_text())
         canonical = json.loads(Path("request.json").read_text())
         assert execution["id"] == canonical["id"]
@@ -185,6 +191,83 @@ class Engine:
             )
         )
         print("test MATLAB execution output")
+
+    def stepinfo(self, request_path):
+        execution = json.loads(Path(request_path).read_text())
+        canonical = json.loads(Path("request.json").read_text())
+        assert canonical["operation"] == "stepinfo"
+        assert execution["inputs"] == canonical["inputs"]
+        assert execution["series_path"] == str(Path.cwd() / "project" / "series.json")
+        assert canonical["input_evidence"] == [canonical["inputs"]["series"]]
+        if mode() == "execution_error":
+            raise MatlabExecutionError("test-only metric operation failed")
+        if mode() == "missing_receipt":
+            os._exit(0)
+        Path("series.json").write_bytes(Path(execution["series_path"]).read_bytes())
+        Path("raw.mat").write_bytes(b"MATLAB 5.0 MAT-file, test-only metric placeholder")
+        Image.new("RGB", (8, 8), "white").save("step-response.png")
+        runtime = {
+            "id": execution["id"],
+            "request_sha256": execution["request_sha256"],
+            "snapshot_root": execution["snapshot_root"],
+            "working_directory": str(Path.cwd()),
+            "matlab_version": "test-only-engine",
+            "matlab_release": "test-only",
+            "products": [{"Name": "test-only", "Version": "test-only"}],
+            "settings": {},
+        }
+        if mode() == "wrong_runtime_id":
+            runtime["id"] = "0" * 32
+        if mode() == "contradictory_runtime_inputs":
+            runtime["inputs"] = canonical["inputs"]
+        Path("runtime-metadata.json").write_text(json.dumps(runtime))
+        valid = mode() != "invalid_step"
+        metrics = (
+            {
+                "overshoot": {"value": 12.5, "unit": "%"},
+                "settling_time": {"value": 3.25, "unit": "s"},
+            }
+            if valid
+            else {}
+        )
+        details = {
+            "mode": "stepinfo",
+            "settling_band": execution["inputs"]["settling_band"],
+            "steady_state_policy": execution["inputs"]["steady_state"],
+        }
+        if mode() == "bad_band":
+            details["settling_band"] = 0.9
+        series = json.loads(Path("series.json").read_text())
+        for role in ("input", "response"):
+            details[role + "_signal"] = {key: series[role][key] for key in ("name", "unit")}
+        if mode() == "wrong_step_signal":
+            details["response_signal"]["unit"] = "invented"
+        if mode() == "wrong_metric_unit":
+            metrics["settling_time"]["unit"] = "ms"
+        if mode() == "changed_step_source":
+            artifact = canonical["inputs"]["series"]
+            (Path.cwd().parent / artifact["path"]).write_text("{}")
+        if mode() == "missing_plot":
+            Path("step-response.png").unlink()
+        Path("bridge.json").write_text(
+            json.dumps(
+                {
+                    "id": execution["id"],
+                    "request_sha256": execution["request_sha256"],
+                    "artifact_paths": [
+                        "raw.mat",
+                        "runtime-metadata.json",
+                        "series.json",
+                        "step-response.png",
+                    ],
+                    "output_evidence": True,
+                    "valid": valid,
+                    "metrics": metrics,
+                    "details": details,
+                    "diagnostics": [] if valid else ["Unreliable steady state in test-only series"],
+                }
+            )
+        )
 
     def quit(self):
         increment(Path("engine-quits.txt"))

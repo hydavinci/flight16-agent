@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from ..matlab import _stop_worker
 from ..runtime.capability_metadata import Availability
 from ..runtime.contracts import fingerprint
+from ..runtime.evidence import publish_evidence, verify_evidence
 from ..runtime.observations import OutputArtifact
 from ..session import _write_json
 from .artifacts import MAX_ARTIFACT_BYTES, describe_artifact
@@ -23,10 +24,13 @@ from .matlab_contracts import (
     LocalMatlabExecution,
     LocalMatlabRequest,
     LocalMatlabResult,
+    LocalMatlabStepinfoExecution,
     MatlabEntry,
     MatlabExecutionMetadata,
     MatlabSeriesPair,
+    MatlabStepinfoOutput,
     ProjectExecutionInput,
+    StepinfoInput,
 )
 from .matlab_projects import discover_matlab_project, snapshot_matlab_project
 from .projects import file_digest
@@ -83,7 +87,18 @@ def _signature(entry: MatlabEntry) -> Literal[0, 1]:
     return 1 if match[1] is not None else 0
 
 
-def _execution_request(request: LocalMatlabRequest, directory: Path) -> LocalMatlabExecution:
+def _execution_request(
+    request: LocalMatlabRequest, directory: Path
+) -> LocalMatlabExecution | LocalMatlabStepinfoExecution:
+    if isinstance(request.inputs, StepinfoInput):
+        return LocalMatlabStepinfoExecution(
+            id=request.id,
+            request_sha256=fingerprint(request.model_dump(mode="json")),
+            snapshot_root=str(directory / "project"),
+            output_directory=str(directory),
+            inputs=request.inputs,
+            series_path=str(directory / "project" / "series.json"),
+        )
     assert isinstance(request.inputs, ProjectExecutionInput) and request.project is not None
     snapshot = directory / "project"
     entry, initializer = request.inputs.entry, request.inputs.initializer
@@ -110,6 +125,17 @@ def _execution_request(request: LocalMatlabRequest, directory: Path) -> LocalMat
         if initializer is not None
         else [],
     )
+
+
+def _stepinfo_source(request: LocalMatlabRequest, directory: Path) -> Path:
+    assert isinstance(request.inputs, StepinfoInput)
+    if request.input_evidence != [request.inputs.series]:
+        raise ValueError("stepinfo requires its exact series input evidence")
+    path = verify_evidence(directory.parent, request.inputs.series)
+    series = _read_model(path, MatlabSeriesPair)
+    if series.input.time_unit != "s" or series.response.time_unit != "s":
+        raise ValueError("stepinfo requires actual normalized time units in seconds")
+    return path
 
 
 def _output_bounds(directory: Path) -> None:
@@ -150,7 +176,7 @@ def _verify_result(request: LocalMatlabRequest, result: LocalMatlabResult, direc
         actual = describe_artifact(directory, item.path)
         if (actual.sha256, actual.size) != (item.sha256, item.size):
             raise ValueError(f"Artifact digest mismatch: {item.path}")
-    if not result.valid:
+    if result.execution_status != "completed":
         return
     paths = {item.path for item in result.artifacts}
     if not {"raw.mat", "runtime-metadata.json", "metadata.json"} <= paths or not result.details.get(
@@ -162,10 +188,51 @@ def _verify_result(request: LocalMatlabRequest, result: LocalMatlabResult, direc
         metadata.id != request.id
         or metadata.request_sha256 != result.request_sha256
         or metadata.inputs != request.inputs
+        or metadata.input_evidence != request.input_evidence
         or metadata.conditions != request.inputs.conditions
         or metadata.snapshot_root != str(directory / "project")
     ):
         raise ValueError("Execution metadata identity differs from the confirmed request")
+    if isinstance(request.inputs, StepinfoInput):
+        required = {"series.json", "step-response.png"}
+        if not required <= paths:
+            raise ValueError("Missing stepinfo series/plot evidence")
+        source = request.inputs.series
+        copied = describe_artifact(directory, "series.json")
+        snapshot = describe_artifact(directory / "project", "series.json")
+        if (copied.sha256, copied.size) != (source.sha256, source.size) or (
+            snapshot.sha256,
+            snapshot.size,
+        ) != (source.sha256, source.size):
+            raise ValueError("stepinfo series differs from its input evidence")
+        measured = _read_model(directory / "bridge.json", MatlabStepinfoOutput)
+        series = _read_model(directory / "series.json", MatlabSeriesPair)
+        for role, samples in (("input", series.input), ("response", series.response)):
+            if measured.details.get(role + "_signal") != {
+                "name": samples.name,
+                "unit": samples.unit,
+            }:
+                raise ValueError("stepinfo signal identity/unit differs from the actual series")
+        if (
+            measured.id != request.id
+            or measured.request_sha256 != result.request_sha256
+            or measured.valid != result.valid
+            or measured.details.get("mode") != "stepinfo"
+            or measured.details.get("settling_band") != request.inputs.settling_band
+            or measured.details.get("steady_state_policy")
+            != request.inputs.steady_state.model_dump(mode="json")
+            or result.details.get("metrics")
+            != {name: metric.model_dump(mode="json") for name, metric in measured.metrics.items()}
+            or any(result.details.get(key) != value for key, value in measured.details.items())
+            or result.diagnostics != measured.diagnostics
+        ):
+            raise ValueError("stepinfo metrics/settings differ from the confirmed evidence")
+    if "series.json" in paths:
+        expected = next(
+            item.model_dump(mode="json") for item in result.artifacts if item.path == "series.json"
+        )
+        if result.details.get("series") != expected:
+            raise ValueError("Series reference does not match its artifact")
     if (
         isinstance(request.inputs, ProjectExecutionInput)
         and request.inputs.input_signal is not None
@@ -182,11 +249,6 @@ def _verify_result(request: LocalMatlabRequest, result: LocalMatlabResult, direc
                 raise ValueError("Series unit does not match the normalized requested unit")
             if samples.name != ".".join(selection.path):
                 raise ValueError("Series identity does not match the selected signal path")
-        expected = next(
-            item.model_dump(mode="json") for item in result.artifacts if item.path == "series.json"
-        )
-        if result.details.get("series") != expected:
-            raise ValueError("Series reference does not match its artifact")
 
 
 class LocalMatlabBackend:
@@ -278,23 +340,29 @@ class LocalMatlabBackend:
         _write_json(directory / "state.json", state.model_dump(mode="json"))
         status: Literal["failed", "unknown", "interrupted"] = "failed"
         try:
-            if request.operation != "execute_project":
-                raise ValueError("stepinfo execution is not implemented by the project bridge")
-            assert isinstance(request.inputs, ProjectExecutionInput) and request.project is not None
-            for entry in (request.inputs.entry, request.inputs.initializer):
-                if entry is not None:
-                    _signature(entry)
-                    if entry.kind == "script" and any(
-                        item.path == Path(entry.path).with_suffix(".p").as_posix()
-                        for item in request.project.files
-                    ):
-                        raise ValueError(
-                            f"Unsupported selected script with same-stem P-file: {entry.path}"
-                        )
+            if isinstance(request.inputs, ProjectExecutionInput):
+                assert request.project is not None
+                for entry in (request.inputs.entry, request.inputs.initializer):
+                    if entry is not None:
+                        _signature(entry)
+                        if entry.kind == "script" and any(
+                            item.path == Path(entry.path).with_suffix(".p").as_posix()
+                            for item in request.project.files
+                        ):
+                            raise ValueError(
+                                f"Unsupported selected script with same-stem P-file: {entry.path}"
+                            )
+            else:
+                _stepinfo_source(request, directory)
             available = self.availability()
             if available.state != "available":
                 raise ValueError(available.reason)
-            snapshot_matlab_project(request.project, directory / "project")
+            if request.project is not None:
+                snapshot_matlab_project(request.project, directory / "project")
+            else:
+                source = _stepinfo_source(request, directory)
+                publish_evidence(directory / "project", "series.json", source.read_bytes())
+                _stepinfo_source(request, directory)
             execution = _execution_request(request, directory)
             _write_json(directory / "execution.json", execution.model_dump(mode="json"))
             _output_bounds(directory)
@@ -335,8 +403,12 @@ class LocalMatlabBackend:
             state = state.model_copy(update={"worker_exit_confirmed": True})
             _write_json(directory / "state.json", state.model_dump(mode="json"))
             result = self._receipt(request, directory)
-            if discover_matlab_project(request.project.root) != request.project:
+            if request.project is not None and (
+                discover_matlab_project(request.project.root) != request.project
+            ):
                 raise ValueError("Source project changed during execution; review required")
+            if isinstance(request.inputs, StepinfoInput):
+                _stepinfo_source(request, directory)
             return self._finish(directory, state, result, receipt=True)
         except (OSError, ValueError) as exc:
             result = LocalMatlabResult(
@@ -407,7 +479,7 @@ class LocalMatlabBackend:
                 if (directory / "result.json").exists():
                     local_result = _read_model(directory / "result.json", LocalMatlabResult)
                     _verify_result(request, local_result, directory)
-                    if not local_result.valid:
+                    if local_result.execution_status != "completed":
                         return self._finish(directory, state, local_result)
                 if not state.worker_exit_confirmed:
                     raise ValueError(
@@ -425,6 +497,10 @@ class LocalMatlabBackend:
                 or result.execution_status != state.status
             ):
                 raise ValueError("Saved terminal result digest/state mismatch")
+            if result.execution_status == "completed" and (
+                not state.worker_exit_confirmed or result.details.get("engine_closed") is not True
+            ):
+                raise ValueError("Unconfirmed worker termination or Engine cleanup")
             _verify_result(request, result, directory)
             return result
         except (OSError, ValueError) as exc:

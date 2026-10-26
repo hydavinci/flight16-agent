@@ -6,7 +6,7 @@ from pydantic import ConfigDict, Field, JsonValue, ValidationInfo, field_validat
 
 from ..models import Contract, FiniteNumber, Nonempty
 from ..runtime.contracts import Digest, RunId
-from ..runtime.observations import OutputArtifact
+from ..runtime.observations import MetricValue, OutputArtifact
 from ..upload_models import MAX_RESULT, finite_json
 from .contracts import FileDigest, SteadyStatePolicy, matlab_identifier, relative_path
 from .intake import safe_directory
@@ -174,7 +174,7 @@ class LocalMatlabRequest(_MatlabContract):
     @model_validator(mode="after")
     def matched_operation(self) -> Self:
         if self.operation == "stepinfo":
-            if not isinstance(self.inputs, StepinfoInput):
+            if not isinstance(self.inputs, StepinfoInput) or self.project is not None:
                 raise ValueError("stepinfo requires StepinfoInput")
             return self
         if not isinstance(self.inputs, ProjectExecutionInput) or self.project is None:
@@ -248,6 +248,15 @@ class LocalMatlabExecution(_MatlabContract):
     initializer_arguments: list[str]
 
 
+class LocalMatlabStepinfoExecution(_MatlabContract):
+    id: RunId
+    request_sha256: Digest
+    snapshot_root: Nonempty
+    output_directory: Nonempty
+    inputs: StepinfoInput
+    series_path: Nonempty
+
+
 class MatlabRuntimeMetadata(_MatlabContract):
     id: RunId
     request_sha256: Digest
@@ -267,7 +276,8 @@ class MatlabRuntimeMetadata(_MatlabContract):
 
 
 class MatlabExecutionMetadata(MatlabRuntimeMetadata):
-    inputs: ProjectExecutionInput
+    inputs: ProjectExecutionInput | StepinfoInput
+    input_evidence: list[OutputArtifact] = []
     conditions: dict[str, JsonValue]
     input_provenance: Literal["canonical_request"]
 
@@ -306,3 +316,23 @@ class MatlabProjectOutput(_MatlabContract):
     def bounded_details(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
         _bounded_json(value, MAX_RESULT)
         return value
+
+
+class MatlabStepinfoOutput(MatlabProjectOutput):
+    valid: bool
+    metrics: dict[Literal["overshoot", "settling_time"], MetricValue]
+
+    @model_validator(mode="after")
+    def measured_metrics(self) -> Self:
+        if self.valid:
+            if set(self.metrics) != {"overshoot", "settling_time"}:
+                raise ValueError("Valid stepinfo requires both actual metrics")
+            for name, metric in self.metrics.items():
+                unit = "%" if name == "overshoot" else "s"
+                if not metric.valid or metric.value is None or metric.unit != unit:
+                    raise ValueError("stepinfo requires finite metrics in declared units")
+                if metric.value < 0:
+                    raise ValueError("stepinfo metrics cannot be negative")
+        elif not self.diagnostics or any(metric.valid for metric in self.metrics.values()):
+            raise ValueError("Invalid stepinfo requires diagnostics and no valid metrics")
+        return self

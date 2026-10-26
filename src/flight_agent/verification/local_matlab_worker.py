@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 from ..runtime.contracts import fingerprint
+from ..runtime.evidence import verify_evidence
 from ..runtime.observations import OutputArtifact
 from ..session import _write_json
 from .artifacts import describe_artifact
@@ -17,13 +18,14 @@ from .local_matlab import (
     _verify_result,
 )
 from .matlab_contracts import (
-    LocalMatlabExecution,
     LocalMatlabRequest,
     LocalMatlabResult,
     MatlabExecutionMetadata,
     MatlabProjectOutput,
     MatlabRuntimeMetadata,
+    MatlabStepinfoOutput,
     ProjectExecutionInput,
+    StepinfoInput,
 )
 from .matlab_projects import discover_matlab_project
 
@@ -36,18 +38,21 @@ def _child(directory: Path) -> None:
     request = _read_model(directory / "request.json", LocalMatlabRequest, MAX_REQUEST_BYTES)
     if os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") != "1":
         raise ValueError("Set MATLAB_ALLOW_TRUSTED_PROJECTS=1")
-    if request.operation != "execute_project" or not isinstance(
-        request.inputs, ProjectExecutionInput
-    ):
-        raise ValueError("Unsupported local MATLAB operation")
     digest = fingerprint(request.model_dump(mode="json"))
-    execution = _read_model(directory / "execution.json", LocalMatlabExecution, MAX_REQUEST_BYTES)
-    if execution != _execution_request(request, directory):
+    expected = _execution_request(request, directory)
+    execution = _read_model(directory / "execution.json", type(expected), MAX_REQUEST_BYTES)
+    if execution != expected:
         raise ValueError("Execution locators/identity differ from the confirmed request")
-    assert request.project is not None
-    snapshot = discover_matlab_project(execution.snapshot_root)
-    if snapshot.model_copy(update={"root": request.project.root}) != request.project:
-        raise ValueError("Prepared snapshot changed before Engine execution")
+    if request.project is not None:
+        snapshot = discover_matlab_project(execution.snapshot_root)
+        if snapshot.model_copy(update={"root": request.project.root}) != request.project:
+            raise ValueError("Prepared snapshot changed before Engine execution")
+    else:
+        assert isinstance(request.inputs, StepinfoInput)
+        verify_evidence(
+            Path(execution.snapshot_root),
+            request.inputs.series.model_copy(update={"path": "series.json"}),
+        )
     engine = None
     result = LocalMatlabResult(
         id=request.id, request_sha256=digest, execution_status="failed", valid=False
@@ -57,7 +62,11 @@ def _child(directory: Path) -> None:
         engine = module.start_matlab()
         engine.cd(str(_support()), nargout=0)
         engine.addpath(str(_support()), nargout=0)
-        helper = "flight_agent_run_project"
+        helper = (
+            "flight_agent_run_project"
+            if request.operation == "execute_project"
+            else "flight_agent_local_stepinfo"
+        )
         resolved = engine.which(helper, nargout=1)
         if not isinstance(resolved, str) or Path(resolved).resolve() != _support() / (
             helper + ".m"
@@ -66,20 +75,29 @@ def _child(directory: Path) -> None:
         engine.feval(helper, str(directory / "execution.json"), nargout=0)
         result = result.model_copy(update={"execution_status": "unknown"})
         _output_bounds(directory)
-        output = _read_model(directory / "bridge.json", MatlabProjectOutput)
+        output: MatlabProjectOutput = (
+            _read_model(directory / "bridge.json", MatlabStepinfoOutput)
+            if isinstance(request.inputs, StepinfoInput)
+            else _read_model(directory / "bridge.json", MatlabProjectOutput)
+        )
         if output.id != request.id or output.request_sha256 != digest:
             raise ValueError("Bridge output identity mismatch")
-        allowed = {"raw.mat", "runtime-metadata.json", "series.json", "return.json"}
+        allowed = (
+            {"raw.mat", "runtime-metadata.json", "series.json", "step-response.png"}
+            if isinstance(request.inputs, StepinfoInput)
+            else {"raw.mat", "runtime-metadata.json", "series.json", "return.json"}
+        )
         if len(set(output.artifact_paths)) != len(output.artifact_paths):
             raise ValueError("Duplicate output artifact")
         if not set(output.artifact_paths) <= allowed:
             raise ValueError("Unexpected output artifact")
-        if request.inputs.input_signal is None and "series.json" in output.artifact_paths:
-            raise ValueError("Series output requires confirmed signal selections")
-        if request.inputs.input_signal is not None:
-            if "series.json" not in output.artifact_paths:
-                raise ValueError("Missing requested series")
-            _normalize_series(request, directory)
+        if isinstance(request.inputs, ProjectExecutionInput):
+            if request.inputs.input_signal is None and "series.json" in output.artifact_paths:
+                raise ValueError("Series output requires confirmed signal selections")
+            if request.inputs.input_signal is not None:
+                if "series.json" not in output.artifact_paths:
+                    raise ValueError("Missing requested series")
+                _normalize_series(request, directory)
         if "runtime-metadata.json" not in output.artifact_paths:
             raise ValueError("Missing runtime metadata artifact")
         runtime = _read_model(directory / "runtime-metadata.json", MatlabRuntimeMetadata)
@@ -95,6 +113,7 @@ def _child(directory: Path) -> None:
             {
                 **runtime.model_dump(mode="json"),
                 "inputs": request.inputs.model_dump(mode="json"),
+                "input_evidence": [item.model_dump(mode="json") for item in request.input_evidence],
                 "conditions": request.inputs.conditions,
                 "input_provenance": "canonical_request",
             }
@@ -104,7 +123,18 @@ def _child(directory: Path) -> None:
         for name in [*output.artifact_paths, "metadata.json"]:
             item = describe_artifact(directory, name)
             artifacts.append(OutputArtifact(path=item.path, sha256=item.sha256, size=item.size))
-        details = {**output.details, "output_evidence": output.output_evidence}
+        details = {
+            **output.details,
+            "output_evidence": output.output_evidence,
+            "conditions": request.inputs.conditions,
+        }
+        if isinstance(output, MatlabStepinfoOutput):
+            details.update(
+                valid=output.valid,
+                metrics={
+                    name: metric.model_dump(mode="json") for name, metric in output.metrics.items()
+                },
+            )
         for artifact in artifacts:
             if artifact.path == "series.json":
                 details["series"] = artifact.model_dump(mode="json")
@@ -112,7 +142,7 @@ def _child(directory: Path) -> None:
             id=request.id,
             request_sha256=digest,
             execution_status="completed",
-            valid=True,
+            valid=output.valid if isinstance(output, MatlabStepinfoOutput) else True,
             details=details,
             diagnostics=output.diagnostics,
             artifacts=artifacts,
@@ -155,6 +185,8 @@ def main() -> int:
             if (
                 not callable(module.start_matlab)
                 or not (_support() / "flight_agent_run_project.m").is_file()
+                or not (_support() / "flight_agent_local_stepinfo.m").is_file()
+                or not (_support() / "flight_agent_step_metrics.m").is_file()
             ):
                 raise ValueError("Engine or packaged MATLAB support is unavailable")
             print(json.dumps({"available": True}))

@@ -626,3 +626,224 @@ def test_real_packaged_bridge_rejects_initializer_created_pfile(real_local_backe
     assert result.execution_status == "failed" and not result.valid
     assert "P-file" in " ".join(result.diagnostics)
     assert discover_matlab_project(str(root)) == project
+
+
+@pytest.fixture
+def stepinfo_request(tmp_path):
+    from flight_agent.runtime.evidence import describe_evidence, publish_evidence
+    from flight_agent.runtime.observations import OutputArtifact
+    from flight_agent.verification.matlab_contracts import StepinfoInput
+
+    name = "calls/" + "e" * 32 + "/published/series.json"
+    series = {
+        role: {
+            "time": [0, 1, 2, 3, 4, 5],
+            "values": values,
+            "time_unit": "s",
+            "unit": unit,
+            "name": signal,
+        }
+        for role, values, unit, signal in [
+            ("input", [0, 0, 1, 1, 1, 1], "N", "demand"),
+            ("response", [0, 0, 0, 1, 1, 1], "m", "position"),
+        ]
+    }
+    publish_evidence(tmp_path, name, json.dumps(series).encode())
+    artifact = OutputArtifact(
+        **describe_evidence(tmp_path, name).model_dump(), node_id="producer", id="series"
+    )
+    return LocalMatlabRequest(
+        id="f" * 32,
+        operation="stepinfo",
+        inputs=StepinfoInput(
+            series=artifact,
+            settling_band=0.02,
+            conditions={"empty": [], "singleton": [7], "null": None},
+        ),
+        input_evidence=[artifact],
+    )
+
+
+def test_stepinfo_uses_owned_lifecycle_and_lossless_metadata(
+    local_backend, stepinfo_request, tmp_path
+):
+    directory = tmp_path / "metric"
+    result = local_backend.execute(stepinfo_request, directory)
+    assert result.execution_status == "completed" and result.valid, result.diagnostics
+    assert result.details["mode"] == "stepinfo"
+    assert result.details["settling_band"] == 0.02
+    metadata = json.loads((directory / "metadata.json").read_text())
+    runtime = json.loads((directory / "runtime-metadata.json").read_text())
+    assert metadata["inputs"] == stepinfo_request.inputs.model_dump(mode="json")
+    assert metadata["conditions"] == stepinfo_request.inputs.conditions
+    assert "inputs" not in runtime and "conditions" not in runtime
+    assert metadata["input_provenance"] == "canonical_request"
+    assert (directory / "series.json").read_bytes() == (
+        tmp_path / stepinfo_request.inputs.series.path
+    ).read_bytes()
+    assert {item.path for item in result.artifacts} >= {
+        "raw.mat",
+        "series.json",
+        "step-response.png",
+        "metadata.json",
+        "runtime-metadata.json",
+    }
+    assert local_backend.execute(stepinfo_request, directory, resume=True) == result
+    assert (directory / "engine-starts.txt").read_text() == "1"
+    assert (directory / "engine-quits.txt").read_text() == "1"
+
+
+@pytest.mark.parametrize(
+    "mode,status",
+    [
+        ("invalid_step", "completed"),
+        ("wrong_runtime_id", "unknown"),
+        ("contradictory_runtime_inputs", "unknown"),
+        ("bad_band", "unknown"),
+        ("changed_step_source", "unknown"),
+        ("missing_plot", "unknown"),
+        ("wrong_step_signal", "unknown"),
+        ("wrong_metric_unit", "unknown"),
+        ("execution_error", "failed"),
+    ],
+)
+def test_stepinfo_invalid_and_unverified_outputs_never_become_valid(
+    local_backend, stepinfo_request, tmp_path, monkeypatch, mode, status
+):
+    monkeypatch.setenv("TEST_LOCAL_MODE", mode)
+    directory = tmp_path / "metric"
+    result = local_backend.execute(stepinfo_request, directory)
+    assert result.execution_status == status and not result.valid, result.diagnostics
+    if mode == "invalid_step":
+        assert result.artifacts and result.diagnostics
+        assert result.details["engine_closed"] is True
+    assert local_backend.execute(stepinfo_request, directory, resume=True) == result
+
+
+@pytest.mark.parametrize("damage", ["bytes", "unit", "missing", "evidence"])
+def test_stepinfo_input_is_verified_before_engine(
+    local_backend, stepinfo_request, tmp_path, damage
+):
+    from flight_agent.runtime.evidence import describe_evidence
+    from flight_agent.runtime.observations import OutputArtifact
+
+    request = stepinfo_request
+    source = tmp_path / request.inputs.series.path
+    if damage == "bytes":
+        source.write_text("{}")
+    elif damage == "missing":
+        source.unlink()
+    elif damage == "evidence":
+        request = request.model_copy(update={"input_evidence": []})
+    else:
+        series = json.loads(source.read_text())
+        series["response"]["time_unit"] = "ms"
+        source.write_text(json.dumps(series))
+        artifact = OutputArtifact(
+            **describe_evidence(tmp_path, request.inputs.series.path).model_dump(),
+            node_id="producer",
+            id="series",
+        )
+        request = request.model_copy(
+            update={
+                "inputs": request.inputs.model_copy(update={"series": artifact}),
+                "input_evidence": [artifact],
+            }
+        )
+    directory = tmp_path / "metric"
+    result = local_backend.execute(request, directory)
+    assert not result.valid and result.execution_status == "failed"
+    assert not (directory / "engine-starts.txt").exists()
+
+
+@pytest.mark.matlab
+def test_real_stepinfo_bridge_preserves_artifact_descriptor_and_legacy_default(
+    real_local_backend, stepinfo_request, tmp_path
+):
+    import math
+
+    from flight_agent.runtime.evidence import describe_evidence
+    from flight_agent.runtime.observations import OutputArtifact
+
+    # Owned synthetic data only: a boundary regression, not real-project acceptance.
+    source = tmp_path / stepinfo_request.inputs.series.path
+    samples = [index / 100 for index in range(1401)]
+    data = json.loads(source.read_text())
+    data["input"].update(time=samples, values=[0 if t < 1 else 1 for t in samples])
+    data["response"].update(
+        time=samples, values=[0 if t < 1 else 1 - math.exp(-(t - 1)) for t in samples]
+    )
+    source.write_text(json.dumps(data))
+    artifact = OutputArtifact(
+        **describe_evidence(tmp_path, stepinfo_request.inputs.series.path).model_dump(),
+        node_id="producer",
+        id=None,
+    )
+    request = stepinfo_request.model_copy(
+        update={
+            "inputs": stepinfo_request.inputs.model_copy(update={"series": artifact}),
+            "input_evidence": [artifact],
+        }
+    )
+    directory = tmp_path / "metric"
+    result = real_local_backend.execute(request, directory)
+    assert result.valid and result.execution_status == "completed", result.diagnostics
+    assert result.details["settling_band"] == 0.02
+    assert result.details["input_signal"] == {"name": "demand", "unit": "N"}
+    assert result.details["response_signal"] == {"name": "position", "unit": "m"}
+    assert result.details["metrics"]["settling_time"]["value"] > 0
+    metadata = json.loads((directory / "metadata.json").read_text())
+    assert metadata["inputs"] == request.inputs.model_dump(mode="json")
+    assert metadata["inputs"]["series"]["node_id"] == "producer"
+    assert metadata["inputs"]["series"]["id"] is None
+    assert metadata["conditions"] == {"empty": [], "singleton": [7], "null": None}
+    assert (directory / "series.json").read_bytes() == source.read_bytes()
+    assert real_local_backend.execute(request, directory, resume=True) == result
+
+    # Check the unchanged historical five-argument default in the actual language.
+    import matlab.engine
+
+    import matlab
+
+    engine = matlab.engine.start_matlab()
+    try:
+        engine.cd(
+            str(Path(__file__).resolve().parents[1] / "src/flight_agent/matlab_support"), nargout=0
+        )
+        policy = engine.jsondecode(request.inputs.steady_state.model_dump_json(), nargout=1)
+        legacy = engine.feval(
+            "flight_agent_step_metrics",
+            matlab.double(samples),
+            matlab.double(data["input"]["values"]),
+            matlab.double(samples),
+            matlab.double(data["response"]["values"]),
+            policy,
+            nargout=1,
+        )
+        assert legacy["valid"]
+        assert legacy["details"]["settling_band"] == 0.05
+        assert (
+            legacy["metrics"]["settling_time"]["value"]
+            < (result.details["metrics"]["settling_time"]["value"])
+        )
+    finally:
+        engine.quit()
+
+
+@pytest.mark.parametrize("running", [True, False])
+def test_completed_invalid_stepinfo_requires_confirmed_owned_exit_on_recovery(
+    local_backend, stepinfo_request, tmp_path, monkeypatch, running
+):
+    monkeypatch.setenv("TEST_LOCAL_MODE", "invalid_step")
+    directory = tmp_path / "metric"
+    first = local_backend.execute(stepinfo_request, directory)
+    assert first.execution_status == "completed" and not first.valid
+    state = json.loads((directory / "state.json").read_text())
+    state["worker_exit_confirmed"] = False
+    if running:
+        state.update(status="running", result_sha256=None, receipt_sha256=None)
+    (directory / "state.json").write_text(json.dumps(state))
+    result = local_backend.execute(stepinfo_request, directory, resume=True)
+    assert result.execution_status == "unknown", result.diagnostics
+    assert "unconfirmed" in " ".join(result.diagnostics).lower()
+    assert (directory / "engine-starts.txt").read_text() == "1"
