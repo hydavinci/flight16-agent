@@ -56,8 +56,8 @@ def thermal_project(tmp_path):
     return case
 
 
-@pytest.fixture
-def nonlinear_project(tmp_path, actual_backend):
+@pytest.fixture(params=["script", "base_function", "mixed"])
+def nonlinear_project(tmp_path, actual_backend, request):
     import matlab.engine
 
     case = PreparedCase(
@@ -66,13 +66,28 @@ def nonlinear_project(tmp_path, actual_backend):
     )
     (case.root / "models").mkdir(parents=True)
     (case.root / "setup").mkdir()
-    (case.root / case.initializer).write_text(
-        "% These locals must be visible to sim via SrcWorkspace=current, not base.\n"
+    initialization = (
         "feedback_gain = 2; actuator_limit = 0.5; decay_rate = 1;\n"
         "reference_level = 1; excitation_time = 1;\n"
         "horizon = 16; integration_step = 0.002;\n"
         "condition = 'limited';\n"
     )
+    if request.param == "base_function":
+        initialization = (
+            "function prepare()\n" + initialization
+            + "for name = {'feedback_gain','actuator_limit','decay_rate',"
+            "'reference_level','excitation_time','horizon','integration_step','condition'}\n"
+            "assignin('base',name{1},eval(name{1}));\nend\nend\n"
+        )
+    elif request.param == "mixed":
+        initialization += (
+            "assignin('base','actuator_limit',9);\n"
+            "assignin('base','decay_rate',decay_rate);\n"
+            "assignin('base','horizon',horizon);\n"
+            "assignin('base','integration_step',integration_step);\n"
+            "clear decay_rate horizon integration_step;\n"
+        )
+    (case.root / case.initializer).write_text(initialization)
     case.document()
     # Fixture-owned MATLAB prepares an actual nonlinear feedback model, then exits.
     engine = matlab.engine.start_matlab()
@@ -225,6 +240,32 @@ def test_actual_nonlinear_closed_loop_full_http_pipeline(
     assert details["measure"]["final_value"] == pytest.approx(0.5, abs=2e-6)
     assert record.task.result.evaluation.status == expected
     assert word.inline_shapes
+
+
+@pytest.mark.parametrize("nonlinear_project", ["base_function"], indirect=True)
+def test_actual_simulink_compile_failure_keeps_nested_causes(
+    tmp_path, monkeypatch, actual_backend, nonlinear_project,
+):
+    initializer = nonlinear_project.root / nonlinear_project.initializer
+    initializer.write_text(
+        initializer.read_text().replace("'feedback_gain','actuator_limit',", "")
+    )
+    before = discover_matlab_project(str(nonlinear_project.root))
+    app, runtime, _ = acceptance_app(
+        tmp_path / "web", monkeypatch, nonlinear_project, actual_backend,
+    )
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers, pending = propose_http(client, nonlinear_project)
+        done = confirm_http(client, headers, pending, timeout=240)
+    assert done["status"] == "failed"
+    assert "multiple causes" in done["error"]
+    assert "feedback_gain" in done["error"] and "actuator_limit" in done["error"]
+    assert len(done["error"]) <= 6000
+    task = runtime.store.get(done["id"]).task
+    assert [call.status for call in task.calls] == ["failed"]
+    assert not task.result.observations and task.result.evaluation is None
+    assert discover_matlab_project(str(nonlinear_project.root)) == before
+    print("ACTUAL Simulink compile failure: nested causes retained, no successful metrics")
 
 
 @pytest.mark.parametrize("damage", ["multistep", "nonsteady", "missing"])

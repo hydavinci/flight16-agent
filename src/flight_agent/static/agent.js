@@ -726,9 +726,12 @@ async function start() {
     $("worker-state").textContent = bootstrap.worker_configured
       ? "MATLAB Worker：已配置" : `MATLAB Worker（仅相关能力需要）：${bootstrap.worker_error}`;
     $("model-state").textContent = bootstrap.model_configured ? "LLM：已配置" : `LLM：${bootstrap.model_error}`;
-    $("local-matlab-state").textContent = bootstrap.local_matlab.state === "available"
+    const localMatlab = bootstrap.local_matlab;
+    $("local-matlab-state").textContent = localMatlab?.state === "available"
       ? "本机 MATLAB Engine：导入探测通过；启动与许可证尚未验证。"
-      : `本机 MATLAB Engine：不可用；仍可浏览目录及静态发现。${bootstrap.local_matlab.reason}`;
+      : localMatlab?.state === "unavailable"
+        ? `本机 MATLAB Engine：不可用；仍可浏览目录及静态发现。${localMatlab.reason}`
+        : "本机 MATLAB Engine：状态未知；当前后端未提供本机工程状态，请重启后端服务以加载新版功能。";
     locations = await api("/api/resource-locations");
     locations.forEach((item) => {
       const option = element("option", `${item.display_name} (${item.location})${

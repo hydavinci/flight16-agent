@@ -28,6 +28,7 @@ from flight_agent.verification.agent_planner import AgentDecision, AgentPlanner
 from flight_agent.verification.local_matlab import LocalMatlabBackend
 from flight_agent.verification.matlab_projects import discover_matlab_project
 from flight_agent.web import create_web_app
+from tests.helpers import ScriptedModel
 
 API = "/api/conversations"
 
@@ -174,7 +175,7 @@ def acceptance_draft(context, case):
 def acceptance_app(directory, monkeypatch, case, backend=None, mutate=None):
     import flight_agent.web as web
 
-    planner = AgentPlanner()
+    planner = AgentPlanner(model=ScriptedModel(responses=[]))
     contexts = []
 
     def decision(context, paths):

@@ -159,6 +159,7 @@ def local_planning_case(tmp_path, monkeypatch):
     import sys
 
     import flight_agent.web as web
+    from tests.helpers import ScriptedModel
 
     def forbidden(*args, **kwargs):
         raise AssertionError("Planning must start zero Engines")
@@ -173,7 +174,7 @@ def local_planning_case(tmp_path, monkeypatch):
     project = prepared_project(tmp_path / "source")
     backend = ControlledBackend()
     monkeypatch.setattr(LocalMatlabBackend, "from_environment", classmethod(lambda cls: backend))
-    planner = AgentPlanner()
+    planner = AgentPlanner(model=ScriptedModel(responses=[]))
     contexts = []
     proposal = {"build": local_draft}
 
@@ -217,6 +218,757 @@ def submit(case, message=REQUEST):
     return runtime.continue_submission(record.id)
 
 
+@pytest.fixture
+def documented_selection_case(local_planning_case):
+    project = local_planning_case[6]
+    for folder in ("models", "support", "setup", "tools"):
+        (project / folder).mkdir()
+    (project / "plant.slx").rename(project / "models/main.slx")
+    (project / "support/library.slx").write_bytes((project / "models/main.slx").read_bytes())
+    (project / "initialize.m").rename(project / "setup/initialize.m")
+    (project / "tools/helper.m").write_text("unused = 1;\n")
+    return local_planning_case
+
+
+def selection_document(case, declarations):
+    project = case[6]
+    (project / "README.md").write_text(
+        declarations + "\n"
+        "workspace input signal: command (deg)\n"
+        "workspace response signal: response (deg/s)\n"
+        "condition: cruise\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "declarations",
+    [
+        "使用本案例时，统一从 `models/main.slx` 进入。\n"
+        r"模型位置：`.\models\main.slx`。" "\n"
+        "唯一初始化入口是 `setup/initialize.m`。",
+        "主模型：`models/main.slx`\n初始化入口：`setup/initialize.m`",
+        r'模型位置：".\models\main.slx"' "\n" r"唯一初始化入口为 `setup\initialize.m`",
+        "Main model: `models/main.slx`\nExisting initializer: `setup/initialize.m`",
+        "Primary model is `models/main.slx`.\n" r"Initializer is `.\setup\initialize.m`.",
+        "**主模型**：`models/main.slx`\n**初始化入口**：`setup/initialize.m`",
+        'Existing model: "models/main.slx"\nInitializer path: "setup/initialize.m"',
+        "## 示例\nModel: support/library.slx\nInitializer: tools/helper.m\n"
+        "## 运行配置\n主模型：`models/main.slx`\n初始化入口：`setup/initialize.m`",
+        "主模型：`models/main.slx`，不要修改源模型。\n初始化入口：`setup/initialize.m`",
+        "Main model: `models/main.slx` (Windows or Linux).\n"
+        "Initializer: `setup/initialize.m` (do not edit).",
+        "库模型：`support/library.slx`，主模型：`models/main.slx`\n"
+        "辅助初始化入口：`tools/helper.m`，唯一初始化入口是 `setup/initialize.m`",
+        "Library model: `support/library.slx`\nMain model: `models/main.slx`\n"
+        "Auxiliary initializer: `tools/helper.m`\nInitializer: `setup/initialize.m`",
+    ],
+)
+def test_documented_roles_resolve_candidates_without_repeating_user_input(
+    documented_selection_case, declarations
+):
+    selection_document(documented_selection_case, declarations)
+    record = submit(documented_selection_case)
+    assert record.task is not None, record.messages[-1].content
+    baseline = record.task.baseline
+    assert not baseline.confirmed
+    assert baseline.nodes[0].inputs["model"] == "models/main.slx"
+    assert baseline.nodes[0].inputs["initializer"]["path"] == "setup/initialize.m"
+    _, _, _, backend, contexts, *_ = documented_selection_case
+    documentation = contexts[-1]["resources"][0]["metadata"]["project"]["settings"]["documentation"]
+    assert documentation[0]["text"].startswith(declarations + "\n")
+    assert backend.requests == []
+
+
+@pytest.mark.parametrize(
+    "declarations",
+    [
+        "候选模型：`models/main.slx`\n候选初始化入口：`setup/initialize.m`",
+        "参考模型：`models/main.slx`\n参考初始化入口：`setup/initialize.m`",
+        "例如，主模型：`models/main.slx`\n初始化入口：`setup/initialize.m`",
+        "## 示例\n主模型：`models/main.slx`\n初始化入口：`setup/initialize.m`",
+        "Example:\n```text\nModel: models/main.slx\nInitializer: setup/initialize.m\n```",
+        "不要使用模型：`models/main.slx`\n不要使用初始化入口：`setup/initialize.m`",
+        "Do not use model: models/main.slx\nDo not use initializer: setup/initialize.m",
+        "Don't use model: models/main.slx\nDon't use initializer: setup/initialize.m",
+        "如果使用主模型：`models/main.slx`\n初始化入口：`setup/initialize.m`",
+        "Maybe use model: models/main.slx\nInitializer: setup/initialize.m",
+        "Model: models/main.slx or support/library.slx\nInitializer: setup/initialize.m",
+        "Model: models/main.slx or another model\nInitializer: setup/initialize.m",
+        "Model: models/main.slx (do not use this model)\nInitializer: setup/initialize.m",
+        "主模型：`models/main.slx`（不要使用）\n初始化入口：`setup/initialize.m`",
+        "主模型：`models/main.slx` 或 `support/library.slx`\n初始化入口：`setup/initialize.m`",
+        "主模型：`models/main.slx`\n初始化入口：`setup/initialize.m` 或 `tools/helper.m`",
+        "主模型：`models/main.slx`\n模型位置：`support/library.slx`\n"
+        "初始化入口：`setup/initialize.m`",
+        "主模型：`models/main.slx`\n唯一初始化入口是 `setup/initialize.m`\n"
+        "初始化入口：`tools/helper.m`",
+    ],
+)
+def test_non_authoritative_or_conflicting_roles_still_require_clarification(
+    documented_selection_case, declarations
+):
+    selection_document(documented_selection_case, declarations)
+    record = submit(documented_selection_case)
+    assert record.task is None
+    assert documented_selection_case[3].requests == []
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "主模型：`models/missing.slx`",
+        "不要使用模型：`models/main.slx`",
+        "如果使用主模型：`models/main.slx`",
+        "Model: not models/main.slx",
+        "Model is not models/main.slx",
+        "模型不是 `models/main.slx`",
+    ],
+)
+def test_explicit_unresolved_role_blocks_single_candidate_fallback(
+    documented_selection_case, declaration
+):
+    (documented_selection_case[6] / "support/library.slx").unlink()
+    selection_document(
+        documented_selection_case, declaration + "\n初始化入口：`setup/initialize.m`"
+    )
+    record = submit(documented_selection_case)
+    assert record.task is None
+    assert documented_selection_case[3].requests == []
+
+
+@pytest.mark.parametrize("role", ["model", "initializer"])
+def test_documented_roles_reject_a_different_proposed_candidate(documented_selection_case, role):
+    selection_document(
+        documented_selection_case,
+        "主模型：`models/main.slx`\n初始化入口：`setup/initialize.m`",
+    )
+
+    def wrong_selection(context):
+        data = local_draft(context)
+        if role == "model":
+            data["nodes"][0]["inputs"]["model"] = "support/library.slx"
+        else:
+            data["nodes"][0]["inputs"]["initializer"] = next(
+                item for item in context["resources"][0]["metadata"]["project"]["entries"]
+                if item["path"] == "tools/helper.m"
+            )
+        return data
+
+    documented_selection_case[5]["build"] = wrong_selection
+    with pytest.raises(ValueError, match="已有来源"):
+        submit(documented_selection_case)
+    assert documented_selection_case[1].store.recent()[0].task is None
+    assert documented_selection_case[3].requests == []
+
+
+def structured_selection_model(case, monkeypatch, changes):
+    from tests.helpers import ScriptedModel, tool_message
+
+    calls = []
+
+    class SelectionModel(ScriptedModel):
+        def _generate(self, messages, **kwargs):
+            context = json.loads(messages[-1].content)
+            payload = {
+                "action": "plan",
+                "text": "Source-backed proposal.",
+                "plan": local_draft(deepcopy(context)),
+            }
+            index = len(calls)
+            calls.append({"context": context, "timeout": kwargs.get("timeout")})
+            changes[index](payload)
+            self.responses = [tool_message("propose_agent", payload)]
+            return super()._generate(messages, **kwargs)
+
+    planner = case[1].planner
+    monkeypatch.delattr(planner, "_decision")
+    planner.model = SelectionModel(responses=[])
+    selection_document(
+        case, "主模型：`models/main.slx`\n唯一初始化入口是 `setup/initialize.m`"
+    )
+    return calls
+
+
+def omit_proposed_initializer(payload):
+    payload["plan"]["nodes"][0]["inputs"].pop("initializer")
+
+
+def accept_proposed_selection(payload):
+    pass
+
+
+@pytest.mark.parametrize("authority", ["documentation", "configuration", "user"])
+def test_first_proposal_uses_precomputed_source_selections(
+    documented_selection_case, monkeypatch, authority
+):
+    expected = {
+        "model": "models/main.slx" if authority == "documentation" else "support/library.slx",
+        "initializer": "setup/initialize.m" if authority == "documentation" else "tools/helper.m",
+    }
+
+    def follow_sources(payload):
+        context = calls[0]["context"]
+        resource = context["resources"][0]
+        selections = context["source_selections"][resource["id"]]
+        assert selections == expected
+        inputs = payload["plan"]["nodes"][0]["inputs"]
+        inputs["model"] = selections["model"]
+        inputs["initializer"] = next(
+            entry for entry in resource["metadata"]["project"]["entries"]
+            if entry["path"] == selections["initializer"]
+        )
+        if authority == "configuration":
+            for label in ("input_signal", "response_signal"):
+                inputs[label]["source"] = "logsout"
+
+    calls = structured_selection_model(documented_selection_case, monkeypatch, [follow_sources])
+    project = documented_selection_case[6]
+    with (project / "README.md").open("a") as stream:
+        stream.write("\n模型回调调用初始化入口，通常无需手动调用。\n")
+    message = REQUEST
+    if authority == "configuration":
+        (project / "flight-agent.project.json").write_text(json.dumps({
+            "name": "Explicit source selection", **expected,
+            "input_signal": {"name": "command", "unit": "deg"},
+            "response_signal": {"name": "response", "unit": "deg/s"},
+        }))
+        readme = project / "README.md"
+        readme.write_text(readme.read_text().replace("workspace", "logsout"))
+        message = REQUEST.replace("workspace", "logsout")
+    elif authority == "user":
+        message += (
+            " Existing model: support/library.slx. Existing initializer: tools/helper.m."
+        )
+    record = submit(documented_selection_case, message)
+    assert record.task is not None, record.error or record.messages[-1].content
+    assert len(calls) == 1
+    assert "validation_feedback" not in calls[0]["context"]
+    assert record.pending_decision.kind == "confirm_baseline"
+    assert not record.task.baseline.confirmed
+    assert record.task.baseline.nodes[0].inputs["initializer"]["path"] == expected["initializer"]
+    assert record.task.baseline.requirements.criteria[0].source.quote == message
+    assert documented_selection_case[3].requests == []
+
+
+@pytest.mark.parametrize("case", ["conflicting", "denied", "inventory", "positive-and-denied"])
+def test_first_proposal_does_not_invent_unresolved_source_constraints(
+    documented_selection_case, monkeypatch, case
+):
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch, [accept_proposed_selection]
+    )
+    declarations = {
+        "conflicting": "初始化入口：setup/initialize.m\n初始化入口：tools/helper.m",
+        "denied": "不要使用初始化入口：setup/initialize.m",
+        "inventory": "",
+        "positive-and-denied": (
+            "初始化入口：setup/initialize.m\n不要使用初始化入口：setup/initialize.m"
+        ),
+    }
+    selection_document(
+        documented_selection_case, "主模型：models/main.slx\n" + declarations[case]
+    )
+    record = submit(documented_selection_case)
+    resource_id = calls[0]["context"]["resources"][0]["id"]
+    selections = calls[0]["context"].get("source_selections", {}).get(resource_id, {})
+    assert selections == {"model": "models/main.slx"}
+    assert record.task is None
+    assert record.pending_decision.kind == "clarify"
+    assert len(calls) == 1
+    assert documented_selection_case[3].requests == []
+
+
+@pytest.mark.parametrize("damage", ["location", "version", "fingerprint", "descriptor"])
+def test_source_constraints_require_the_exact_local_resource(local_planning_case, damage):
+    from flight_agent.verification.agent_planner import _source_selections
+
+    resource = local_planning_case[2]
+    original = resource.model_dump(mode="json")
+    assert _source_selections({resource.id: resource}, {})[resource.id]["initializer"] == (
+        "initialize.m"
+    )
+    updates = {
+        "location": {"location": "worker"},
+        "version": {"version": "2"},
+        "fingerprint": {"fingerprint": "f" * 64},
+        "descriptor": {"metadata": {"project": {}}},
+    }
+    changed = resource.model_copy(update=updates[damage])
+    assert _source_selections({resource.id: changed}, {}) == {}
+    assert resource.model_dump(mode="json") == original
+    assert local_planning_case[3].requests == []
+
+
+def test_source_constraints_do_not_promote_inventory_only_candidates(local_planning_case):
+    from flight_agent.verification.agent_planner import _source_selections
+
+    (local_planning_case[6] / "README.md").unlink()
+    runtime = local_planning_case[1]
+    resource = runtime.resources.inspect("matlab_project", str(local_planning_case[6]))
+    assert len(resource.metadata["project"]["models"]) == 1
+    assert len(resource.metadata["project"]["entries"]) == 1
+    assert _source_selections({resource.id: resource}, {}) == {}
+    assert local_planning_case[3].requests == []
+
+
+@pytest.mark.parametrize(
+    "selection", ["missing-initializer", "missing-model", "wrong-initializer", "wrong-model"]
+)
+def test_source_selection_proposal_is_corrected_before_user_confirmation(
+    documented_selection_case, monkeypatch, selection
+):
+    def broken(payload):
+        inputs = payload["plan"]["nodes"][0]["inputs"]
+        if selection == "missing-initializer":
+            inputs.pop("initializer")
+        elif selection == "missing-model":
+            inputs.pop("model")
+        elif selection == "wrong-initializer":
+            inputs["initializer"].update(path="tools/helper.m")
+        else:
+            inputs["model"] = "support/library.slx"
+
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch, [broken, accept_proposed_selection]
+    )
+    record = submit(documented_selection_case)
+    assert record.task is not None, record.error or record.messages[-1].content
+    assert not record.task.baseline.confirmed
+    assert record.pending_decision.kind == "confirm_baseline"
+    inputs = record.task.baseline.nodes[0].inputs
+    assert inputs["model"] == "models/main.slx"
+    assert inputs["initializer"]["path"] == "setup/initialize.m"
+    assert len(calls) == 2
+    original = calls[0]["context"]
+    corrected = deepcopy(calls[1]["context"])
+    feedback = corrected.pop("validation_feedback")
+    assert corrected == original
+    expected = "models/main.slx" if selection.endswith("model") else "setup/initialize.m"
+    assert feedback["errors"][0]["expected_selection"] == expected
+    assert record.task.baseline.requirements.criteria[0].source.quote == REQUEST
+    assert documented_selection_case[3].requests == []
+
+
+def test_missing_source_backed_analysis_entry_is_corrected_before_confirmation(
+    documented_selection_case, monkeypatch
+):
+    def entry_mode(payload):
+        inputs = payload["plan"]["nodes"][0]["inputs"]
+        inputs["mode"] = "entry"
+        inputs.pop("model")
+        inputs["entry"] = {"path": "tools/helper.m", "kind": "script"}
+
+    def missing_entry(payload):
+        entry_mode(payload)
+        payload["plan"]["nodes"][0]["inputs"].pop("entry")
+
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch, [missing_entry, entry_mode]
+    )
+    selection_document(
+        documented_selection_case,
+        "Existing analysis entry: tools/helper.m\n"
+        "Existing initializer: setup/initialize.m",
+    )
+    record = submit(documented_selection_case)
+    assert record.task is not None, record.error or record.messages[-1].content
+    assert record.pending_decision.kind == "confirm_baseline"
+    assert not record.task.baseline.confirmed
+    assert record.task.baseline.nodes[0].inputs["entry"]["path"] == "tools/helper.m"
+    assert len(calls) == 2
+    assert calls[1]["context"]["validation_feedback"]["errors"] == [{
+        "location": ["entry"],
+        "code": "source_selection_mismatch",
+        "expected_selection": "tools/helper.m",
+    }]
+    assert documented_selection_case[3].requests == []
+
+
+def test_source_selection_proposal_failure_is_not_reported_as_user_ambiguity(
+    documented_selection_case, monkeypatch
+):
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch,
+        [omit_proposed_initializer, omit_proposed_initializer],
+    )
+    with pytest.raises(ValueError, match="未生成"):
+        submit(documented_selection_case)
+    assert documented_selection_case[1].store.recent()[0].task is None
+    assert len(calls) == 2
+    assert documented_selection_case[3].requests == []
+
+
+@pytest.mark.parametrize("format_first", [False, True])
+def test_source_selection_and_format_errors_share_one_correction(
+    documented_selection_case, monkeypatch, format_first
+):
+    def bad_format(payload):
+        payload.pop("plan")
+
+    changes = [bad_format, omit_proposed_initializer] if format_first else [
+        omit_proposed_initializer, bad_format
+    ]
+    calls = structured_selection_model(documented_selection_case, monkeypatch, changes)
+    with pytest.raises(ValueError, match="未生成"):
+        submit(documented_selection_case)
+    assert documented_selection_case[1].store.recent()[0].task is None
+    assert len(calls) == 2
+    assert documented_selection_case[3].requests == []
+
+
+def test_source_selection_correction_does_not_retry_real_source_ambiguity(
+    documented_selection_case, monkeypatch
+):
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch, [accept_proposed_selection]
+    )
+    selection_document(
+        documented_selection_case,
+        "主模型：`models/main.slx`\n初始化入口：`setup/initialize.m`\n"
+        "初始化入口：`tools/helper.m`",
+    )
+    record = submit(documented_selection_case)
+    assert record.task is None
+    assert record.pending_decision.kind == "clarify"
+    assert len(calls) == 1
+    assert documented_selection_case[3].requests == []
+
+
+@pytest.mark.parametrize("role", ["model", "entry"])
+def test_missing_required_selection_does_not_resolve_conflicting_sources(
+    documented_selection_case, monkeypatch, role
+):
+    def missing_selection(payload):
+        inputs = payload["plan"]["nodes"][0]["inputs"]
+        inputs.pop("model")
+        if role == "entry":
+            inputs["mode"] = "entry"
+
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch, [missing_selection]
+    )
+    declarations = (
+        "Existing model: models/main.slx\nExisting model: support/library.slx"
+        if role == "model"
+        else "Existing analysis entry: setup/initialize.m\n"
+        "Existing analysis entry: tools/helper.m"
+    )
+    selection_document(
+        documented_selection_case, declarations + "\nExisting initializer: setup/initialize.m"
+    )
+    record = submit(documented_selection_case)
+    assert record.task is None
+    assert record.pending_decision.kind == "clarify"
+    assert len(calls) == 1
+    assert documented_selection_case[3].requests == []
+
+
+@pytest.mark.parametrize("elapsed,expected_calls", [(4, 2), (11, 1)])
+def test_source_selection_correction_shares_original_timeout(
+    documented_selection_case, monkeypatch, elapsed, expected_calls
+):
+    import flight_agent.verification.agent_planner as planner_module
+
+    clock = [100.0]
+    monkeypatch.setattr(planner_module, "monotonic", lambda: clock[0])
+
+    def delayed(payload):
+        clock[0] += elapsed
+        omit_proposed_initializer(payload)
+
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch, [delayed, accept_proposed_selection]
+    )
+    runtime = documented_selection_case[1]
+    original = runtime.planner
+    runtime.planner = original.with_timeout(10)
+    if expected_calls == 2:
+        record = submit(documented_selection_case)
+        assert record.task is not None, record.error
+        assert [item["timeout"] for item in calls] == [10, 6]
+    else:
+        with pytest.raises(ValueError, match="总超时"):
+            submit(documented_selection_case)
+        assert runtime.store.recent()[0].task is None
+    assert len(calls) == expected_calls
+    assert original._timeout_seconds is None
+    assert documented_selection_case[3].requests == []
+
+
+def test_source_selection_correction_respects_context_limit(
+    documented_selection_case, monkeypatch
+):
+    import flight_agent.verification.agent_planner as planner_module
+
+    def too_large(payload):
+        context_size = len(json.dumps(calls[0]["context"], ensure_ascii=False).encode("utf-8"))
+        monkeypatch.setattr(planner_module, "MAX_CONTEXT_BYTES", context_size + 1)
+        omit_proposed_initializer(payload)
+
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch,
+        [too_large, accept_proposed_selection],
+    )
+    with pytest.raises(ValueError, match="大小限制"):
+        submit(documented_selection_case)
+    assert len(calls) == 1
+    assert documented_selection_case[1].store.recent()[0].task is None
+    assert documented_selection_case[3].requests == []
+
+
+@pytest.mark.parametrize("violation", ["signal-unit", "unregistered-tool"])
+def test_source_selection_correction_revalidates_the_entire_plan(
+    documented_selection_case, monkeypatch, violation
+):
+    def still_invalid(payload):
+        if violation == "signal-unit":
+            payload["plan"]["nodes"][0]["inputs"]["response_signal"]["unit"] = "invented"
+        else:
+            payload["plan"]["nodes"][0]["tool"] = "unregistered"
+
+    calls = structured_selection_model(
+        documented_selection_case, monkeypatch, [omit_proposed_initializer, still_invalid]
+    )
+    if violation == "unregistered-tool":
+        with pytest.raises(ValueError, match="not registered"):
+            submit(documented_selection_case)
+    else:
+        record = submit(documented_selection_case)
+        assert record.task is None
+        assert record.pending_decision.kind == "clarify"
+    assert len(calls) == 2
+    assert documented_selection_case[1].store.recent()[0].task is None
+    assert documented_selection_case[3].requests == []
+
+
+SIGNAL_TABLE_REQUEST = (
+    "Analyze the existing closed-loop step response; condition: cruise. "
+    "Use stepinfo settling band 5%; overshoot <=10%; settling_time <=3 s. Deliver JSON and Word."
+)
+SIGNAL_TABLE = (
+    "| 日志名 | 含义 | 单位 |\n"
+    "| --- | --- | --- |\n"
+    "| `command` | 实际进入控制器的激励 | deg |\n"
+    "| `response` | 真实被控对象响应 | deg/s |\n"
+    "| `step_time_s` | 配置的阶跃时刻 | s |\n"
+)
+
+
+def signal_table_document(case, content):
+    (case[6] / "README.md").write_text(
+        "Existing model: plant.slx\nExisting initializer: initialize.m\ncondition: cruise\n\n"
+        + content
+    )
+
+
+@pytest.fixture
+def signal_table_case(local_planning_case):
+    def logged(context):
+        data = local_draft(context)
+        for label in ("input_signal", "response_signal"):
+            data["nodes"][0]["inputs"][label]["source"] = "logsout"
+        return data
+
+    local_planning_case[5]["build"] = logged
+    return local_planning_case
+
+
+@pytest.mark.parametrize(
+    "content,namespace",
+    [
+        (
+            "## 信号记录\n\nGUI 工作区变量为 `out`，数据字段 `out.logsout`，"
+            "格式为 `Simulink.SimulationData.Dataset`。\n\n" + SIGNAL_TABLE,
+            "logsout",
+        ),
+        (
+            "## Signal logging\nSignals are recorded in `out.logsout` "
+            "(`Simulink.SimulationData.Dataset`).\n\n"
+            "| Signal name | Meaning | Units |\n"
+            "| :--- | --- | ---: |\n"
+            '| "command" | Actual excitation | `deg` |\n'
+            "| **response** | Actual response | deg/s |\n",
+            "logsout",
+        ),
+        (
+            "## 信号记录\n信号保存在 `out.logsout` Dataset。\n\n### 日志清单\n\n"
+            + SIGNAL_TABLE,
+            "logsout",
+        ),
+        (
+            "## Signals\nThe following signals are in the base workspace.\n\n" + SIGNAL_TABLE,
+            "workspace",
+        ),
+        (
+            "| 信号名称 | 来源 | 单位 |\n| --- | --- | --- |\n"
+            "| command | out.logsout | deg |\n| response | logsout | deg/s |\n",
+            "logsout",
+        ),
+        (
+            "Reference signals are recorded in `logsout`.\n\n"
+            + SIGNAL_TABLE.replace("实际进入控制器的激励", "Reference command"),
+            "logsout",
+        ),
+        (
+            "Signals are recorded in `logsout`.\n\n"
+            "| Signal | Role | Unit |\n| --- | --- | --- |\n"
+            "| command | input | deg |\n| response | output | deg/s |\n"
+            "| step_time_s | metadata | s |\n",
+            "logsout",
+        ),
+    ],
+)
+def test_documented_signal_tables_produce_unconfirmed_plan(signal_table_case, content, namespace):
+    signal_table_document(signal_table_case, content)
+    original_build = signal_table_case[5]["build"]
+
+    def selected(context):
+        data = original_build(context)
+        for label in ("input_signal", "response_signal"):
+            data["nodes"][0]["inputs"][label]["source"] = namespace
+        return data
+
+    signal_table_case[5]["build"] = selected
+    record = submit(signal_table_case, SIGNAL_TABLE_REQUEST)
+    assert record.task is not None, record.messages[-1].content
+    assert not record.task.baseline.confirmed
+    inputs = record.task.baseline.nodes[0].inputs
+    assert inputs["input_signal"] == {
+        "source": namespace,
+        "path": ["command"],
+        "unit": "deg",
+    }
+    assert inputs["response_signal"] == {
+        "source": namespace,
+        "path": ["response"],
+        "unit": "deg/s",
+    }
+    documentation = signal_table_case[4][-1]["resources"][0]["metadata"]["project"]["settings"]
+    assert documentation["documentation"][0]["text"].endswith(content)
+    assert signal_table_case[3].requests == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        SIGNAL_TABLE,
+        "Signals may be recorded in `logsout`.\n\n" + SIGNAL_TABLE,
+        "Signals are not recorded in `logsout`.\n\n" + SIGNAL_TABLE,
+        "Example: signals are recorded in `logsout`.\n\n" + SIGNAL_TABLE,
+        "## Examples\nSignals are recorded in `logsout`.\n\n" + SIGNAL_TABLE,
+        "Example:\n```text\nSignals are recorded in `logsout`.\n\n" + SIGNAL_TABLE + "```\n",
+        "## Logs\nSignals are recorded in `logsout`.\n\n## Other signals\n\n" + SIGNAL_TABLE,
+        "Signals are recorded in `logsout` and in the workspace.\n\n" + SIGNAL_TABLE,
+        "Signals are recorded in `logsout`.\n\n"
+        + SIGNAL_TABLE.replace("| `response` |", "| `different` |"),
+        "Signals are recorded in `logsout`.\n\n"
+        + SIGNAL_TABLE.replace("| deg/s |", "| rad/s |"),
+        "Signals are recorded in `logsout`.\n\n"
+        + SIGNAL_TABLE + "| `response` | Conflicting unit | rad/s |\n",
+        "Signals are recorded in `logsout`.\n\n"
+        + SIGNAL_TABLE.replace("| --- | --- | --- |\n", ""),
+        "Signals are recorded in `logsout`.\n\n"
+        "| Signal | Role | Unit |\n| --- | --- | --- |\n"
+        "| command | response | deg |\n| response | input | deg/s |\n",
+        "Signals are recorded in `logsout`.\n\n"
+        "| Signal | Source | Unit |\n| --- | --- | --- |\n"
+        "| command | csv | deg |\n| response | csv | deg/s |\n",
+        "Signals are recorded in `logsout`.\n\n"
+        + SIGNAL_TABLE.replace("| deg/s |", "| unknown |"),
+        "Signals are recorded in `logsout`.\n\n"
+        "| Signal | Unit | Unit |\n| --- | --- | --- |\n"
+        "| command | rad | deg |\n| response | rad/s | deg/s |\n",
+    ],
+)
+def test_unproven_or_conflicting_signal_tables_require_clarification(signal_table_case, content):
+    signal_table_document(signal_table_case, content)
+    record = submit(signal_table_case, SIGNAL_TABLE_REQUEST)
+    assert record.task is None
+    assert record.pending_decision.kind == "clarify"
+    assert signal_table_case[3].requests == []
+
+
+def test_documented_signal_table_does_not_override_explicit_role(signal_table_case):
+    signal_table_document(
+        signal_table_case,
+        "logsout input signal: different (deg)\n"
+        "Signals are recorded in `logsout`.\n\n" + SIGNAL_TABLE,
+    )
+    record = submit(signal_table_case, SIGNAL_TABLE_REQUEST)
+    assert record.task is None
+    assert signal_table_case[3].requests == []
+
+
+def test_documented_signal_table_does_not_allow_a_different_namespace(signal_table_case):
+    signal_table_document(
+        signal_table_case, "Signals are recorded in `logsout`.\n\n" + SIGNAL_TABLE
+    )
+    signal_table_case[5]["build"] = local_draft
+    record = submit(signal_table_case, SIGNAL_TABLE_REQUEST)
+    assert record.task is None
+    assert signal_table_case[3].requests == []
+
+
+def test_documented_signal_table_source_does_not_leak_between_files(signal_table_case):
+    signal_table_document(signal_table_case, SIGNAL_TABLE)
+    (signal_table_case[6] / "README-logging.md").write_text("Signals are recorded in `logsout`.")
+    record = submit(signal_table_case, SIGNAL_TABLE_REQUEST)
+    assert record.task is None
+    assert signal_table_case[3].requests == []
+
+
+@pytest.mark.parametrize("unit", ["-", "unknown", "未知", "?"])
+def test_documented_signal_table_requires_known_units(signal_table_case, unit):
+    signal_table_document(
+        signal_table_case,
+        "Signals are recorded in `logsout`.\n\n"
+        + SIGNAL_TABLE.replace("| deg/s |", f"| {unit} |"),
+    )
+    original_build = signal_table_case[5]["build"]
+
+    def unknown_units(context):
+        data = original_build(context)
+        data["nodes"][0]["inputs"]["response_signal"]["unit"] = unit
+        return data
+
+    signal_table_case[5]["build"] = unknown_units
+    record = submit(signal_table_case, SIGNAL_TABLE_REQUEST)
+    assert record.task is None
+    assert signal_table_case[3].requests == []
+
+
+def test_documented_signal_table_supports_existing_function_return(signal_table_case):
+    (signal_table_case[6] / "analyze.m").write_text(
+        "function result = analyze()\nresult = struct;\nend\n"
+    )
+    signal_table_document(
+        signal_table_case,
+        "Analysis entry: analyze.m\n\n"
+        "The following signals are returned by the existing function.\n\n" + SIGNAL_TABLE,
+    )
+
+    def returned(context):
+        data = local_draft(context)
+        entries = context["resources"][0]["metadata"]["project"]["entries"]
+        execute = data["nodes"][0]["inputs"]
+        execute.update(
+            mode="entry",
+            entry=next(item for item in entries if item["path"] == "analyze.m"),
+            initializer=next(item for item in entries if item["path"] == "initialize.m"),
+        )
+        execute.pop("model")
+        for label in ("input_signal", "response_signal"):
+            execute[label]["source"] = "return"
+        return data
+
+    signal_table_case[5]["build"] = returned
+    record = submit(signal_table_case, SIGNAL_TABLE_REQUEST)
+    assert record.task is not None, record.messages[-1].content
+    assert not record.task.baseline.confirmed
+    assert record.task.baseline.nodes[0].inputs["input_signal"]["source"] == "return"
+    assert signal_table_case[3].requests == []
+
+
 def test_local_resource_does_not_require_worker(local_planning_case):
     _, runtime, resource, backend, *_ = local_planning_case
     assert resource is not None, "Local resource missing from default Web assembly"
@@ -234,6 +986,21 @@ def test_local_resource_does_not_require_worker(local_planning_case):
     locations = {item.id: item for item in runtime.resources.locations()}
     assert locations["simulink_project"].location == "worker"
     assert locations["diagnostic_data"].location == "agent"
+
+
+def test_multi_output_default_initializer_reaches_unconfirmed_plan(local_planning_case):
+    _, _, _, backend, _, _, project = local_planning_case
+    (project / "initialize.m").write_text(
+        "function [point, selection] = initialize(folder)\n"
+        "if nargin == 0\nfolder = fileparts(mfilename('fullpath'));\nend\n"
+        "point = 1;\nselection = folder;\nend\n"
+    )
+    record = submit(local_planning_case)
+    assert record.task is not None, record.messages[-1].content
+    baseline = record.task.baseline
+    assert not baseline.confirmed
+    assert baseline.nodes[0].inputs["initializer"]["arguments"] == []
+    assert backend.requests == []
 
 
 def test_provenance_private_locator_and_four_node_bindings(local_planning_case):
@@ -302,7 +1069,7 @@ def test_invalid_actual_proposals_stop_before_confirmation(local_planning_case, 
         (project / "initialize.m").write_text(
             {
                 "arity": "function initialize(required)\nend\n",
-                "outputs": "function [a,b] = initialize()\nend\n",
+                "outputs": "function [a,varargout] = initialize()\nend\n",
                 "return-without-output": "function initialize()\nend\n",
             }[damage]
         )
@@ -356,9 +1123,14 @@ def test_invalid_actual_proposals_stop_before_confirmation(local_planning_case, 
         return data
 
     proposal["build"] = broken
-    record = submit(local_planning_case, message)
-    assert record.task is None
-    assert record.pending_decision.kind in {"clarify", "capability_gap"}
+    if damage == "omitted-initializer":
+        with pytest.raises(ValueError, match="已有来源"):
+            submit(local_planning_case, message)
+        assert local_planning_case[1].store.recent()[0].task is None
+    else:
+        record = submit(local_planning_case, message)
+        assert record.task is None
+        assert record.pending_decision.kind in {"clarify", "capability_gap"}
     assert not backend.requests
 
 
@@ -860,13 +1632,18 @@ def test_entry_mode_requires_only_the_attributed_initializer(
         return data
 
     proposal["build"] = analysis
-    record = submit(local_planning_case, message)
-    if selection == "explicit":
-        assert record.task is not None, record.pending_decision
-        assert record.task.baseline.nodes[0].inputs["initializer"]["path"] == "initialize.m"
+    if selection == "omitted":
+        with pytest.raises(ValueError, match="已有来源"):
+            submit(local_planning_case, message)
+        assert local_planning_case[1].store.recent()[0].task is None
     else:
-        assert record.task is None
-        assert record.pending_decision.kind == "clarify"
+        record = submit(local_planning_case, message)
+        if selection == "explicit":
+            assert record.task is not None, record.pending_decision
+            assert record.task.baseline.nodes[0].inputs["initializer"]["path"] == "initialize.m"
+        else:
+            assert record.task is None
+            assert record.pending_decision.kind == "clarify"
     assert not backend.requests
 
 

@@ -140,6 +140,23 @@ def test_model_mode_keeps_initializer_and_existing_settings(local_backend, local
     assert metadata["matlab_version"] == "test-only-engine"
 
 
+def test_execution_failure_includes_bounded_nested_matlab_causes(
+    local_backend, local_request, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TEST_LOCAL_MODE", "nested_execution_error")
+    directory = tmp_path / "nested-error"
+    result = local_backend.execute(local_request, directory)
+    assert result.execution_status == "failed" and not result.valid
+    diagnostic = "\n".join(result.diagnostics)
+    assert "Error due to multiple causes" in diagnostic
+    assert "specific_missing_gain" in diagnostic
+    assert len(diagnostic) <= 6000
+    assert result.details["engine_closed"] is True
+    assert "specific_missing_gain" in (directory / "matlab.log").read_text()
+    assert local_backend.execute(local_request, directory, resume=True) == result
+    assert (directory / "engine-starts.txt").read_text() == "1"
+
+
 def test_resume_does_not_start_a_second_engine(local_backend, local_request, tmp_path):
     directory = tmp_path / "run"
     first = local_backend.execute(local_request, directory)
@@ -371,12 +388,64 @@ def test_unsupported_signature_stops_before_dispatch(local_backend, local_reques
     assert not (tmp_path / "run" / "engine-starts.txt").exists()
 
 
+@pytest.mark.parametrize("role", ["entry", "initializer"])
+@pytest.mark.parametrize("arguments", [[], [{"condition": "cruise"}]])
+def test_fixed_multi_output_functions_keep_declared_arity(
+    local_backend, local_request, tmp_path, role, arguments
+):
+    root = Path(local_request.project.root)
+    name = "analyze" if role == "entry" else "initialize"
+    (root / f"{name}.m").write_text(
+        f"function [result, info] = {name}(options)\n"
+        "if nargin == 0\noptions = struct;\nend\nresult = 42;\ninfo = options;\nend\n"
+    )
+    project = discover_matlab_project(str(root))
+    data = local_request.model_dump(mode="json")
+    data["project"] = project.model_dump(mode="json")
+    selected = next(item for item in project.entries if item.path == f"{name}.m")
+    data["inputs"][role] = selected.model_copy(update={"arguments": arguments}).model_dump(
+        mode="json"
+    )
+    directory = tmp_path / "run"
+    result = local_backend.execute(LocalMatlabRequest.model_validate(data), directory)
+    assert result.valid, result.diagnostics
+    execution = json.loads((directory / "execution.json").read_text())
+    assert execution[role + "_nargin"] == 1
+    assert execution[role + "_nargout"] == 2
+    assert execution[role + "_arguments"] == [json.dumps(value) for value in arguments]
+
+
+def test_optional_input_proof_cannot_be_forged(local_backend, local_request, tmp_path):
+    root = Path(local_request.project.root)
+    (root / "initialize.m").write_text("function initialize(required)\nend\n")
+    project = discover_matlab_project(str(root))
+    data = local_request.model_dump(mode="json")
+    data["project"] = project.model_dump(mode="json")
+    data["project"]["settings"]["function_defaults"] = [
+        {
+            "path": "initialize.m",
+            "location": "initialize.m:2",
+            "name": "argument_counts",
+            "value": [0],
+        }
+    ]
+    data["inputs"]["initializer"] = next(
+        item.model_dump(mode="json") for item in project.entries if item.path == "initialize.m"
+    )
+    directory = tmp_path / "run"
+    result = local_backend.execute(LocalMatlabRequest.model_validate(data), directory)
+    assert result.execution_status == "failed" and not result.valid
+    assert not (directory / "engine-starts.txt").exists()
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
         ("snapshot_root", "/another/project"),
         ("id", "b" * 32),
         ("entry_nargout", 0),
+        ("entry_nargin", 0),
+        ("initializer_nargin", 1),
     ],
 )
 def test_worker_revalidates_execution_locators_before_engine_start(
@@ -594,6 +663,42 @@ def test_real_packaged_bridge_preserves_json_provenance(real_local_backend, tmp_
     assert real_local_backend.execute(request, directory, resume=True) == result
     assert discover_matlab_project(str(root)) == project
     print(f"Actual MATLAB: {metadata['matlab_version']} ({metadata['matlab_release']})")
+
+
+@pytest.mark.matlab
+def test_real_multi_output_optional_functions_preserve_initialization(real_local_backend, tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    (root / "initialize.m").write_text(
+        "function [point, selection] = initialize(folder)\n"
+        "if nargin == 0\nfolder = fileparts(mfilename('fullpath'));\nend\n"
+        "assert(isfolder(folder));\nassignin('base', 'compatibility_seed', 41);\n"
+        "point = 41;\nselection = 999;\nend\n"
+    )
+    (root / "analyze.m").write_text(
+        "function [result, info] = analyze(folder)\n"
+        "if nargin == 0\nfolder = fileparts(mfilename('fullpath'));\nend\n"
+        "assert(strcmp(folder, fileparts(mfilename('fullpath'))));\n"
+        "result = evalin('base', 'compatibility_seed') + 1;\ninfo = 1000;\nend\n"
+    )
+    project = discover_matlab_project(str(root))
+    request = LocalMatlabRequest(
+        id="b" * 32,
+        operation="execute_project",
+        project=project,
+        inputs=ProjectExecutionInput(
+            mode="entry",
+            entry=next(item for item in project.entries if item.path == "analyze.m"),
+            initializer=next(item for item in project.entries if item.path == "initialize.m"),
+        ),
+        timeout_seconds=120,
+    )
+    directory = tmp_path / "run"
+    result = real_local_backend.execute(request, directory)
+    assert result.valid, result.diagnostics
+    assert json.loads((directory / "return.json").read_text()) == {"result": 42}
+    assert real_local_backend.execute(request, directory, resume=True) == result
+    assert discover_matlab_project(str(root)) == project
 
 
 @pytest.mark.matlab

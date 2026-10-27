@@ -78,6 +78,62 @@ def test_local_default_static_browsing_unavailable_engine_and_saved_selection(
             browser.close()
 
 
+@pytest.mark.parametrize("legacy_status", ["missing", "null"])
+def test_legacy_bootstrap_keeps_history_and_knowledge_chat_usable(
+    tmp_path, monkeypatch, legacy_status,
+):
+    app, runtime, calls = local_web(tmp_path, monkeypatch)
+    saved = runtime.store.create()
+    saved.resource_location = "diagnostic_data"
+    runtime.store.save(saved)
+    runtime.planner.model.responses = [
+        tool_message("propose_agent", {"action": "answer", "text": "Knowledge answer."}),
+    ]
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.set_default_timeout(10000)
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+
+        def legacy_bootstrap(route):
+            response = route.fetch()
+            data = response.json()
+            if legacy_status == "missing":
+                data.pop("local_matlab")
+            else:
+                data["local_matlab"] = None
+            route.fulfill(response=response, json=data)
+
+        def legacy_locations(route):
+            response = route.fetch()
+            route.fulfill(response=response, json=[
+                item for item in response.json() if item["id"] != "matlab_project"
+            ])
+
+        page.route("**/api/bootstrap", legacy_bootstrap)
+        page.route("**/api/resource-locations", legacy_locations)
+        try:
+            page.goto(url)
+            expect(page.locator("#local-matlab-state")).to_contain_text("状态未知")
+            expect(page.locator("#local-matlab-state")).to_contain_text("重启后端")
+            expect(page.locator("#notice")).not_to_contain_text("初始化失败")
+            expect(page.locator("#resource-location")).to_have_value("")
+            page.locator("#history-panel").evaluate("(node) => node.open = true")
+            page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
+            expect(page.locator("#resource-location")).to_have_value("diagnostic_data")
+            page.locator("#new-conversation").click()
+            expect(page.locator("#resource-location")).to_have_value("")
+            page.locator("#message").fill("Explain a step response without running a project.")
+            page.locator("#send").click()
+            expect(page.locator("#messages")).to_contain_text("Knowledge answer.")
+            expect(page.locator("#conversation-status")).to_have_text("已完成")
+            assert calls == []
+            assert errors == []
+        finally:
+            browser.close()
+
+
 def test_structured_sources_require_consent_and_download_real_json_and_word(
     tmp_path, monkeypatch,
 ):

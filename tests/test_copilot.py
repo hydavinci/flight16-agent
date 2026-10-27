@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -26,9 +27,13 @@ def copilot_cli(tmp_path, monkeypatch):
         "'calls': attempt + 1, "
         "'has_worker_secret': 'MATLAB_WORKER_TOKEN' in os.environ, "
         "'has_api_secret': 'LLM_API_KEY' in os.environ}))\n"
-        "time.sleep(float(os.environ.get('PROBE_DELAY', '0')))\n"
+        "delays = os.environ.get('PROBE_DELAY_SEQUENCE')\n"
+        "time.sleep(float(json.loads(delays)[attempt] if delays "
+        "else os.environ.get('PROBE_DELAY', '0')))\n"
         "sequence = os.environ.get('PROBE_EVENTS_SEQUENCE')\n"
-        "print(json.loads(sequence)[attempt] if sequence else os.environ['PROBE_EVENTS'])\n"
+        "print(json.loads(sequence)[attempt] if sequence else os.environ['PROBE_EVENTS'], "
+        "flush=True)\n"
+        "time.sleep(float(os.environ.get('PROBE_EXIT_DELAY', '0')))\n"
         "sys.exit(int(os.environ.get('PROBE_EXIT', '0')))\n",
         encoding="utf-8",
     )
@@ -88,6 +93,100 @@ def test_copilot_returns_validated_plan_without_api_credentials(copilot_cli, mon
     assert not Path(captured["cwd"]).exists()
 
 
+def test_copilot_losslessly_shares_catalog_schemas_and_reduces_request_size(
+    copilot_cli, monkeypatch
+):
+    from flight_agent.runtime.capabilities import CapabilityRegistry
+    from flight_agent.verification.plugins import register_builtin_plugins
+    from flight_agent.verification.resources import ResourceRegistry
+
+    tools = CapabilityRegistry(agent_mode=True)
+    register_builtin_plugins(
+        tools, ResourceRegistry(), backend=None, planner=VerificationPlanner()
+    )
+    context = {
+        "request": "Overshoot <=10%; settling time <=3 s; 5% band.",
+        "catalog": tools.catalog(),
+        "resources": [{"evidence": "Unmodified synthetic project evidence.\n" * 900}],
+        "sources": [{"quote": "Original criterion text, including whitespace.\n"}],
+        "catalog_schemas": {"schema_1": {"note": "Original context field, not the shared table"}},
+        "validation_feedback": {"errors": [{
+            "location": ["initializer"], "code": "source_selection_mismatch",
+            "expected_selection": "setup/existing.m",
+        }]},
+    }
+    original = deepcopy(context)
+    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","question":"Synthetic only"}'))
+    result = VerificationPlanner()._call(
+        "propose_plan", PlanProposal, context, system_prompt="Never execute the plan."
+    )
+    assert result.action == "clarify"
+    prompt = json.loads(copilot_cli.read_text())["args"][-1]
+    payload = json.loads(prompt.split("\n", 1)[1])
+    schemas = payload["catalog_schemas"]
+    restored = deepcopy(payload["request_context"])
+    references = 0
+    for capability in restored["catalog"]:
+        for field in ("input_schema", "output_schema"):
+            schema = capability[field]
+            if set(schema) == {"catalog_schema_ref"}:
+                capability[field] = schemas[schema["catalog_schema_ref"]]
+                references += 1
+    assert references >= 7
+    assert restored == original
+    assert context == original
+    unpacked = {key: value for key, value in payload.items() if key != "catalog_schemas"}
+    unpacked["request_context"] = original
+    assert len(prompt.encode("utf-8")) < 0.7 * len(
+        json.dumps(unpacked, ensure_ascii=False).encode("utf-8")
+    )
+
+
+def test_copilot_shares_only_identical_whole_schemas_and_preserves_local_refs(
+    copilot_cli, monkeypatch
+):
+    original_schema = {
+        "$defs": {"Value": {"type": "number", "description": "Original numeric value"}},
+        "properties": {"value": {"$ref": "#/$defs/Value"}},
+    }
+    different_schema = deepcopy(original_schema)
+    different_schema["$defs"]["Value"]["type"] = "string"
+    context = {"catalog": [
+        {"name": "first", "output_schema": original_schema},
+        {"name": "second", "output_schema": dict(reversed(list(original_schema.items())))},
+        {"name": "different", "output_schema": different_schema},
+    ]}
+    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","question":"Synthetic only"}'))
+    VerificationPlanner()._call(
+        "propose_plan", PlanProposal, context, system_prompt="Never execute the plan."
+    )
+    payload = json.loads(json.loads(copilot_cli.read_text())["args"][-1].split("\n", 1)[1])
+    catalog = payload["request_context"]["catalog"]
+    first = catalog[0]["output_schema"]
+    assert first == catalog[1]["output_schema"]
+    assert payload["catalog_schemas"][first["catalog_schema_ref"]] == original_schema
+    assert catalog[2]["output_schema"] == different_schema
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {},
+        {"catalog": []},
+        {"catalog": [{"name": "unique", "input_schema": {"type": "object"}}]},
+        {"catalog": [{"input_schema": {}}, {"input_schema": {}}]},
+    ],
+)
+def test_copilot_keeps_unhelpful_sharing_inline(copilot_cli, monkeypatch, context):
+    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","question":"Synthetic only"}'))
+    VerificationPlanner()._call(
+        "propose_plan", PlanProposal, context, system_prompt="Never execute the plan."
+    )
+    payload = json.loads(json.loads(copilot_cli.read_text())["args"][-1].split("\n", 1)[1])
+    assert payload["request_context"] == context
+    assert "catalog_schemas" not in payload
+
+
 @pytest.mark.parametrize(
     ("output", "message"),
     [
@@ -118,6 +217,45 @@ def test_copilot_timeout_is_explicit(copilot_cli, monkeypatch):
     monkeypatch.setenv("PROBE_EVENTS", "")
     with pytest.raises(ValueError, match="timed out"):
         call_planner()
+
+
+def test_copilot_rejects_complete_output_when_process_does_not_finish_in_time(
+    copilot_cli, monkeypatch
+):
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("PROBE_EXIT_DELAY", "10")
+    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","question":"Complete text"}'))
+    with pytest.raises(ValueError, match="timed out"):
+        call_planner()
+    assert json.loads(copilot_cli.read_text())["calls"] == 1
+
+
+@pytest.mark.parametrize("round_number", [1, 2])
+def test_agent_timeout_reports_round_and_shared_total_budget(
+    copilot_cli, monkeypatch, tmp_path, round_number
+):
+    from tests.test_agent_planner import setup
+
+    planner, store, conversation, tools, calls, _ = setup(tmp_path, {})
+    planner.model = None
+    monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("PROBE_EVENTS", events(
+        '{"action":"plan","text":"private-invalid-proposal"}'
+    ))
+    monkeypatch.setenv(
+        "PROBE_DELAY_SEQUENCE", json.dumps([10] if round_number == 1 else [0.05, 10])
+    )
+    with pytest.raises(ValueError) as error:
+        planner.propose(
+            "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+        )
+    text = str(error.value)
+    assert f"第 {round_number} 轮" in text
+    assert "原总预算 1s" in text and "本轮可用" in text
+    assert "未自动重试" in text and "未生成新方案" in text
+    assert "private-invalid-proposal" not in text
+    assert json.loads(copilot_cli.read_text())["calls"] == round_number
+    assert calls == [] and store.get(conversation.id).task is None
 
 
 def test_bootstrap_accepts_explicit_copilot_provider_without_api_endpoint(copilot_cli, project):
@@ -257,6 +395,69 @@ def test_copilot_corrects_missing_output_binding_without_executing(
     capture = json.loads(copilot_cli.read_text())
     assert capture["calls"] == 2
     assert "plan_output_producer" in capture["args"][-1]
+    payload = json.loads(capture["args"][-1].split("\n", 1)[1])
+    assert payload["catalog_schemas"]
     assert "--deny-tool=shell" in capture["args"]
     assert calls == []
     assert store.get(conversation.id).task is None
+
+
+def test_copilot_shared_catalog_preserves_source_correction_and_confirmation(
+    copilot_cli, monkeypatch, tmp_path
+):
+    import flight_agent.web as web
+    from flight_agent.runtime.requirements import CriterionSource
+    from flight_agent.verification.local_matlab import LocalMatlabBackend
+    from tests.matlab_project_helpers import prepared_project
+    from tests.test_local_matlab_planning import REQUEST, ControlledBackend, local_draft
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Planning must not dispatch MATLAB")
+
+    backend = ControlledBackend()
+    monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
+    monkeypatch.setattr(LocalMatlabBackend, "from_environment", classmethod(lambda cls: backend))
+    monkeypatch.setattr(LocalMatlabBackend, "_spawn", forbidden)
+    runtimes = []
+    original_runtime = web.EngineeringRuntime
+
+    def capture(*args, **kwargs):
+        runtime = original_runtime(*args, **kwargs)
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(web, "EngineeringRuntime", capture)
+    web.create_web_app(tmp_path / "web")
+    runtime = runtimes[0]
+    project = prepared_project(tmp_path / "project")
+    record = runtime.queue_message(None, REQUEST, str(project), location="matlab_project")
+    resource = runtime.resources.inspect("matlab_project", str(project))
+    source = CriterionSource(
+        kind="user_message", reference=f"message:{record.id}:0", quote=REQUEST
+    )
+    correct = local_draft({
+        "resources": [resource.model_dump(mode="json", exclude={"locator"})],
+        "sources": [source.model_dump(mode="json")],
+    })
+    broken = deepcopy(correct)
+    broken["nodes"][0]["inputs"].pop("initializer")
+    monkeypatch.setenv("PROBE_EVENTS_SEQUENCE", json.dumps([
+        events(json.dumps({"action": "plan", "text": "Missing.", "plan": broken})),
+        events(json.dumps({"action": "plan", "text": "Corrected.", "plan": correct})),
+    ]))
+    result = runtime.continue_submission(record.id)
+    assert result.task is not None, result.messages[-1].content
+    assert result.pending_decision.kind == "confirm_baseline"
+    assert not result.task.baseline.confirmed
+    assert result.task.baseline.nodes[0].inputs["initializer"]["path"] == "initialize.m"
+    assert result.task.baseline.requirements.criteria[0].source.quote == REQUEST
+    assert result.task.calls == [] and backend.requests == []
+    captured = json.loads(copilot_cli.read_text())
+    assert captured["calls"] == 2
+    payload = json.loads(captured["args"][-1].split("\n", 1)[1])
+    assert payload["catalog_schemas"]
+    assert payload["request_context"]["validation_feedback"]["errors"] == [{
+        "location": ["initializer"], "code": "source_selection_mismatch",
+        "expected_selection": "initialize.m",
+    }]
+    assert runtime.store.get(record.id).pending_decision.kind == "confirm_baseline"

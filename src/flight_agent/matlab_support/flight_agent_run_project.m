@@ -4,6 +4,7 @@ fa_request = jsondecode(fileread(fa_request_path));
 fa_inputs = fa_request.inputs;
 fa_root = fa_request.snapshot_root;
 fa_output = fa_request.output_directory;
+fa_raw_path = fullfile(fa_output, 'raw.mat');
 if ~isempty(fa_inputs.project_file)
     fa_project = openProject(fullfile(fa_root, fa_inputs.project_file)); %#ok<NASGU>
 end
@@ -25,7 +26,7 @@ if ~isempty(fa_inputs.initializer)
         run(fa_path);
     else
         fa_initializer_return = call_existing(fa_path, fa_request.initializer_arguments, ...
-            fa_request.initializer_nargout);
+            fa_request.initializer_nargout, fa_request.initializer_nargin);
     end
 end
 fa_before_names = who;
@@ -45,7 +46,8 @@ if strcmp(fa_inputs.mode, 'entry')
             'Unsupported selected entry script with same-stem P-file');
         run(fa_path);
     else
-        fa_return = call_existing(fa_path, fa_request.entry_arguments, fa_request.entry_nargout);
+        fa_return = call_existing(fa_path, fa_request.entry_arguments, ...
+            fa_request.entry_nargout, fa_request.entry_nargin);
     end
 else
     fa_model_path = fullfile(fa_root, fa_inputs.model);
@@ -61,10 +63,23 @@ else
         fa_metadata.settings.(fa_name) = get_param(fa_model, fa_name);
     end
     fa_log_name = get_param(fa_model, 'SignalLoggingName');
-    % Keep model configuration, inputs and logging intact; initializer locals
-    % are available to this simulation, not shared with any later node.
-    fa_return = sim(fa_model, 'SrcWorkspace', 'current');
+    % Keep base/callback variables visible; script locals override them only
+    % for this simulation, without changing the saved model configuration.
+    fa_simulation = Simulink.SimulationInput(fa_model);
+    fa_workspace_names = who;
+    fa_workspace_names = fa_workspace_names(~startsWith(fa_workspace_names, 'fa_'));
+    if ~isempty(fa_workspace_names)
+        fa_info = whos;
+        assert(sum([fa_info.bytes]) <= 100 * 1024 * 1024, ...
+            'Workspace exceeds raw artifact limit');
+        save(fa_raw_path, fa_workspace_names{:}, '-v7');
+        fa_simulation = loadVariablesFromMATFile(fa_simulation, fa_raw_path);
+    end
+    fa_return = sim(fa_simulation);
     if isa(fa_return, 'Simulink.SimulationOutput')
+        if ~isempty(fa_return.ErrorMessage)
+            error('flight_agent:SimulationFailed', '%s', fa_return.ErrorMessage);
+        end
         fa_metadata.simulation_model_info = fa_return.SimulationMetadata.ModelInfo;
         fa_metadata.simulation_timing_info = fa_return.SimulationMetadata.TimingInfo;
     end
@@ -74,7 +89,6 @@ fa_names = fa_names(~startsWith(fa_names, 'fa_'));
 fa_new_names = setdiff(fa_names, fa_before_names);
 fa_info = whos;
 assert(sum([fa_info.bytes]) <= 100 * 1024 * 1024, 'Workspace exceeds raw artifact limit');
-fa_raw_path = fullfile(fa_output, 'raw.mat');
 save(fa_raw_path, fa_names{:}, 'fa_return', 'fa_initializer_return', '-v7');
 fa_receipt.id = fa_request.id;
 fa_receipt.request_sha256 = fa_request.request_sha256;
@@ -103,16 +117,17 @@ write_json(fullfile(fa_output, 'runtime-metadata.json'), fa_metadata);
 write_json(fullfile(fa_output, 'bridge.json'), fa_receipt);
 end
 
-function result = call_existing(path, arguments_json, output_count)
+function result = call_existing(path, arguments_json, output_count, input_count)
 [~, name] = fileparts(path);
 assert(same_file(which(name), path), 'Selected function resolution mismatch');
-assert(nargin(name) == numel(arguments_json) && nargout(name) == output_count, ...
+assert(nargin(name) == input_count && numel(arguments_json) <= input_count ...
+    && nargout(name) == output_count, ...
     'Unsupported runtime function signature');
 call_arguments = cell(1, numel(arguments_json));
 for index = 1:numel(arguments_json)
     call_arguments{index} = jsondecode(arguments_json{index});
 end
-if output_count == 1
+if output_count > 0
     result = feval(name, call_arguments{:});
 else
     feval(name, call_arguments{:});

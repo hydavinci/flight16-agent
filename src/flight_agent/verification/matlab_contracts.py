@@ -242,8 +242,10 @@ class LocalMatlabExecution(_MatlabContract):
     output_directory: Nonempty
     inputs: ProjectExecutionInput
     project_paths: list[str]
-    entry_nargout: Literal[0, 1]
-    initializer_nargout: Literal[0, 1]
+    entry_nargin: Annotated[int, Field(ge=0, le=100)]
+    entry_nargout: Annotated[int, Field(ge=0, le=100)]
+    initializer_nargin: Annotated[int, Field(ge=0, le=100)]
+    initializer_nargout: Annotated[int, Field(ge=0, le=100)]
     entry_arguments: list[str]
     initializer_arguments: list[str]
 

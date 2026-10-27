@@ -102,6 +102,90 @@ def test_matlab_only_local_functions_and_unsupported_signatures(tmp_path):
     assert any("Thing.m" in note and "classdef" in note for note in project.notes)
 
 
+@pytest.mark.parametrize(
+    "parameters,body,counts",
+    [
+        ("folder", "if nargin == 0\nfolder = fileparts(mfilename('fullpath'));\nend\n", [0]),
+        ("a,b", "if nargin < 2\nb = 2;\nend\nif nargin < 1\na = 1;\nend\n", [0, 1]),
+        ("a,b", "if nargin == 0\na = 1;\nb = 2;\nend\n", [0]),
+        ("a,b", "if nargin < 2\nb = a + 1;\nend\n", [1]),
+        ("folder", "if nargin == 0\nfolder = 'a;b,c';\nend\n", [0]),
+    ],
+)
+def test_leading_nargin_defaults_are_source_backed(tmp_path, parameters, body, counts):
+    (tmp_path / "initialize.m").write_text(
+        f"function [point, selection] = initialize({parameters})\n"
+        + body
+        + "point = 1;\nselection = 2;\nend\n"
+    )
+    project = discover(tmp_path)
+    assert project.settings["function_defaults"] == [
+        {
+            "path": "initialize.m",
+            "location": "initialize.m:2",
+            "name": "argument_counts",
+            "value": counts,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "% if nargin == 0\n% folder = pwd;\n% end\n",
+        "message = 'if nargin == 0';\nfolder = pwd;\n",
+        "if nargin == 0\nother = pwd;\nend\n",
+        "if nargin == 0\nfolder = folder;\nend\n",
+        "if nargin == 0\nif ready\nfolder = pwd;\nend\nend\n",
+        "if nargin == 0\nfolder = pwd;\nelse\nfolder = pwd;\nend\n",
+        "use(folder);\nif nargin == 0\nfolder = pwd;\nend\n",
+        "if nargin == 0\nfolder == 1;\nend\n",
+        "if nargin == 0\nfolder = 1; clear folder;\nend\n",
+        "if nargin == 0\nfolder = 1, clear folder;\nend\n",
+        "if nargin == 0\nfolder = 1; clear;\nend\n",
+        "if nargin == 0\nfolder = 1, clear;\nend\n",
+    ],
+)
+def test_unproven_optional_inputs_are_not_invented(tmp_path, body):
+    (tmp_path / "initialize.m").write_text(
+        "function result = initialize(folder)\n" + body + "result = 1;\nend\n"
+    )
+    assert discover(tmp_path).settings.get("function_defaults", []) == []
+
+
+@pytest.mark.parametrize(
+    "signature,parameter",
+    [
+        ("function result = initialize(nargin)", "nargin"),
+        ("function nargin = initialize(folder)", "folder"),
+    ],
+)
+def test_shadowed_nargin_is_not_optional_input_evidence(tmp_path, signature, parameter):
+    (tmp_path / "initialize.m").write_text(
+        signature + f"\nif nargin == 0\n{parameter} = 1;\nend\nend\n"
+    )
+    assert discover(tmp_path).settings.get("function_defaults", []) == []
+
+
+def test_script_does_not_declare_optional_inputs(tmp_path):
+    (tmp_path / "initialize.m").write_text(
+        "function_call(folder)\nif nargin == 0\nfolder = 1;\nend\n"
+    )
+    assert discover(tmp_path).settings.get("function_defaults", []) == []
+
+
+def test_optional_input_evidence_respects_serialized_metadata_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(verification_module("matlab_projects"), "MAX_RESULT", 100)
+    (tmp_path / "initialize.m").write_text(
+        "function result = initialize(folder)\n"
+        "if nargin == 0\nfolder = pwd;\nend\nresult = 1;\nend\n"
+    )
+    project = discover(tmp_path)
+    assert len(json.dumps(project.settings, ensure_ascii=False).encode("utf-8")) <= 100
+    assert project.settings.get("function_defaults", []) == []
+    assert [entry.path for entry in project.entries] == ["initialize.m"]
+
+
 def test_static_literals_are_not_expressions_or_commented_code(tmp_path):
     root = tmp_path / "literal only"
     root.mkdir()

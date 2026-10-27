@@ -34,6 +34,25 @@ def _support() -> Path:
     return Path(__file__).resolve().parents[1] / "matlab_support"
 
 
+def _failure_diagnostic(directory: Path, exc: Exception) -> str:
+    message = f"MATLAB output/execution: {exc}"
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        log = directory / "matlab.log"
+        if log.is_symlink() or not log.is_file():
+            return message[:6000]
+        with log.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 4000))
+            tail = stream.read(4000).decode("utf-8", errors="replace").strip()
+        if tail:
+            message = f"{message[:1800]}\nMATLAB log (last 4000 bytes):\n{tail}"
+    except OSError:
+        pass
+    return message[:6000]
+
+
 def _child(directory: Path) -> None:
     request = _read_model(directory / "request.json", LocalMatlabRequest, MAX_REQUEST_BYTES)
     if os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") != "1":
@@ -157,7 +176,7 @@ def _child(directory: Path) -> None:
                 "unknown" if result.execution_status in ("unknown", "completed") else "failed"
             ),
             valid=False,
-            diagnostics=[f"MATLAB output/execution: {exc}"[:6000]],
+            diagnostics=[_failure_diagnostic(directory, exc)],
         )
     finally:
         try:

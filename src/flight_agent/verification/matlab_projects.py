@@ -65,6 +65,70 @@ def _matlab_statements(text: str) -> Iterator[tuple[int, str]]:
         yield start, pending  # Retain the kind, but not an incomplete function signature.
 
 
+def _default_argument_counts(statements: list[tuple[int, str]]) -> list[int]:
+    """Prove omissions only from leading nargin guards with straight-line assignments."""
+    if not statements or not re.match(r"^function\b", statements[0][1]):
+        return []
+    match = re.search(r"\(([^()]*)\)\s*;?$", statements[0][1])
+    if match is None:
+        return []
+    parameters = [name.strip() for name in match[1].split(",")]
+    if (
+        len(parameters) > 100
+        or len(set(parameters)) != len(parameters)
+        or "varargin" in parameters
+        or "nargin" in parameters
+        or re.search(r"\bnargin\b", statements[0][1].split("(", 1)[0])
+        or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,62}", name) for name in parameters)
+    ):
+        return []
+    defined = [set(parameters[:count]) for count in range(len(parameters))]
+    valid = [True] * len(parameters)
+    index = 1
+    while index < len(statements):
+        guard = re.fullmatch(r"if\s+nargin\s*(==|<)\s*(\d+)\s*;?", statements[index][1])
+        if guard is None:
+            break
+        assignments = []
+        index += 1
+        while index < len(statements) and not re.fullmatch(r"end\s*;?", statements[index][1]):
+            assignment = re.fullmatch(
+                r"([A-Za-z][A-Za-z0-9_]{0,62})\s*=(?!=)\s*(.+?);?", statements[index][1]
+            )
+            if assignment is None or assignment[1] not in parameters:
+                break
+            assignments.append(assignment)
+            index += 1
+        if index == len(statements) or not re.fullmatch(r"end\s*;?", statements[index][1]):
+            break
+        for count, names in enumerate(defined):
+            applies = count == int(guard[2]) if guard[1] == "==" else count < int(guard[2])
+            if not applies:
+                continue
+            for assignment in assignments:
+                expression = re.sub(r"'(?:''|[^'])*'|" r'"(?:""|[^"])*"', "", assignment[2])
+                depth = 0
+                for character in expression:
+                    if character in "([{":
+                        depth += 1
+                    elif character in ")]}":
+                        depth -= 1
+                    elif depth == 0 and character in ",;":
+                        valid[count] = False
+                    if depth < 0:
+                        valid[count] = False
+                if depth != 0:
+                    valid[count] = False
+                referenced = set(re.findall(r"[A-Za-z][A-Za-z0-9_]*", expression))
+                if referenced & (set(parameters) - names):
+                    valid[count] = False
+                names.add(assignment[1])
+        index += 1
+    return [
+        count for count, names in enumerate(defined) if valid[count] and set(parameters) <= names
+    ]
+
+
 def _literal(value: str) -> JsonValue:
     if re.fullmatch(r"'(?:''|[^'])*'", value):
         return value[1:-1].replace("''", "'")
@@ -124,10 +188,16 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
 
     def append_setting(group: str, value: dict[str, JsonValue]) -> bool:
         nonlocal settings_size, settings_truncated
-        records = settings[group]
+        overhead = 0
+        if group not in settings:
+            overhead = (
+                len(json.dumps({**settings, group: []}, ensure_ascii=False).encode("utf-8"))
+                - settings_size
+            )
+        records = settings.get(group, [])
         assert isinstance(records, list)
         size = len(json.dumps(value, ensure_ascii=False).encode("utf-8")) + (2 if records else 0)
-        if settings_size + size > MAX_RESULT:
+        if settings_size + overhead + size > MAX_RESULT:
             settings_truncated = True
             notes.append(
                 f"{value['path']}: serialized metadata limit exceeded; "
@@ -135,7 +205,8 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
             )
             return False
         records.append(value)
-        settings_size += size
+        settings[group] = records
+        settings_size += overhead + size
         return True
 
     def record(group: str, path: str, location: str, name: str, value: JsonValue) -> bool:
@@ -261,6 +332,15 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
             settings["explicit_configuration"] = configuration
             settings_size = len(json.dumps(settings, ensure_ascii=False).encode("utf-8"))
         elif suffix == ".m":
+            counts = _default_argument_counts(statements)
+            if counts:
+                record(
+                    "function_defaults",
+                    item.path,
+                    f"{item.path}:{statements[1][0]}",
+                    "argument_counts",
+                    [count for count in counts],
+                )
             for line, statement in _matlab_statements(text):
                 if re.match(r"^(function|classdef)\b", statement):
                     break

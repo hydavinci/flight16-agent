@@ -28,6 +28,7 @@ from .matlab_contracts import (
     LocalMatlabStepinfoExecution,
     MatlabEntry,
     MatlabExecutionMetadata,
+    MatlabProjectDescriptor,
     MatlabSeriesPair,
     MatlabStepinfoOutput,
     ProjectExecutionInput,
@@ -64,28 +65,46 @@ def _read_model(path: Path, model: type[T], limit: int = MAX_RESULT_BYTES) -> T:
     return model.model_validate_json(content)
 
 
-def _signature(entry: MatlabEntry) -> Literal[0, 1]:
+def _signature(
+    entry: MatlabEntry, project: MatlabProjectDescriptor | None = None
+) -> tuple[int, int]:
     if entry.kind == "script":
-        return 0
+        return 0, 0
     identifier = r"[A-Za-z][A-Za-z0-9_]{0,62}"
+    outputs = rf"{identifier}(?:(?:\s*,\s*|\s+){identifier})*"
     match = re.fullmatch(
-        rf"function\s+(?:({identifier})\s*=\s*)?({identifier})"
-        rf"\s*(?:\(\s*({identifier}(?:\s*,\s*{identifier})*)?\s*\))?\s*;?",
+        rf"function\s+(?:(?P<outputs>{identifier}|\[\s*{outputs}\s*\])\s*=\s*)?"
+        rf"(?P<name>{identifier})"
+        rf"\s*(?:\(\s*(?P<inputs>{identifier}(?:\s*,\s*{identifier})*)?\s*\))?\s*;?",
         entry.signature or "",
     )
-    if not match or match[2] != Path(entry.path).stem:
+    if not match or match["name"] != Path(entry.path).stem:
         raise ValueError(f"Unsupported existing function signature: {entry.path}")
-    names = [item.strip() for item in (match[3] or "").split(",") if item.strip()]
+    names = re.findall(identifier, match["inputs"] or "")
+    returned = re.findall(identifier, match["outputs"] or "")
+    defaults = project.settings.get("function_defaults", []) if project else []
+    defaulted = isinstance(defaults, list) and any(
+        isinstance(record, dict)
+        and record.get("path") == entry.path
+        and record.get("name") == "argument_counts"
+        and isinstance(counts := record.get("value"), list)
+        and len(entry.arguments) in counts
+        for record in defaults
+    )
     if (
         "varargin" in names
-        or match[1] == "varargout"
-        or len(names) != len(entry.arguments)
+        or "varargout" in returned
+        or len(set(names)) != len(names)
+        or len(set(returned)) != len(returned)
+        or max(len(names), len(returned)) > 100
+        or len(entry.arguments) > len(names)
+        or (len(names) != len(entry.arguments) and not defaulted)
         or any(
             part.startswith(("+", "@")) or part == "private" for part in Path(entry.path).parts[:-1]
         )
     ):
         raise ValueError(f"Unsupported existing function signature/arguments: {entry.path}")
-    return 1 if match[1] is not None else 0
+    return len(names), len(returned)
 
 
 def _execution_request(
@@ -103,6 +122,10 @@ def _execution_request(
     assert isinstance(request.inputs, ProjectExecutionInput) and request.project is not None
     snapshot = directory / "project"
     entry, initializer = request.inputs.entry, request.inputs.initializer
+    entry_nargin, entry_nargout = _signature(entry, request.project) if entry else (0, 0)
+    initializer_nargin, initializer_nargout = (
+        _signature(initializer, request.project) if initializer else (0, 0)
+    )
     return LocalMatlabExecution(
         id=request.id,
         request_sha256=fingerprint(request.model_dump(mode="json")),
@@ -112,8 +135,10 @@ def _execution_request(
         project_paths=sorted(
             {str(snapshot), *(str((snapshot / item.path).parent) for item in request.project.files)}
         ),
-        entry_nargout=_signature(entry) if entry is not None else 0,
-        initializer_nargout=_signature(initializer) if initializer is not None else 0,
+        entry_nargin=entry_nargin,
+        entry_nargout=entry_nargout,
+        initializer_nargin=initializer_nargin,
+        initializer_nargout=initializer_nargout,
         entry_arguments=[
             json.dumps(value, ensure_ascii=False, allow_nan=False) for value in entry.arguments
         ]
@@ -358,7 +383,7 @@ class LocalMatlabBackend:
                 assert request.project is not None
                 for entry in (request.inputs.entry, request.inputs.initializer):
                     if entry is not None:
-                        _signature(entry)
+                        _signature(entry, request.project)
                         if entry.kind == "script" and any(
                             item.path == Path(entry.path).with_suffix(".p").as_posix()
                             for item in request.project.files

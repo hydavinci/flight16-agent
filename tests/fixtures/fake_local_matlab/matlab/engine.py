@@ -88,6 +88,15 @@ class Engine:
         )
         if mode() == "execution_error":
             raise MatlabExecutionError("solver failed")
+        if mode() == "nested_execution_error":
+            print("Earlier MATLAB output\n" * 1000, file=sys.stderr, flush=True)
+            print(
+                "Error due to multiple causes.\nCaused by:\n"
+                "    Unrecognized function or variable 'specific_missing_gain'.",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise MatlabExecutionError("Error due to multiple causes.")
         if mode() == "function_shadow":
             raise MatlabExecutionError("Selected function resolution mismatch")
         if mode() in {"block", "artifact_flood", "log_flood"}:
