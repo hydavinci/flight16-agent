@@ -1,35 +1,65 @@
 import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from functools import partial
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from ..jobs import BusyError, JobManager
+from ..runtime.evidence import verify_evidence
+from ..runtime.intents import Scenario
+from ..runtime.observations import OutputArtifact
 from .artifacts import verify_artifact
-from .contracts import Conversation, PendingDecision, VerificationTask
+from .compat import LegacyRuntimeAdapter
+from .contracts import AgentTask, Conversation, ConversationMessage, PendingDecision
+from .coordinator import EngineeringRuntime
 from .runtime import VerificationRuntime
+from .store import now
+from .views import ConversationView, to_conversation_view
 
 logger = logging.getLogger(__name__)
 
 
 class MessageRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    message: str = Field(min_length=1, max_length=4000)
+    message: str | None = Field(default=None, min_length=1, max_length=4000)
+    analysis_request: str | None = Field(default=None, min_length=1, max_length=4000)
+    evaluation_criteria: str | None = Field(default=None, min_length=1, max_length=4000)
     project_root: str | None = Field(default=None, max_length=4096)
     output_root: str | None = Field(default=None, max_length=4096)
-    scenario: Literal["d1", "d2"] | None = None
+    location: str | None = Field(default=None, min_length=1, max_length=128)
+    scenario: Scenario | None = None
 
-    @field_validator("message")
+    @field_validator("message", "analysis_request", "evaluation_criteria")
     @classmethod
-    def nonempty_message(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("A nonempty message is required")
-        return value.strip()
+    def nonempty_text(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("Nonempty request text is required")
+        return value
+
+    @model_validator(mode="after")
+    def message_or_structured_input(self) -> Self:
+        if self.message is not None:
+            if self.analysis_request is not None or self.evaluation_criteria is not None:
+                raise ValueError("message cannot be combined with structured input fields")
+        elif self.analysis_request is None:
+            raise ValueError("Provide message or analysis_request")
+        if len(self.canonical_message()) > 4000:
+            raise ValueError(
+                "Combined message including source labels must not exceed 4000 characters"
+            )
+        return self
+
+    def canonical_message(self) -> str:
+        if self.message is not None:
+            return self.message.strip()
+        text = f"[工程分析要求]\n{self.analysis_request}\n[工程分析要求结束]"
+        if self.evaluation_criteria is not None:
+            text += f"\n\n[评价指标]\n{self.evaluation_criteria}\n[评价指标结束]"
+        return text
 
 
 class ConfirmationRequest(BaseModel):
@@ -46,8 +76,12 @@ class ConfirmationRequest(BaseModel):
 
 
 class ConversationManager:
-    def __init__(self, runtime: VerificationRuntime, jobs: JobManager):
-        self.runtime = runtime
+    def __init__(
+        self, runtime: EngineeringRuntime | VerificationRuntime, jobs: JobManager,
+    ):
+        self.runtime = (
+            LegacyRuntimeAdapter(runtime) if isinstance(runtime, VerificationRuntime) else runtime
+        )
         self.jobs = jobs
 
     def _fail(self, conversation_id: str, error: Exception) -> None:
@@ -55,7 +89,9 @@ class ConversationManager:
         record = self.runtime.store.get(conversation_id)
         message = str(error)[:4000] or "Conversation operation failed"
         if record.restore_turn_origin():
-            self.runtime._message(record, "assistant", "Follow-up request failed: " + message)
+            record.messages.append(ConversationMessage(
+                role="assistant", content="Follow-up request failed: " + message, created_at=now(),
+            ))
             self.runtime.store.save(record)
             return
         record.pending_decision = PendingDecision(
@@ -100,9 +136,10 @@ class ConversationManager:
         try:
             record = self.runtime.queue_message(
                 conversation_id,
-                request.message,
+                request.canonical_message(),
                 request.project_root,
                 output_root=request.output_root,
+                location=request.location,
                 scenario=request.scenario,
             )
             if record.status == "planning":
@@ -124,62 +161,13 @@ class ConversationManager:
         dispatched = False
         try:
             record = self.runtime.store.get(conversation_id)
-            task = record.task
-            if task is None:
-                raise ValueError("No verification task has been planned")
-            if request is not None and request.version != task.baseline.version:
-                raise ValueError("Confirmation baseline version is stale")
-            if action in ("confirm", "resume") and record.status == "completed":
+            operation = self.runtime.prepare_decision(
+                conversation_id, action,
+                version=request.version if request is not None else None,
+                trusted=request.trusted if request is not None else False,
+            )
+            if operation is None:
                 return record
-            if action == "confirm":
-                if request is None or task.baseline.confirmed:
-                    raise ValueError("This baseline is already confirmed; use resume")
-                operation = partial(
-                    self.runtime.confirm,
-                    conversation_id,
-                    request.version,
-                    trusted=request.trusted,
-                )
-            elif action == "resume":
-                if not task.baseline.confirmed:
-                    raise ValueError("Confirm the current baseline before continuing")
-                operation = partial(self.runtime.resume, conversation_id)
-            elif action == "replan":
-                if (
-                    request is None
-                    or not isinstance(task, VerificationTask)
-                    or record.pending_decision is None
-                    or record.pending_decision.kind != "confirm_replan"
-                    or task.failure_proposal is None
-                    or task.failure_proposal.action != "plan"
-                ):
-                    raise ValueError("No recovery plan is awaiting explicit adoption")
-                if task.pending_request and not self.runtime._known_failed_run(task):
-                    raise ValueError(
-                        "Reconcile the unknown Worker run before adopting another plan"
-                    )
-                operation = partial(
-                    self.runtime.replan,
-                    conversation_id,
-                    request.version,
-                    trusted=request.trusted,
-                )
-            else:
-                if (
-                    request is None
-                    or not isinstance(task, VerificationTask)
-                    or not task.baseline.confirmed
-                    or task.pending_request is None
-                    or task.worker_run is None
-                    or task.worker_run.status not in ("failed", "interrupted")
-                ):
-                    raise ValueError("Only a known failed or interrupted worker run may be retried")
-                operation = partial(
-                    self.runtime.retry,
-                    conversation_id,
-                    request.version,
-                    trusted=request.trusted,
-                )
             record.status = "running"
             record.error = None
             self.runtime.store.save(record)
@@ -192,7 +180,8 @@ class ConversationManager:
 
 
 def verification_router(
-    runtime: VerificationRuntime, jobs: JobManager, authorize: Callable[[Request], None]
+    runtime: EngineeringRuntime | VerificationRuntime, jobs: JobManager,
+    authorize: Callable[[Request], None],
 ) -> APIRouter:
     router = APIRouter(prefix="/api/conversations", dependencies=[Depends(authorize)])
     manager = ConversationManager(runtime, jobs)
@@ -223,7 +212,9 @@ def verification_router(
                     "output_root": record.output_root,
                     "updated_at": record.updated_at,
                     "title": (
-                        record.task.proposal.title
+                        record.task.baseline.title
+                        if isinstance(record.task, AgentTask)
+                        else record.task.proposal.title
                         if record.task
                         else record.messages[0].content[:100]
                         if record.messages
@@ -240,10 +231,24 @@ def verification_router(
             return manager.submit(None, request)
         raise AssertionError("Unreachable")
 
+    @router.get("/workflows")
+    def workflows() -> list[dict[str, object]]:
+        return manager.runtime.workflow_catalog()
+
+    @router.get("/capabilities")
+    def capabilities() -> list[dict[str, object]]:
+        return manager.runtime.capability_catalog()
+
     @router.get("/{conversation_id}")
     def status(conversation_id: str) -> Conversation:
         with request_errors():
             return runtime.store.get(conversation_id)
+        raise AssertionError("Unreachable")
+
+    @router.get("/{conversation_id}/view")
+    def view(conversation_id: str) -> ConversationView:
+        with request_errors():
+            return to_conversation_view(runtime.store.get(conversation_id))
         raise AssertionError("Unreachable")
 
     @router.post("/{conversation_id}/messages", status_code=202)
@@ -290,6 +295,9 @@ def verification_router(
             directory = runtime.store.task_directory(conversation_id, task_id, task.output_root)
             if str(directory) != task.result_directory:
                 raise ValueError("Task result directory does not match its persisted identity")
+            if isinstance(item, OutputArtifact):
+                path = verify_evidence(directory, item)
+                return FileResponse(path, filename=Path(name).name)
             path = verify_artifact(directory, item)
             return FileResponse(path, media_type=item.media_type, filename=Path(name).name)
         raise AssertionError("Unreachable")

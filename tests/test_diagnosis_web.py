@@ -85,5 +85,5 @@ def test_d2_native_data_picker_needs_no_worker_and_still_requires_explicit_enabl
             json={"target": "project", "scenario": "d2", "path": str(root)},
         )
         assert response.status_code == 200, response.text
-        assert calls == [(str(root), "选择诊断数据目录")]
+        assert calls == [(str(root), "选择资源目录")]
         assert not runtime.store.recent()

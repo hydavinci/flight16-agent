@@ -1,4 +1,9 @@
-function result = flight_agent_step_metrics(inputTime,inputValue,responseTime,responseValue,policy)
+function result = flight_agent_step_metrics(inputTime,inputValue,responseTime,responseValue,policy,settlingBand)
+if nargin < 6
+    settlingBand = 0.05;
+end
+assert(isnumeric(settlingBand) && isscalar(settlingBand) && isfinite(settlingBand) ...
+    && settlingBand > 0 && settlingBand < 1, 'Invalid finite settling band');
 result = struct('kind','step_response','execution_status','completed', ...
     'valid',false,'metrics',struct,'diagnostics',{{}},'details',struct, ...
     'artifact_paths',{{}});
@@ -10,6 +15,7 @@ for index = 1:numel(names)
         policy.(names{index}) = defaults.(names{index});
     end
 end
+result.details = struct('settling_band',settlingBand,'steady_state_policy',policy);
 t = double(inputTime(:));
 u = double(inputValue(:));
 ty = double(responseTime(:));
@@ -26,7 +32,7 @@ if ty(1) < t(1)-timeTolerance || ty(end) > t(end)+timeTolerance
 end
 changes = find(abs(diff(u)) > max(1e-10,1e-8*max(abs(u))));
 if numel(changes) ~= 1
-    result.diagnostics = {'A single identifiable Stick step is required.'};
+    result.diagnostics = {'A single identifiable input step is required.'};
     return;
 end
 stepTime = t(changes(1)+1);
@@ -55,7 +61,7 @@ minimumChange = max(1e-8,100*eps(max(1,max(abs(y)))));
 result.details = struct('step_time',stepTime,'input_initial',u(changes(1)), ...
     'input_final',u(changes(1)+1),'initial_value',initial,'final_value',final, ...
     'steady_window_start',ty(tail(1)),'steady_window_seconds',window, ...
-    'settling_band',0.05,'steady_state_policy',policy,'sample_count',numel(y));
+    'settling_band',settlingBand,'steady_state_policy',policy,'sample_count',numel(y));
 if abs(change) <= minimumChange
     result.diagnostics = {'The response has no reliable nonzero steady-state change.'};
     return;
@@ -71,7 +77,7 @@ if relativeRange > policy.maximum_relative_range ...
     result.diagnostics = {'Initial or final response is not reliably steady; no forced step metrics.'};
     return;
 end
-info = stepinfo(y(after),elapsed,final,initial,'SettlingTimeThreshold',0.05);
+info = stepinfo(y(after),elapsed,final,initial,'SettlingTimeThreshold',settlingBand);
 if ~isfinite(info.Overshoot) || ~isfinite(info.SettlingTime) || info.SettlingTime < 0
     result.diagnostics = {'stepinfo did not produce valid finite response metrics.'};
     return;

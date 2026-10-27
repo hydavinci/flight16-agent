@@ -117,28 +117,32 @@ class ProjectInspector:
         )
 
     def _files(self, root: Path) -> list[FileDigest]:
-        files: list[FileDigest] = []
-        total = 0
-        for current, directories, names in os.walk(root, followlinks=False):
-            directories[:] = sorted(name for name in directories if name not in IGNORED)
-            for name in directories:
-                if (Path(current) / name).is_symlink():
-                    raise ValueError(f"Project symlink is not supported: {name}")
-            for name in sorted(names):
-                if name in IGNORED or name.endswith((".asv", ".slxc")):
-                    continue
-                path = Path(current) / name
-                relative = relative_path(path.relative_to(root).as_posix())
-                if path.is_symlink() or not path.is_file():
-                    raise ValueError(
-                        f"Project symlink or special file is not supported: {relative}"
-                    )
-                size = path.stat().st_size
-                total += size
-                if len(files) >= MAX_PROJECT_FILES or total > MAX_PROJECT_BYTES:
-                    raise ValueError("Project exceeds the 5000-file / 512 MB snapshot limit")
-                files.append(FileDigest(path=relative, sha256=file_digest(path), size=size))
-        return sorted(files, key=lambda item: item.path)
+        return inventory_project_files(root)
+
+
+def inventory_project_files(root: Path) -> list[FileDigest]:
+    files: list[FileDigest] = []
+    total = 0
+    for current, directories, names in os.walk(root, followlinks=False):
+        directories[:] = sorted(name for name in directories if name not in IGNORED)
+        for name in directories:
+            if (Path(current) / name).is_symlink():
+                raise ValueError(f"Project symlink is not supported: {name}")
+        for name in sorted(names):
+            if name in IGNORED or name.endswith((".asv", ".slxc")):
+                continue
+            path = Path(current) / name
+            relative = relative_path(path.relative_to(root).as_posix())
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(
+                    f"Project symlink or special file is not supported: {relative}"
+                )
+            size = path.stat().st_size
+            total += size
+            if len(files) >= MAX_PROJECT_FILES or total > MAX_PROJECT_BYTES:
+                raise ValueError("Project exceeds the 5000-file / 512 MB snapshot limit")
+            files.append(FileDigest(path=relative, sha256=file_digest(path), size=size))
+    return sorted(files, key=lambda item: item.path)
 
 
 def snapshot_project(project: ProjectDescriptor, destination: Path) -> Path:

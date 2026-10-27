@@ -224,7 +224,8 @@ def test_project_browse_uses_authenticated_worker(
         monkeypatch.setenv("MATLAB_WORKER_URL", url)
         with web_client(project) as client:
             response = client.get(
-                "/api/directories", params={"target": "project", "path": str(root)}
+                "/api/directories",
+                params={"target": "project", "path": str(root), "location": "worker"},
             )
 
     assert response.status_code == 200
@@ -244,11 +245,12 @@ def test_project_browse_does_not_fall_back_to_agent_filesystem(
     monkeypatch.delenv("MATLAB_WORKER_TOKEN", raising=False)
     with web_client(project) as client:
         response = client.get(
-            "/api/directories", params={"target": "project", "path": str(project)}
+            "/api/directories",
+            params={"target": "project", "path": str(project), "location": "worker"},
         )
 
     assert response.status_code == 503
-    assert "MATLAB_WORKER_URL" in response.json()["detail"]
+    assert "Worker" in response.json()["detail"]
     assert "directories" not in response.json()
 
 
@@ -275,7 +277,7 @@ def test_project_browse_preserves_worker_paths_and_query_encoding(
         )
         with web_client(project) as client:
             response = client.get(
-                "/api/directories", params={"target": "project", "path": path}
+                "/api/directories", params={"target": "project", "path": path, "location": "worker"}
             )
         assert not transport.is_closed
 
@@ -319,8 +321,29 @@ def test_project_browse_surfaces_worker_connection_failure(
         )
         with web_client(project) as client:
             response = client.get(
-                "/api/directories", params={"target": "project", "path": str(project)}
+                "/api/directories",
+                params={"target": "project", "path": str(project), "location": "worker"},
             )
 
     assert response.status_code == 503
     assert "worker unavailable" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "params,expected",
+    [
+        ({"location": "agent"}, 200),
+        ({"location": "diagnostic_data"}, 200),
+        ({"location": "unregistered"}, 422),
+        ({"location": "agent", "scenario": "d1"}, 422),
+        ({}, 422),
+    ],
+)
+def test_resource_directory_locations_are_explicit_and_unambiguous(project, params, expected):
+    with web_client(project) as client:
+        response = client.get(
+            "/api/directories", params={"target": "project", "path": str(project), **params},
+        )
+    assert response.status_code == expected, response.text
+    if expected == 200:
+        assert response.json()["path"] == str(project)

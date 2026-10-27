@@ -146,12 +146,13 @@ def test_native_selection_api_fills_only_selected_path(
     with native_client(project) as client:
         assert client.get("/api/bootstrap").json()["native_directory_picker"] is True
         response = client.post(
-            "/api/directories/select", json={"target": target, "path": str(project)}
+            "/api/directories/select",
+            json={"target": target, "path": str(project), "location": "worker"},
         )
 
     assert response.status_code == 200
     assert response.json() == {"path": None if cancel else str(project)}
-    assert calls == [(str(project), "选择工程目录" if target == "project" else "选择输出根目录")]
+    assert calls == [(str(project), "选择资源目录" if target == "project" else "选择输出根目录")]
 
 
 @pytest.mark.parametrize(
@@ -192,10 +193,24 @@ def test_native_project_selection_rejects_remote_worker(project, monkeypatch, lo
 
     monkeypatch.setattr(web, "choose_native_directory", unexpected, raising=False)
     with native_client(project) as client:
-        response = client.post("/api/directories/select", json={"target": "project"})
+        response = client.post(
+            "/api/directories/select", json={"target": "project", "location": "worker"},
+        )
 
     assert response.status_code == 409
     assert "Worker" in response.json()["detail"]
+
+
+def test_explicit_agent_resource_native_picker_needs_no_worker(project, monkeypatch):
+    monkeypatch.delenv("MATLAB_WORKER_URL", raising=False)
+    monkeypatch.delenv("MATLAB_WORKER_TOKEN", raising=False)
+    monkeypatch.setattr(web, "choose_native_directory", lambda path="", **kwargs: str(project))
+    with native_client(project) as client:
+        response = client.post(
+            "/api/directories/select", json={"target": "project", "location": "agent"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["path"] == str(project)
 
 
 @pytest.mark.parametrize("failure", ["native", "path"])

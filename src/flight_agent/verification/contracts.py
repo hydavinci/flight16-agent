@@ -1,12 +1,25 @@
 import re
-from collections.abc import Sequence
 from pathlib import PurePosixPath
 from typing import Annotated, Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from ..models import Contract, FiniteNumber, Nonempty
-from ..runtime.contracts import AnalysisRun, AnalysisSpec
+from ..runtime.agent_contracts import (
+    AgentBaseline,
+    AgentNode,
+    BudgetState,
+    InvocationRun,
+    InvocationSpec,
+)
+from ..runtime.contracts import AnalysisRun, AnalysisSpec, Name, Version
+from ..runtime.intents import WorkflowRequest
+from ..runtime.observations import CapabilityOutcome, OutputArtifact, TaskResult
+from ..runtime.observations import MetricValue as MetricValue
+from ..runtime.requirements import CapabilityGap
+from ..runtime.tasks import GeneralBaseline, GeneralProposal
+from ..runtime.tasks import PlanNode as PlanNode
+from ..runtime.tasks import plan_ancestors as plan_ancestors
 from ..upload_models import finite_json
 from .diagnosis_contracts import (
     DiagnosisBaseline,
@@ -14,6 +27,7 @@ from .diagnosis_contracts import (
     DiagnosisProposal,
     DiagnosisTermination,
     DiagnosticRound,
+    Hypothesis,
     HypothesisAssessment,
     PendingAnalysis,
 )
@@ -193,28 +207,6 @@ class EvaluationBaseline(Contract):
         return self
 
 
-class MetricValue(Contract):
-    value: FiniteNumber | None = None
-    unit: Nonempty
-    special: SpecialValue | None = None
-    valid: bool = True
-    reason: str = ""
-
-    @model_validator(mode="after")
-    def explicit_value(self) -> Self:
-        if self.value is not None and self.special is not None:
-            raise ValueError("A metric cannot contain both a finite and a special value")
-        if (
-            self.valid
-            and self.value is None
-            and self.special not in ("positive_infinity", "negative_infinity")
-        ):
-            raise ValueError("A valid metric requires a finite value or explicit infinity")
-        if not self.valid and not self.reason:
-            raise ValueError("An invalid metric requires an explicit reason")
-        return self
-
-
 class Artifact(FileDigest):
     media_type: Nonempty
     role: Literal["figure", "data", "report", "record"]
@@ -330,48 +322,6 @@ ToolName = NodeIdentifier
 NodeStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
 
 
-class PlanNode(Contract):
-    id: NodeIdentifier
-    tool: ToolName
-    depends_on: Annotated[list[str], Field(max_length=8)] = []
-    inputs: dict[str, JsonValue] = {}
-
-    @field_validator("inputs")
-    @classmethod
-    def finite_inputs(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        finite_json(value)
-        return value
-
-
-def plan_ancestors(nodes: Sequence[PlanNode]) -> dict[str, set[str]]:
-    if not nodes:
-        raise ValueError("A plan requires at least one node")
-    by_id = {node.id: node for node in nodes}
-    if len(by_id) != len(nodes):
-        raise ValueError("Plan node IDs must be unique")
-    ancestors: dict[str, set[str]] = {}
-
-    def visit(node_id: str, visiting: frozenset[str]) -> set[str]:
-        if node_id in visiting:
-            raise ValueError("Plan dependencies contain a cycle")
-        if node_id not in by_id:
-            raise ValueError("Plan dependency refers to an unknown node")
-        if node_id in ancestors:
-            return ancestors[node_id]
-        dependencies = by_id[node_id].depends_on
-        if len(dependencies) != len(set(dependencies)):
-            raise ValueError("Plan dependencies must be unique")
-        result = set(dependencies)
-        for dependency in dependencies:
-            result.update(visit(dependency, visiting | {node_id}))
-        ancestors[node_id] = result
-        return result
-
-    for node in nodes:
-        visit(node.id, frozenset())
-    return ancestors
-
-
 class PlanProposal(Contract):
     action: Literal["plan", "clarify", "explain"]
     title: Annotated[str, Field(max_length=200)] = ""
@@ -382,6 +332,7 @@ class PlanProposal(Contract):
     rationale: Annotated[str, Field(max_length=2000)] = ""
     question: Annotated[str, Field(max_length=2000)] = ""
     nodes: Annotated[list[PlanNode], Field(max_length=8)] = []
+    tool_versions: dict[ToolName, Version] = {}
 
     @model_validator(mode="after")
     def executable_plan(self) -> Self:
@@ -426,6 +377,7 @@ class ToolCall(MutableRecord):
     id: Identifier
     node_id: str
     tool: ToolName
+    tool_version: Version | None = None
     baseline_version: int
     status: NodeStatus = "running"
     started_at: str
@@ -442,7 +394,9 @@ class PlanVersion(Contract):
 
 
 class PendingDecision(Contract):
-    kind: Literal["clarify", "confirm_baseline", "confirm_replan", "resume", "retry"]
+    kind: Literal[
+        "clarify", "capability_gap", "confirm_baseline", "confirm_replan", "resume", "retry",
+    ]
     message: Nonempty
 
 
@@ -457,6 +411,8 @@ class ConversationMessage(Contract):
     role: Literal["user", "assistant"]
     content: Nonempty
     created_at: Nonempty
+    response_kind: Literal["answer", "clarify", "capability_gap", "plan"] | None = None
+    gaps: Annotated[list[CapabilityGap], Field(max_length=40)] = []
 
 
 class VerificationTask(MutableRecord):
@@ -512,8 +468,70 @@ class DiagnosisTask(MutableRecord):
     dispatch_count: Annotated[int, Field(strict=True, ge=0, le=40)] = 0
     no_progress_rounds: Annotated[int, Field(strict=True, ge=0)] = 0
 
+    @property
+    def current_hypotheses(self) -> list[Hypothesis]:
+        for round_ in reversed(self.rounds):
+            if revision := round_.review.hypothesis_revision:
+                return revision.hypotheses
+        return self.baseline.hypotheses
 
-Task = VerificationTask | DiagnosisTask
+
+class GeneralTask(MutableRecord):
+    scenario: Literal["general"] = "general"
+    workflow: NodeIdentifier
+    id: Identifier
+    baseline: GeneralBaseline
+    proposal: GeneralProposal
+    result_directory: Nonempty
+    output_root: str | None = None
+    stage: str = "awaiting_confirmation"
+    nodes: list[ExecutionNode]
+    calls: list[ToolCall] = []
+    decisions: list[Decision] = []
+    analysis_runs: list[AnalysisRun] = []
+    artifacts: list[Artifact] = []
+    outputs: dict[str, dict[str, JsonValue]] = {}
+    started_at: str | None = None
+
+
+class AgentExecutionNode(AgentNode, MutableRecord):
+    status: NodeStatus = "pending"
+    error: str | None = None
+
+
+class AgentTask(MutableRecord):
+    schema_version: Literal["2.0"] = "2.0"
+    id: Identifier
+    baseline: AgentBaseline
+    baseline_sha256: Digest | None = None
+    nodes: list[AgentExecutionNode]
+    calls: list[ToolCall] = []
+    decisions: list[Decision] = []
+    outputs: dict[str, CapabilityOutcome] = {}
+    analysis_runs: list[InvocationRun] = []
+    pending_specs: dict[Identifier, InvocationSpec] = {}
+    budget_state: BudgetState = BudgetState()
+    progress_calls: list[Identifier] = []
+    checkpoints: dict[Identifier, Nonempty] = {}
+    checkpoint_sha256: dict[Identifier, Digest] = {}
+    reuse_sources: dict[Identifier, Identifier] = {}
+    reuse_mappings: dict[Identifier, dict[NodeIdentifier, NodeIdentifier]] = {}
+    result: TaskResult | None = None
+    artifacts: list[OutputArtifact] = []
+    result_directory: Nonempty
+    output_root: str | None = None
+    stage: str = "awaiting_confirmation"
+
+    @field_validator("checkpoints")
+    @classmethod
+    def safe_checkpoints(cls, value: dict[str, str]) -> dict[str, str]:
+        for path in value.values():
+            relative_path(path)
+        return value
+
+
+LegacyTask = VerificationTask | DiagnosisTask | GeneralTask
+Task = LegacyTask | AgentTask
 
 
 ConversationStatus = Literal[
@@ -528,19 +546,24 @@ class ConversationState(Contract):
 
 
 class Conversation(MutableRecord):
-    scenario: Literal["d1", "d2"] = "d1"
+    scenario: Literal["auto", "d1", "d2"] = "d1"
     id: Identifier
     created_at: Nonempty
     updated_at: Nonempty
     status: ConversationStatus = "waiting_for_user"
     project_root: str | None = None
+    resource_location: Name | None = None
     output_root: str | None = None
+    output_root_reset: bool = False
     task: Task | None = None
     archived_tasks: list[Task] = []
     pending_decision: PendingDecision | None = None
     messages: list[ConversationMessage] = []
     error: str | None = None
     turn_origin: ConversationState | None = None
+    goal: Annotated[str, Field(max_length=4000)] = ""
+    active_workflow: NodeIdentifier | None = None
+    workflow_agenda: Annotated[list[WorkflowRequest], Field(max_length=6)] = []
 
     def restore_turn_origin(self) -> bool:
         if self.turn_origin is None:

@@ -25,12 +25,22 @@ from .directories import (
 from .jobs import BusyError, JobManager, JobStore
 from .models import AnalysisResult, Parameters, validate_result_context
 from .remote import RemoteError, RemoteWorker
+from .runtime.capabilities import CapabilityRegistry
 from .service import BodyLimitMiddleware, artifact_response, install_validation_handler, safe_log
 from .session import AnalysisSession
 from .upload_models import JobRecord, UploadRequest
-from .verification.backend import RemoteSimulinkBackend
+from .verification.agent_planner import AgentPlanner
+from .verification.agent_runtime import AgentContext, AgentExecutor
+from .verification.backend import AnalysisBackend, RemoteSimulinkBackend
+from .verification.compat import resolve_location
+from .verification.coordinator import EngineeringRuntime
+from .verification.local_matlab import LocalMatlabBackend
+from .verification.planner import VerificationPlanner
+from .verification.plugins import register_builtin_plugins
+from .verification.resources import ResourceLocation, ResourceRegistry
 from .verification.routes import verification_router
 from .verification.runtime import VerificationRuntime
+from .verification.store import ConversationStore
 
 
 class AnalysisRequest(BaseModel):
@@ -41,7 +51,8 @@ class DirectorySelectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     target: Literal["project", "output"]
-    scenario: Literal["d1", "d2"] = "d1"
+    scenario: Literal["d1", "d2"] | None = None
+    location: str | None = Field(default=None, min_length=1, max_length=128)
     path: str = Field(default="", max_length=4096)
 
 
@@ -59,8 +70,39 @@ def create_web_app(
     root: Path,
     *,
     verification_runtime: VerificationRuntime | None = None,
+    engineering_runtime: EngineeringRuntime | None = None,
     native_directory_picker: bool = False,
 ) -> FastAPI:
+    if verification_runtime is not None and engineering_runtime is not None:
+        raise ValueError("Inject only one conversation runtime")
+    local_backend = LocalMatlabBackend.from_environment()
+    resources = (
+        engineering_runtime.resources if engineering_runtime is not None else ResourceRegistry()
+    )
+    if engineering_runtime is None:
+        if verification_runtime is None:
+            conversations = ConversationStore(root / "runs" / "verification")
+            backend: AnalysisBackend | None
+            try:
+                backend = RemoteSimulinkBackend.from_environment()
+            except ValueError:
+                backend = None
+            legacy = VerificationRuntime(conversations.root, store=conversations, backend=backend)
+        else:
+            legacy = verification_runtime
+            backend = legacy.backend
+        tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
+        register_builtin_plugins(
+            tools, resources, backend=backend, planner=legacy.planner, local_backend=local_backend,
+        )
+        if verification_runtime is None:
+            engineering_runtime = EngineeringRuntime(
+                conversations, AgentPlanner(),
+                AgentExecutor(conversations, tools, resources), resources, legacy,
+            )
+    runtime = engineering_runtime if engineering_runtime is not None else verification_runtime
+    if runtime is None:
+        raise AssertionError("Conversation runtime was not assembled")
     root = root.resolve()
     store = JobStore(root / "runs" / "web")
     manager = JobManager(store)
@@ -99,10 +141,7 @@ def create_web_app(
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     install_validation_handler(app)
     auth = [Depends(authorize)]
-    verification_runtime = verification_runtime or VerificationRuntime(
-        root / "runs" / "verification"
-    )
-    app.include_router(verification_router(verification_runtime, manager, authorize))
+    app.include_router(verification_router(runtime, manager, authorize))
 
     @app.middleware("http")
     async def response_headers(
@@ -135,36 +174,71 @@ def create_web_app(
 
     @app.get("/api/bootstrap")
     def bootstrap() -> dict[str, object]:
+        local = local_backend.readiness()
         worker_error = model_error = None
         try:
             RemoteWorker.from_environment()
         except ValueError as exc:
             worker_error = str(exc)
-        try:
-            ModelSettings.from_environment()
-        except ValueError as exc:
-            model_error = str(exc)
+        if runtime.planner.model is None and type(runtime.planner) in (
+            AgentPlanner, VerificationPlanner,
+        ):
+            try:
+                ModelSettings.from_environment()
+            except ValueError as exc:
+                model_error = str(exc)
         return {
             "token": token,
             "worker_configured": worker_error is None,
             "worker_error": worker_error,
             "model_configured": model_error is None,
             "model_error": model_error,
+            "local_matlab": {
+                "state": local.state,
+                "reason": (
+                    "Import probe only; MATLAB startup and license are not verified."
+                    if local.state == "available"
+                    else "Local MATLAB Engine unavailable; enable MATLAB_ALLOW_TRUSTED_PROJECTS=1 "
+                    "and check the selected Python environment and Engine installation."
+                ),
+            },
             "trusted_code_only": True,
             "native_directory_picker": native_directory_picker,
         }
+
+    @app.get("/api/resource-locations", dependencies=auth)
+    def resource_locations() -> list[ResourceLocation]:
+        return resources.locations()
+
+    def project_location(location: str | None, scenario: str | None) -> ResourceLocation:
+        locations = resources.locations()
+        try:
+            identifier = resolve_location(location, scenario, locations)
+            if identifier is None:
+                if len(locations) != 1:
+                    raise ValueError("Select an explicit registered resource location")
+                identifier = locations[0].id
+            return next(item for item in locations if item.id == identifier)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/directories", dependencies=auth)
     def directories(
         target: Literal["project", "output"],
         path: str = Query(default="", max_length=4096),
-        scenario: Literal["d1", "d2"] = "d1",
+        scenario: Literal["d1", "d2"] | None = None,
+        location: str | None = Query(default=None, min_length=1, max_length=128),
     ) -> DirectoryListing:
-        if target == "project" and scenario == "d1":
+        if target == "project":
+            selected = project_location(location, scenario)
+            if selected.availability.state != "available":
+                raise HTTPException(status_code=503, detail=selected.availability.reason)
             try:
-                return RemoteSimulinkBackend.from_environment().browse(path)
-            except (ValueError, RemoteError) as exc:
+                return resources.browse(selected.id, path)
+            except RemoteError as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
+            except (ValueError, OSError) as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
             return browse_directories(path)
         except (ValueError, OSError) as exc:
@@ -177,7 +251,11 @@ def create_web_app(
                 status_code=409,
                 detail="Native directory selection requires --native-directory-picker",
             )
-        if request.target == "project" and request.scenario == "d1":
+        selected = (
+            project_location(request.location, request.scenario)
+            if request.target == "project" else None
+        )
+        if selected is not None and selected.location == "worker":
             try:
                 worker = RemoteWorker.from_environment()
             except ValueError as exc:
@@ -194,9 +272,7 @@ def create_web_app(
                 "path": choose_native_directory(
                     request.path,
                     title=(
-                        "选择诊断数据目录"
-                        if request.target == "project" and request.scenario == "d2"
-                        else "选择工程目录" if request.target == "project"
+                        "选择资源目录" if request.target == "project"
                         else "选择输出根目录"
                     ),
                 )

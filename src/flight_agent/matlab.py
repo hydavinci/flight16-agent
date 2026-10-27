@@ -32,7 +32,7 @@ def engine_available() -> bool:
         return False
 
 
-def _stop_worker(process: subprocess.Popen[str]) -> _CleanupResult:
+def _stop_worker(process: subprocess.Popen[str], *, label: str = "MATLAB") -> _CleanupResult:
     errors: list[str] = []
     stdout: str | bytes | None = None
     stderr: str | bytes | None = None
@@ -71,7 +71,7 @@ def _stop_worker(process: subprocess.Popen[str]) -> _CleanupResult:
     error = None
     if errors:
         error = (
-            f"MATLAB cleanup incomplete for process group {process.pid}: {'; '.join(errors)}. "
+            f"{label} cleanup incomplete for process group {process.pid}: {'; '.join(errors)}. "
             "Check the worker and its descendants before retrying."
         )
         logger.error(error)

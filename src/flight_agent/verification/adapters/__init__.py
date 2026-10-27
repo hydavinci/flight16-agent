@@ -1,0 +1,1 @@
+"""Trusted registered capability adapters."""

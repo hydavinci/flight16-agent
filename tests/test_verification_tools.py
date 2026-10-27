@@ -94,6 +94,83 @@ def test_registered_typed_analysis_executes_and_is_recorded_without_runtime_chan
     assert "acceptable" in definition["output_schema"]["properties"]
 
 
+def test_declared_tool_version_is_pinned_and_persisted_with_its_output(tmp_path):
+    runtime, _, model, root = runtime_fixture(tmp_path, [extension_plan()])
+    runtime.tools.register(peak_tool(version="2.3"))
+    pending = runtime.submit(None, "Verify with the registered extension.", str(root))
+    assert pending.task.proposal.tool_versions["check_peak"] == "2.3"
+    definition = next(
+        item for item in json.loads(model.seen[0][-1])["tools"] if item["name"] == "check_peak"
+    )
+    assert definition["version"] == "2.3"
+    completed = confirm(runtime, pending)
+    assert completed.status == "completed", completed.error
+    call = next(item for item in completed.task.calls if item.tool == "check_peak")
+    assert call.tool_version == "2.3"
+    restored = runtime.store.get(completed.id)
+    assert next(item for item in restored.task.calls if item.id == call.id).tool_version == "2.3"
+    record = json.loads(
+        (Path(completed.task.result_directory) / "delivery-v1/execution_record.json").read_text()
+    )
+    assert next(item for item in record["calls"] if item["id"] == call.id)["tool_version"] == "2.3"
+
+
+def test_changed_pending_tool_version_cannot_execute_under_old_confirmation(tmp_path):
+    runtime, backend, _, root = runtime_fixture(tmp_path, [extension_plan()])
+    runtime.tools.register(peak_tool(version="2"))
+    pending = runtime.submit(None, "Verify.", str(root))
+    restored = verification_module("runtime").VerificationRuntime(
+        tmp_path / "state", backend=backend, planner=runtime.planner
+    )
+    invoked = []
+    restored.tools.register(peak_tool(
+        lambda context, inputs: invoked.append(inputs), version="3"
+    ))
+    rejected = confirm(restored, pending)
+    assert rejected.status == "waiting_for_user"
+    assert "version" in rejected.error.lower()
+    assert not rejected.task.baseline.confirmed
+    assert not backend.calls and not invoked
+
+
+def test_completed_extension_retains_original_version_after_an_implementation_upgrade(
+    tmp_path, monkeypatch
+):
+    module = verification_module("runtime")
+    original = module.deliver_report
+    runtime, backend, _, root = runtime_fixture(tmp_path, [extension_plan()])
+    runtime.tools.register(peak_tool(version="2"))
+
+    def fail_delivery(*args, **kwargs):
+        raise OSError("Controlled report failure")
+
+    monkeypatch.setattr(module, "deliver_report", fail_delivery)
+    failed = confirm(runtime, runtime.submit(None, "Verify.", str(root)))
+    assert failed.status == "failed"
+    monkeypatch.setattr(module, "deliver_report", original)
+    restored = module.VerificationRuntime(
+        tmp_path / "state", backend=backend, planner=runtime.planner
+    )
+    invoked = []
+    restored.tools.register(peak_tool(
+        lambda context, inputs: invoked.append(inputs), version="3"
+    ))
+    done = restored.resume(failed.id)
+    assert done.status == "completed", done.error
+    assert not invoked
+    assert next(item for item in done.task.calls if item.tool == "check_peak").tool_version == "2"
+    assert done.task.proposal.tool_versions["check_peak"] == "2"
+
+
+def test_legacy_tool_call_does_not_invent_an_implementation_version():
+    call = verification_module("contracts").ToolCall(
+        id="a" * 32, node_id="check", tool="check_peak", baseline_version=1,
+        started_at="2026-10-20T12:00:00+00:00",
+    )
+    assert call.tool_version is None
+    assert call.model_dump()["tool_version"] is None
+
+
 @pytest.mark.parametrize(
     "nodes,error",
     [

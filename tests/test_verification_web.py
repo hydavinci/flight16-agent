@@ -55,7 +55,9 @@ def test_directory_agent_is_default_and_legacy_workbench_is_preserved(project, t
     ) as client:
         response = client.get("/")
         assert response.status_code == 200
-        assert "目录验证 Agent" in response.text
+        assert "飞控工程 Agent" in response.text
+        assert 'id="resource-location"' in response.text
+        assert 'id="scenario"' not in response.text
         assert "MATLAB 分析工作台" in client.get("/workbench").text
         for name in ("agent.js", "agent.css", "app.js", "style.css"):
             assert client.get(f"/static/{name}").status_code == 200

@@ -1,5 +1,6 @@
 import math
 import os
+import shutil
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -13,9 +14,28 @@ class ModelSettings:
     base_url: str
     api_key: SecretStr
     timeout_seconds: float
+    provider: str = "openai-compatible"
 
     @classmethod
     def from_environment(cls) -> "ModelSettings":
+        provider = os.environ.get("LLM_PROVIDER", "openai-compatible").strip()
+        if provider not in ("openai-compatible", "copilot-cli"):
+            raise ValueError("LLM_PROVIDER must be openai-compatible or copilot-cli")
+        timeout = float(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("LLM_TIMEOUT_SECONDS must be finite and greater than zero")
+        if provider == "copilot-cli":
+            if os.name != "posix":
+                raise ValueError("The Copilot CLI backend currently requires macOS or Linux")
+            if shutil.which("copilot") is None:
+                raise ValueError("Install GitHub Copilot CLI and sign in with copilot login")
+            return cls(
+                model=os.environ.get("LLM_MODEL", "").strip(),
+                base_url="",
+                api_key=SecretStr(""),
+                timeout_seconds=timeout,
+                provider=provider,
+            )
         values = {}
         for name in ("LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"):
             value = os.environ.get(name, "").strip()
@@ -34,9 +54,6 @@ class ModelSettings:
             raise ValueError(
                 "LLM_BASE_URL must be an HTTP(S) URL without credentials/query/fragment"
             )
-        timeout = float(os.environ.get("LLM_TIMEOUT_SECONDS", "60"))
-        if not math.isfinite(timeout) or timeout <= 0:
-            raise ValueError("LLM_TIMEOUT_SECONDS must be finite and greater than zero")
         return cls(
             model=values["LLM_MODEL"],
             base_url=values["LLM_BASE_URL"],
@@ -47,6 +64,11 @@ class ModelSettings:
 
 def create_model() -> ChatOpenAI:
     settings = ModelSettings.from_environment()
+    if settings.provider == "copilot-cli":
+        raise ValueError(
+            "Copilot CLI supports directory workflows only; CLI analyze and workbench "
+            "Agent analysis require LLM_PROVIDER=openai-compatible"
+        )
     return ChatOpenAI(
         model=settings.model,
         base_url=settings.base_url,

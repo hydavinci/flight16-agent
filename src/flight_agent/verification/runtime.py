@@ -4,19 +4,23 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from openai import APIError
 from pydantic import JsonValue
 
 from ..jobs import BusyError
+from ..runtime.capabilities import Capability, CapabilityDefinition, Input, Output
 from ..runtime.contracts import AnalysisRun, EvidenceFile, fingerprint
 from ..runtime.evidence import load_run, persist_run, receipt_name
+from ..runtime.intents import Scenario, WorkflowRequest
+from ..runtime.loop import LoopDecision, run_loop
+from ..runtime.workflows import DirectoryInputs, Workflow, WorkflowRegistry
 from ..session import _write_json
 from .artifacts import describe_artifact, verify_artifact
 from .backend import AnalysisBackend, RemoteSimulinkBackend
 from .contracts import (
+    AgentTask,
     AnalysisKind,
     AnalysisResult,
     AnalysisRunRequest,
@@ -29,6 +33,8 @@ from .contracts import (
     Evaluation,
     EvaluationBaseline,
     ExecutionNode,
+    GeneralTask,
+    LegacyTask,
     PendingDecision,
     PlanNode,
     PlanProposal,
@@ -41,6 +47,7 @@ from .contracts import (
 )
 from .diagnosis import DiagnosisRuntime
 from .evaluation import evaluate
+from .general import GeneralContext, GeneralRuntime
 from .intake import parse_directories, safe_directory, validate_output_root
 from .planner import VerificationPlanner
 from .reports import ReportRequest, deliver_report, finalize_execution_record
@@ -57,13 +64,46 @@ class VerificationRuntime:
         *,
         backend: AnalysisBackend | None = None,
         planner: VerificationPlanner | None = None,
+        store: ConversationStore | None = None,
     ):
-        self.store = ConversationStore(root)
+        self.store = store if store is not None else ConversationStore(root)
         self.backend = backend
         self.planner = planner or VerificationPlanner()
         self.lock = threading.Lock()
         self.tools = ToolRegistry(self._analyze, self._evaluate, self._deliver)
         self.diagnosis = DiagnosisRuntime(self.store, self.planner)
+        self.general = GeneralRuntime(self.store)
+        self.workflows: WorkflowRegistry[Conversation] = WorkflowRegistry()
+        self.workflows.register(Workflow(
+            CapabilityDefinition(
+                name="d1", version="1", description="Registered Simulink verification.",
+                effect="execute_project",
+            ), "worker_project", DirectoryInputs, self._propose_verification,
+        ))
+        self.workflows.register(Workflow(
+            CapabilityDefinition(
+                name="d2", version="1", description="Registered offline diagnostic data analysis.",
+                effect="read_only",
+            ), "diagnostic_data", DirectoryInputs,
+            lambda conversation, request: self.diagnosis.propose(conversation, request.request),
+        ))
+
+    def register_capability(self, capability: Capability[GeneralContext, Input, Output]) -> None:
+        if any(item["name"] == capability.name for item in self.workflows.catalog()):
+            raise ValueError(f"Workflow is already registered: {capability.name}")
+        self.general.tools.register(capability)
+        self.workflows.register(Workflow(
+            self.general.tools.definition(capability.name), "none", capability.input_model,
+            self._propose_general,
+        ))
+
+    def _propose_general(
+        self, conversation: Conversation, request: WorkflowRequest
+    ) -> Conversation:
+        proposal = self.planner.propose_general(
+            request, conversation, tools=self.general.tools.catalog()
+        )
+        return self.general.propose(conversation, proposal, workflow=request.workflow)
 
     @contextmanager
     def _operation(self) -> Iterator[None]:
@@ -88,6 +128,10 @@ class VerificationRuntime:
         self, conversation: Conversation, message: str, *, error: str | None = None
     ) -> Conversation:
         restored = conversation.restore_turn_origin()
+        switching = (
+            conversation.task is not None and conversation.active_workflow is not None
+            and conversation.active_workflow != self._task_workflow(conversation.task)
+        )
         if not restored:
             conversation.status = "waiting_for_user"
             conversation.error = error
@@ -95,9 +139,11 @@ class VerificationRuntime:
             conversation.error = error
         kind = (
             conversation.pending_decision.kind
-            if restored and conversation.pending_decision
+            if restored and conversation.pending_decision and not switching
             else "clarify"
         )
+        if switching:
+            conversation.status = "waiting_for_user"
         conversation.pending_decision = PendingDecision(kind=kind, message=message)
         self._message(conversation, "assistant", message)
         self.store.save(conversation)
@@ -110,7 +156,7 @@ class VerificationRuntime:
         project_root: str | None = None,
         *,
         output_root: str | None = None,
-        scenario: Literal["d1", "d2"] | None = None,
+        scenario: Scenario | None = None,
     ) -> Conversation:
         with self._operation():
             conversation = self._queue_message(
@@ -127,7 +173,7 @@ class VerificationRuntime:
         project_root: str | None = None,
         *,
         output_root: str | None = None,
-        scenario: Literal["d1", "d2"] | None = None,
+        scenario: Scenario | None = None,
     ) -> Conversation:
         with self._operation():
             return self._queue_message(
@@ -140,31 +186,27 @@ class VerificationRuntime:
         message: str,
         project_root: str | None,
         output_root: str | None,
-        scenario: Literal["d1", "d2"] | None,
+        scenario: Scenario | None,
     ) -> Conversation:
         if not message.strip() or len(message) > 4000:
             raise ValueError("A message between 1 and 4000 characters is required")
         conversation = self.store.get(conversation_id) if conversation_id else self.store.create()
-        if (
-            conversation_id is not None and scenario is not None
-            and scenario != conversation.scenario
-        ):
-            raise ValueError("Use a new conversation to change the task scenario")
-        if conversation_id is None:
-            conversation.scenario = scenario or "d1"
         self._message(conversation, "user", message.strip())
-        if (
-            isinstance(conversation.task, VerificationTask)
-            and conversation.task.pending_request
-            and not self._known_failed_run(conversation.task)
-        ):
+        if self._unknown_execution(conversation.task):
             self._message(
                 conversation,
                 "assistant",
-                "已有 Worker 运行待核对；请先续接该运行，不能直接发起重复仿真。",
+                "已有 Worker 或能力运行待核对；请先续接该运行，不能切换任务或重复派发。",
             )
             self.store.save(conversation)
             return conversation
+        selected = scenario or conversation.scenario
+        changed = selected != conversation.scenario
+        if changed or conversation_id is None:
+            conversation.scenario = selected
+            conversation.workflow_agenda = []
+        if selected != "auto":
+            conversation.active_workflow = selected
         if conversation.task is not None:
             conversation.turn_origin = ConversationState(
                 status=conversation.status,
@@ -175,20 +217,16 @@ class VerificationRuntime:
             message,
             project_root,
             output_root,
-            current_project=conversation.project_root,
-            current_output=conversation.output_root,
+            current_project=None if changed or selected == "auto" else conversation.project_root,
+            current_output=None if changed or selected == "auto" else conversation.output_root,
         )
         if intake.question is not None:
             return self._wait(conversation, intake.question)
         conversation.project_root = intake.project_root
         conversation.output_root = intake.output_root
-        if not conversation.project_root:
-            return self._wait(
-                conversation,
-                "请提供 Agent 可见的诊断数据目录路径。"
-                if conversation.scenario == "d2"
-                else "请提供 MATLAB Worker 可见的工程目录路径。",
-            )
+        conversation.output_root_reset = output_root is not None and not output_root.strip()
+        if selected == "auto" and not conversation.workflow_agenda:
+            conversation.goal = message.strip()
         conversation.status = "planning"
         conversation.error = None
         conversation.pending_decision = None
@@ -215,35 +253,15 @@ class VerificationRuntime:
 
     def _propose(self, conversation: Conversation, message: str) -> Conversation:
         try:
-            if conversation.project_root is None:
-                raise ValueError("A project directory is required")
-            if conversation.scenario == "d2":
-                return self.diagnosis.propose(conversation, message)
-            project = self._backend().inspect(conversation.project_root)
-            conversation.output_root = self._resolve_output_root(conversation, project)
-            if (
-                project.config.backend != "simulink"
-                or 1 not in project.config.supported_trim_points
-            ):
-                raise ValueError("D1 only supports a registered Simulink project at trim point 1")
-            proposal = self.planner.propose(
-                message, conversation, project, tools=self.tools.catalog()
-            )
-            if proposal.action == "clarify":
-                return self._wait(conversation, proposal.question)
-            if proposal.action == "explain":
-                if isinstance(conversation.task, DiagnosisTask):
-                    raise ValueError("D1 cannot reuse a diagnostic task")
-                if conversation.task and not self._same_project(conversation.task.project, project):
-                    return self._wait(
-                        conversation, "工程已经变化，请先确认新基线；不能沿用旧结论。"
-                    )
-                if conversation.task and conversation.output_root != conversation.task.output_root:
-                    return self._wait(conversation, "输出目录已变化，请先生成并确认新的交付计划。")
-                return self._answer(conversation, message)
-            self._plan(conversation, project, proposal)
-            self.store.save(conversation)
-            return conversation
+            if conversation.scenario == "auto":
+                if not conversation.workflow_agenda:
+                    decision = self._intent(conversation, message)
+                    if decision is not None:
+                        return decision
+                request = conversation.workflow_agenda[0]
+            else:
+                request = WorkflowRequest(workflow=conversation.scenario, request=message)
+            return self._propose_workflow(conversation, request)
         except (APIError, OSError, ValueError, RuntimeError) as exc:
             logger.exception("Verification planning failed for %s", conversation.id)
             return self._wait(
@@ -251,6 +269,129 @@ class VerificationRuntime:
                 "无法形成可执行计划，请补充或修正配置：" + str(exc)[:4000],
                 error=str(exc)[:4000],
             )
+
+    def _intent(
+        self, conversation: Conversation, message: str, *, phase: str = "request"
+    ) -> Conversation | None:
+        proposal = self.planner.plan_intent(
+            message, conversation, workflows=self.workflows.catalog(), phase=phase
+        )
+        if proposal.action == "clarify":
+            return self._wait(conversation, proposal.text)
+        if proposal.action == "answer":
+            if not conversation.restore_turn_origin():
+                conversation.status = "completed"
+                conversation.error = None
+                conversation.pending_decision = None
+            conversation.workflow_agenda = []
+            self._message(conversation, "assistant", proposal.text)
+            self.store.save(conversation)
+            return conversation
+        requests = [self.workflows.validate(item) for item in proposal.steps]
+        conversation.workflow_agenda = requests
+        self._message(conversation, "assistant", proposal.text)
+        self.store.save(conversation)
+        return None
+
+    @staticmethod
+    def _task_workflow(task: Task) -> str:
+        if isinstance(task, AgentTask):
+            raise ValueError("Use the generic v2 coordinator for this task")
+        return task.workflow if isinstance(task, GeneralTask) else task.scenario
+
+    def _propose_workflow(
+        self, conversation: Conversation, request: WorkflowRequest
+    ) -> Conversation:
+        request = self.workflows.validate(request)
+        workflow = self.workflows.get(request.workflow)
+        previous = conversation.task
+        previous_version = previous.baseline.version if previous is not None else 0
+        same = previous is not None and self._task_workflow(previous) == request.workflow
+        conversation.active_workflow = request.workflow
+        if (
+            conversation.project_root is None and same
+            and isinstance(previous, (VerificationTask, DiagnosisTask))
+        ):
+            conversation.project_root = previous.project.root
+        if (
+            conversation.output_root is None and not conversation.output_root_reset
+            and same and previous is not None
+        ):
+            conversation.output_root = previous.output_root
+        if workflow.directory != "none" and not conversation.project_root:
+            return self._wait(
+                conversation,
+                "请提供 Agent 可见的已登记诊断数据目录；不能复用验证工程或报告目录。"
+                if workflow.directory == "diagnostic_data"
+                else "请提供 MATLAB Worker 可见的已登记工程目录路径。",
+            )
+        planned = workflow.propose(conversation, request)
+        if planned.task is not previous:
+            conversation.workflow_agenda = conversation.workflow_agenda[1:]
+        elif planned.task is not None and planned.task.baseline.version != previous_version:
+            conversation.workflow_agenda = conversation.workflow_agenda[1:]
+        self.store.save(planned)
+        return planned
+
+    def _propose_verification(
+        self, conversation: Conversation, request: WorkflowRequest
+    ) -> Conversation:
+        if conversation.project_root is None:
+            raise ValueError("A project directory is required")
+        project = self._backend().inspect(conversation.project_root)
+        conversation.output_root = self._resolve_output_root(conversation, project)
+        if project.config.backend != "simulink" or 1 not in project.config.supported_trim_points:
+            raise ValueError("D1 only supports a registered Simulink project at trim point 1")
+        proposal = self.planner.propose(
+            request.request, conversation, project, tools=self.tools.catalog()
+        )
+        if proposal.action == "clarify":
+            return self._wait(conversation, proposal.question)
+        if proposal.action == "explain":
+            if (
+                conversation.task is not None
+                and not isinstance(conversation.task, VerificationTask)
+            ):
+                raise ValueError("D1 cannot reuse a task from a different workflow")
+            if conversation.task and not self._same_project(conversation.task.project, project):
+                return self._wait(
+                    conversation, "工程已经变化，请先确认新基线；不能沿用旧结论。"
+                )
+            if conversation.task and conversation.output_root != conversation.task.output_root:
+                return self._wait(conversation, "输出目录已变化，请先生成并确认新的交付计划。")
+            return self._answer(conversation, request.request)
+        self._plan(conversation, project, proposal)
+        return conversation
+
+    def _advance(self, conversation: Conversation) -> Conversation:
+        if (
+            conversation.status != "completed" or conversation.scenario != "auto"
+            or not conversation.workflow_agenda
+        ):
+            return conversation
+        conversation.project_root = None
+        conversation.output_root = None
+        conversation.output_root_reset = False
+        try:
+            decision = self._intent(conversation, conversation.goal, phase="observation")
+            if decision is not None:
+                return decision
+            return self._propose(conversation, conversation.workflow_agenda[0].request)
+        except (APIError, OSError, ValueError, RuntimeError) as exc:
+            logger.exception("Workflow progression failed for %s", conversation.id)
+            return self._wait(
+                conversation, "后续阶段需要补充输入或修正计划：" + str(exc)[:4000],
+                error=str(exc)[:4000],
+            )
+
+    def _unknown_execution(self, task: Task | None) -> bool:
+        if isinstance(task, VerificationTask):
+            return task.pending_request is not None and not self._known_failed_run(task)
+        if isinstance(task, DiagnosisTask):
+            return task.pending_analysis is not None
+        return task is not None and any(
+            call.status in ("running", "interrupted") for call in task.calls
+        )
 
     def _validate_plan(
         self, project: ProjectDescriptor, proposal: PlanProposal
@@ -267,10 +408,12 @@ class VerificationRuntime:
         self, conversation: Conversation, project: ProjectDescriptor, proposal: PlanProposal
     ) -> None:
         self._validate_plan(project, proposal)
-        task = conversation.task
-        if isinstance(task, DiagnosisTask):
-            raise ValueError("Use a new conversation to change the task scenario")
-        prior_tasks = [*conversation.archived_tasks, *([task] if task else [])]
+        proposal = proposal.model_copy(
+            update={"tool_versions": self.tools.versions(proposal.nodes)}
+        )
+        original = conversation.task
+        task = original if isinstance(original, VerificationTask) else None
+        prior_tasks = [*conversation.archived_tasks, *([original] if original else [])]
         version = max((item.baseline.version for item in prior_tasks), default=0) + 1
         baseline = EvaluationBaseline(
             version=version,
@@ -317,8 +460,8 @@ class VerificationRuntime:
             )
             if reusable and previous is not None:
                 self._copy_numerical(previous, task)
-            if previous is not None:
-                conversation.archived_tasks.append(previous)
+            if original is not None:
+                conversation.archived_tasks.append(original)
             conversation.task = task
         else:
             task.baseline_history.append(task.baseline)
@@ -351,9 +494,11 @@ class VerificationRuntime:
         )
         self._message(conversation, "assistant", conversation.pending_decision.message)
 
-    def _task(self, conversation: Conversation) -> Task:
+    def _task(self, conversation: Conversation) -> LegacyTask:
         if conversation.task is None:
             raise ValueError("No verification task has been planned")
+        if isinstance(conversation.task, AgentTask):
+            raise ValueError("Use the generic v2 coordinator for this task")
         directory = self.store.task_directory(
             conversation.id, conversation.task.id, conversation.task.output_root
         )
@@ -400,6 +545,13 @@ class VerificationRuntime:
         if trusted is not True:
             raise ValueError("Explicit trusted-project consent is required")
 
+    def _check_active_task(self, conversation: Conversation, task: Task) -> None:
+        if (
+            conversation.active_workflow is not None
+            and conversation.active_workflow != self._task_workflow(task)
+        ):
+            raise ValueError("The selected workflow stage requires a new plan and confirmation")
+
     def _same_project(self, first: ProjectDescriptor, second: ProjectDescriptor) -> bool:
         return (
             first.root == second.root
@@ -421,14 +573,18 @@ class VerificationRuntime:
         with self._operation():
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
+            self._check_active_task(conversation, task)
             self._check_confirmation(task, version, trusted)
             if conversation.status == "completed" and task.baseline.confirmed:
                 return conversation
             if task.baseline.confirmed:
                 raise ValueError("This baseline is already confirmed; use resume for saved work")
             if isinstance(task, DiagnosisTask):
-                return self.diagnosis.confirm(conversation, task)
+                return self._advance(self.diagnosis.confirm(conversation, task))
+            if isinstance(task, GeneralTask):
+                return self._advance(self.general.confirm(conversation, task))
             try:
+                self.tools.validate_versions(task)
                 project = self._backend().inspect(task.project.root)
                 if not self._same_project(task.project, project):
                     return self._wait(
@@ -451,12 +607,13 @@ class VerificationRuntime:
             )
             self._message(conversation, "user", f"确认基线 v{version}，并同意执行可信工程。")
             self.store.save(conversation)
-            return self._run(conversation, resume=False)
+            return self._advance(self._run(conversation, resume=False))
 
     def resume(self, conversation_id: str) -> Conversation:
         with self._operation():
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
+            self._check_active_task(conversation, task)
             if not task.baseline.confirmed:
                 raise ValueError("Confirm the current baseline before continuing")
             if conversation.status == "completed":
@@ -471,13 +628,13 @@ class VerificationRuntime:
                 else "续接已有任务；核对同一 Worker 运行，不重复提交。",
             )
             self.store.save(conversation)
-            return self._run(conversation, resume=True)
+            return self._advance(self._run(conversation, resume=True))
 
     def retry(self, conversation_id: str, version: int, *, trusted: bool) -> Conversation:
         with self._operation():
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
-            if isinstance(task, DiagnosisTask):
+            if not isinstance(task, VerificationTask):
                 raise ValueError("Worker retry is only available for D1 tasks")
             self._check_confirmation(task, version, trusted)
             if not task.baseline.confirmed or not self._known_failed_run(task):
@@ -498,7 +655,7 @@ class VerificationRuntime:
         with self._operation():
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
-            if isinstance(task, DiagnosisTask):
+            if not isinstance(task, VerificationTask):
                 raise ValueError("Worker recovery plans are only available for D1 tasks")
             self._check_confirmation(task, version, trusted)
             if task.pending_request is not None and not self._known_failed_run(task):
@@ -530,6 +687,8 @@ class VerificationRuntime:
         task = self._task(conversation)
         if isinstance(task, DiagnosisTask):
             return self.diagnosis.run(conversation, task)
+        if isinstance(task, GeneralTask):
+            return self.general.run(conversation, task)
         if not task.baseline.confirmed:
             raise ValueError("Execution requires a confirmed baseline")
         validate_output_root(task.result_directory, task.project.root)
@@ -550,7 +709,11 @@ class VerificationRuntime:
             if planned != task.proposal.nodes:
                 raise ValueError("Execution nodes do not match the confirmed plan")
             self.tools.validate_plan(planned)
-            while any(item.status != "completed" for item in task.nodes):
+            self.tools.validate_versions(task)
+            def decide() -> LoopDecision:
+                nonlocal node
+                if all(item.status == "completed" for item in task.nodes):
+                    return LoopDecision(action="stop", reason="Every confirmed node is complete")
                 completed = {item.id for item in task.nodes if item.status == "completed"}
                 node = next(
                     (
@@ -562,6 +725,15 @@ class VerificationRuntime:
                 )
                 if node is None:
                     raise ValueError("No executable node remains in the persisted plan")
+                return LoopDecision(
+                    action="continue", effect=self.tools.effect(node.tool),
+                    reason=f"Execute the next ready node: {node.id}",
+                )
+
+            def execute() -> None:
+                nonlocal current
+                if node is None:
+                    raise ValueError("No confirmed node was selected")
                 node.status = "running"
                 node.error = None
                 task.stage = node.tool
@@ -569,6 +741,7 @@ class VerificationRuntime:
                     id=uuid4().hex,
                     node_id=node.id,
                     tool=node.tool,
+                    tool_version=task.proposal.tool_versions.get(node.tool),
                     baseline_version=task.baseline.version,
                     started_at=now(),
                     inputs={
@@ -577,6 +750,9 @@ class VerificationRuntime:
                         "project_fingerprint": task.project.fingerprint,
                     },
                 )
+                if node.tool == "analyze_project" and task.pending_request is not None:
+                    versions = {spec.capability_version for spec in task.pending_specs.values()}
+                    current.tool_version = next(iter(versions)) if len(versions) == 1 else None
                 task.calls.append(current)
                 self.store.save(conversation)
                 current.output = self.tools.invoke(
@@ -588,7 +764,12 @@ class VerificationRuntime:
                 current.status = "completed"
                 current.finished_at = now()
                 node.status = "completed"
-                self.store.save(conversation)
+
+            run_loop(
+                decide=decide, execute=execute,
+                persist=lambda: self.store.save(conversation),
+                scope=self.tools.scope(task), max_steps=len(task.nodes),
+            )
             status = task.evaluation.status.upper() if task.evaluation else "UNDETERMINED"
             completion = ConversationMessage(
                 role="assistant",

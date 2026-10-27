@@ -25,7 +25,12 @@ def doctor(root: Path) -> int:
     available = engine_available()
     print(f"MATLAB Engine: {'package found' if available else 'not installed'}")
     print("MATLAB release/Python compatibility, runtime startup and license: not verified")
-    for name in ("LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"):
+    provider = os.environ.get("LLM_PROVIDER", "openai-compatible").strip()
+    print(f"LLM_PROVIDER: {provider}")
+    names = ("LLM_MODEL",) if provider == "copilot-cli" else (
+        "LLM_MODEL", "LLM_BASE_URL", "LLM_API_KEY"
+    )
+    for name in names:
         print(f"{name}: {'configured' if os.environ.get(name, '').strip() else 'missing'}")
     ready = available
     try:
@@ -83,11 +88,23 @@ def directory_task(args: argparse.Namespace) -> int:
         client.headers["X-Flight-Token"] = token
         base = "/api/conversations"
         if args.action == "propose":
-            body: dict[str, JsonValue] = {"message": args.request}
-            for field in ("project_root", "output_root", "scenario"):
+            structured = args.analysis_request is not None or args.criteria is not None
+            body: dict[str, JsonValue] = (
+                {"analysis_request": (
+                    args.analysis_request if args.analysis_request is not None else args.request
+                )}
+                if structured else {"message": args.request}
+            )
+            if args.criteria is not None:
+                body["evaluation_criteria"] = args.criteria
+            for field in ("project_root", "output_root", "scenario", "location"):
                 value = getattr(args, field)
                 if value is not None:
                     body[field] = value
+            if identifier is None and args.scenario is None:
+                body["scenario"] = "auto"
+                if structured and args.location is None:
+                    body["location"] = "matlab_project"
             record = request(
                 "POST", f"{base}/{identifier}/messages" if identifier else base, body
             )
@@ -120,24 +137,40 @@ def directory_task(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Local directory-based verification agent")
+    parser = argparse.ArgumentParser(description="Local flight-engineering agent")
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("doctor", help="Inspect configuration without external calls")
     analyze = commands.add_parser("analyze", help="Analyze a JSON file using the real agent")
     web = commands.add_parser("web", help="Serve the local Web interface")
     worker = commands.add_parser("worker", help="Serve the trusted-project MATLAB worker")
     directory = commands.add_parser(
-        "directory-task", help="Use the running local Web API for persistent D1/D2 tasks"
+        "directory-task",
+        help="Use the unified requirements-driven Web agent and saved conversations",
     )
     directory.add_argument("--server", default="http://127.0.0.1:8000")
     directory.add_argument("--timeout", type=int, default=360)
     actions = directory.add_subparsers(dest="action", required=True)
-    propose = actions.add_parser("propose", help="Propose a task without executing it")
-    propose.add_argument("--scenario", choices=("d1", "d2"))
-    propose.add_argument("--project-root", help="Worker project (D1) or Agent data directory (D2)")
+    propose = actions.add_parser(
+        "propose", help="Describe requirements; no scenario is needed and execution needs consent",
+    )
+    propose.add_argument(
+        "--scenario", choices=("auto", "d1", "d2"),
+        help="Legacy resource aliases: d1=Worker project, d2=Agent data; auto selects neither",
+    )
+    propose.add_argument(
+        "--project-root", help="Resource directory on its registered host, not an uploaded path",
+    )
     propose.add_argument("--output-root", help="Agent-visible delivery directory")
     propose.add_argument("--conversation", help="Continue an existing conversation")
-    propose.add_argument("--request", required=True)
+    propose.add_argument(
+        "--location", help="Explicit registered resource location or legacy host alias",
+    )
+    request_form = propose.add_mutually_exclusive_group(required=True)
+    request_form.add_argument("--request", help="Compatible single-message request")
+    request_form.add_argument("--analysis-request", help="Existing project analysis requirements")
+    propose.add_argument(
+        "--criteria", help="Optional evaluation criteria, preserved as user source",
+    )
     confirm = actions.add_parser("confirm", help="Confirm a recorded baseline and execute")
     confirm.add_argument("--version", type=int, required=True)
     confirm.add_argument("--trusted-project", action="store_true")
