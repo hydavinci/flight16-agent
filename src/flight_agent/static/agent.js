@@ -260,6 +260,9 @@ function chooseDirectory() {
 
 function table(headers, rows) {
   const wrapper = element("div", undefined, "table-scroll");
+  wrapper.tabIndex = 0;
+  wrapper.setAttribute("role", "region");
+  wrapper.setAttribute("aria-label", headers.join("、"));
   const result = element("table");
   const head = element("thead");
   const header = element("tr");
@@ -295,9 +298,36 @@ function sourceText(criterion) {
     : criterion?.source_note || "尚无明确来源";
 }
 
-function renderChecks(view) {
+function metricCard(label, value, special, unit, status, target) {
+  const card = element("section", undefined, "metric-card");
+  const heading = element("div", undefined, "metric-heading");
+  const badge = element("span", {
+    pass: "通过", fail: "未通过", undetermined: "无法判定", valid: "有效", invalid: "无效",
+  }[status] || status, "metric-status");
+  badge.dataset.verdict = status;
+  heading.append(element("span", label), badge);
+  const number = element("div", undefined, "metric-number");
+  const displayed = special || (typeof value === "number" && Number.isFinite(value)
+    ? Number(value.toPrecision(6)).toString()
+    : "不可用");
+  const numeric = element("span", displayed, "metric-value");
+  numeric.title = special || String(value ?? "不可用");
+  number.append(numeric, element("span", unit, "metric-unit"));
+  card.append(heading, number, element("p", target, "metric-target"));
+  return card;
+}
+
+function renderChecks(view, evidence) {
   const criteria = new Map(view.requirements.criteria.map((item) => [item.id, item]));
-  $("evaluation").append(table(
+  view.evaluation.checks.forEach((check) => {
+    const observation = view.observations.find((item) =>
+      item.node_id === check.metric.node_id && item.metric_id === check.metric.metric_id);
+    $("evaluation").append(metricCard(
+      observation?.label || check.metric.metric_id, check.value, check.special, check.value_unit || "",
+      check.status, `判据 ${check.operator} ${check.threshold} ${check.unit}`,
+    ));
+  });
+  evidence.append(element("h3", "判据、工况与证据"), table(
     ["指标", "工况", "实测值", "判据 / 来源", "状态与原因", "证据"],
     view.evaluation.checks.map((check) => {
       const criterion = criteria.get(check.criterion_id);
@@ -320,7 +350,10 @@ function renderEvaluation(view) {
   $("evaluation-heading").textContent = view.evaluation
     ? "评价结果" : hasResults ? "分析结果" : "需求缺项";
   if ($("evaluation-card").hidden) return;
-  $("explanation").textContent = "执行状态、数值有效性和合格判定彼此独立；证据不足时不推断通过。";
+  const evidence = element("details");
+  evidence.dataset.detailKey = "evaluation-evidence";
+  evidence.append(element("summary", "完整指标与判定依据"));
+  $("explanation").textContent = "执行、有效性与判定相互独立；证据不足不推断通过。摘要最多 6 位有效数字，完整记录请展开查看。";
   if (!view.evaluation && hasResults) {
     $("evaluation").append(element("p", view.requirements.mode === "analysis"
       ? "本任务未要求合格判定" : "尚无可用评价，详见任务状态与缺项"));
@@ -329,17 +362,24 @@ function renderEvaluation(view) {
       ? view.evaluation.status.toUpperCase() : "仅判定逐项条件，未要求总体结论", "verdict");
     verdict.dataset.verdict = view.evaluation.status || "";
     $("evaluation").append(verdict);
-    renderChecks(view);
+    renderChecks(view, evidence);
     view.evaluation.warnings.forEach((text) => $("evaluation").append(element("p", text, "hint")));
   }
-  if (view.observations.length) $("evaluation").append(
-    element("h3", "观测结果"),
-    table(["指标", "值", "单位", "工况", "有效性 / 原因", "证据"], view.observations.map((item) => [
+  if (view.observations.length) {
+    if (!view.evaluation) view.observations.forEach((item) => $("evaluation").append(metricCard(
+      item.label, item.value, item.special, item.unit, item.valid ? "valid" : "invalid", item.reason,
+    )));
+    evidence.append(element("h3", "观测与数值有效性"),
+      table(["指标", "值", "单位", "工况", "有效性 / 原因", "证据"], view.observations.map((item) => [
       `${item.label} / ${item.node_id}.${item.metric_id}`, item.special || (item.value ?? "不可用"),
       item.unit, JSON.stringify(item.conditions), `${item.valid ? "有效" : "无效"} ${item.reason}`,
       item.evidence.join("\n"),
-    ])),
-  );
+      ])),
+    );
+  }
+  if (view.evaluation?.checks.length || view.observations.length) {
+    evidence.append(element("p", "摘要数值最多显示 6 位有效数字；完整精度、工况及来源保留于上表。", "hint"));
+  }
   view.findings.forEach((item) => {
     const finding = element("section");
     finding.dataset.finding = item.id;
@@ -359,12 +399,14 @@ function renderEvaluation(view) {
       `能力缺口：${gap.requirement_id} / ${gap.missing_capability || ""}\n缺少输入：${
         gap.missing_inputs.join("、")}\n限制：${gap.limitation}\n下一步：${gap.next_step}`, "hint"));
   });
-  $("evaluation").append(details("技术记录", view.details));
+  evidence.append(details("技术记录", view.details));
+  $("evaluation").append(evidence);
 }
 
 function renderTask(view) {
   const key = `${current.id}/${view.id}/${view.baseline_version}/${current.pending_decision?.kind || ""}`;
-  if (key !== baselineKey) $("trusted").checked = false;
+  const changedBaseline = key !== baselineKey;
+  if (changedBaseline) $("trusted").checked = false;
   baselineKey = key;
   const executeProject = view.permissions.includes("execute_project");
   $("trust-text").textContent = "我已核对需求、资源、能力版本、权限与预算，同意执行本方案";
@@ -406,6 +448,11 @@ function renderTask(view) {
     $("baseline").append(details("恢复建议（尚未采纳或执行）", view.confirmation.recovery_proposal));
   }
   $("decision-controls").hidden = !(confirm || retry || resume || replan);
+  const needsDecision = String(!$("decision-controls").hidden);
+  if (changedBaseline || $("baseline-details").dataset.decision !== needsDecision) {
+    $("baseline-details").open = needsDecision === "true";
+    $("baseline-details").dataset.decision = needsDecision;
+  }
   $("decision-message").textContent = decision?.message || "";
   for (const [id, show] of [["confirm", confirm], ["retry", retry], ["resume", resume], ["replan", replan]]) {
     $(id).hidden = !show;
@@ -462,6 +509,10 @@ function renderDelivery(task) {
     button.addEventListener("click", () => download(conversationId, item.id, artifact, button));
     if (artifact.path.endsWith(".docx")) {
       button.className = "artifact-report";
+      button.textContent = `${prefix}${artifact.path.split("/").pop()}\nWord 报告 · ${artifact.size} bytes`;
+      button.title = `${prefix}${artifact.path}\nSHA-256: ${artifact.sha256}`;
+      evidenceList.append(element("p",
+        `${prefix}${artifact.path} (${artifact.size} bytes)\nSHA-256: ${artifact.sha256}`, "artifact-metadata"));
       $("artifacts").append(button);
     } else evidenceList.append(button);
   }));
@@ -471,6 +522,16 @@ function renderDelivery(task) {
   }
 }
 
+function messageText(message) {
+  if (message.role !== "user") return message.content;
+  const sections = message.content.match(
+    /^\[工程分析要求\]\n([\s\S]*)\n\[工程分析要求结束\](?:\n\n\[评价指标\]\n([\s\S]*)\n\[评价指标结束\])?$/,
+  );
+  if (!sections) return message.content;
+  return `[工程分析要求]\n${sections[1]}${
+    sections[2] === undefined ? "" : `\n\n[评价指标]\n${sections[2]}`}`;
+}
+
 function render(record, resetDirectories = false) {
   const previous = current;
   for (const [id, key] of [["project-root", "project_root"], ["output-root", "output_root"], ["resource-location", "resource_location"]]) {
@@ -478,9 +539,12 @@ function render(record, resetDirectories = false) {
     if (resetDirectories || input.value.trim() === (current?.[key] || "")) input.value = record[key] || "";
   }
   current = record;
+  $("conversation-title").textContent = record.task?.title
+    || record.messages[0]?.content.slice(0, 100) || "工程对话";
   renderLocation();
   $("conversation-status").textContent = statuses[record.status] || record.status;
   $("conversation-status").dataset.status = record.status;
+  $("conversation-status").hidden = false;
   renderProgress(record);
   const sameConversation = previous?.id === record.id;
   if (!sameConversation || JSON.stringify(previous.messages) !== JSON.stringify(record.messages)) {
@@ -490,7 +554,7 @@ function render(record, resetDirectories = false) {
     messages.replaceChildren(...record.messages.map((message) => {
       const node = element("div", undefined, "message");
       node.dataset.role = message.role;
-      node.append(element("strong", message.role === "user" ? "你" : "Agent"), element("span", message.content));
+      node.append(element("strong", message.role === "user" ? "你" : "Agent"), element("span", messageText(message)));
       (message.gaps || []).forEach((gap) => node.append(element("p", `能力缺口：${
         gap.missing_capability || gap.requirement_id}\n缺少输入：${gap.missing_inputs.join("、")}\n限制：${
         gap.limitation}\n下一步：${gap.next_step}`)));
@@ -515,11 +579,11 @@ function render(record, resetDirectories = false) {
     const sameTask = sameConversation && previous.task?.id === task.id;
     const focusedDetail = sameTask && document.activeElement?.tagName === "SUMMARY"
       ? document.activeElement.parentElement.dataset.detailKey : null;
-    if (sameTask) document.querySelectorAll("main details[data-detail-key]").forEach((node) => {
+    if (sameTask) document.querySelectorAll("#task-panel details[data-detail-key]").forEach((node) => {
       detailState.set(node.dataset.detailKey, node.open);
     });
     renderTask(task);
-    document.querySelectorAll("main details[data-detail-key]").forEach((node) => {
+    document.querySelectorAll("#task-panel details[data-detail-key]").forEach((node) => {
       if (detailState.has(node.dataset.detailKey)) node.open = detailState.get(node.dataset.detailKey);
       if (node.dataset.detailKey === focusedDetail) node.querySelector("summary").focus({preventScroll: true});
     });
@@ -553,8 +617,11 @@ async function history() {
   const records = await api(API);
   if (request !== historyRequest) return;
   $("conversation-history").replaceChildren(...records.map((record) => {
-    const button = element("button", `${record.title} · ${statuses[record.status] || record.status}`);
+    const button = element("button");
+    button.append(element("span", record.title, "history-title"),
+      element("small", statuses[record.status] || record.status));
     button.type = "button";
+    button.title = record.title;
     button.dataset.id = record.id;
     button.setAttribute("aria-current", String(current && current.id === record.id));
     button.addEventListener("click", () => select(record.id));
@@ -576,7 +643,9 @@ function clearConversation() {
   $("resource-location").value = locations.some((item) => item.id === "matlab_project"
     && item.availability.state === "available") ? "matlab_project" : "";
   $("messages").replaceChildren();
+  $("conversation-title").textContent = "工程对话";
   $("conversation-status").textContent = "新会话";
+  $("conversation-status").hidden = true;
   delete $("conversation-status").dataset.status;
   for (const id of ["baseline-card", "execution-card", "evaluation-card", "delivery-card"]) $(id).hidden = true;
   document.querySelectorAll("#conversation-history button").forEach((button) => button.setAttribute("aria-current", "false"));
@@ -592,6 +661,7 @@ async function select(id) {
   sending = true;
   controls();
   $("conversation-status").textContent = "正在加载";
+  $("conversation-status").hidden = false;
   try {
     const record = await conversation(`${API}/${id}/view`, id);
     if (generation !== selection) return;
@@ -713,10 +783,129 @@ $("new-conversation").addEventListener("click", () => {
   localStorage.removeItem("verification-conversation");
 });
 
+function initializeColumnResize(compact) {
+  const key = "flight-agent-column-widths";
+  const defaults = {left: 260, right: 340};
+  const minimum = {left: 200, right: 240};
+  const centerMinimum = 480;
+  const handles = {left: $("left-resizer"), right: $("right-resizer")};
+  let preferred = {...defaults};
+  let widths = {...defaults};
+  let drag = null;
+  try {
+    const saved = JSON.parse(localStorage.getItem(key));
+    if (saved && [saved.left, saved.right].every((value) => Number.isFinite(value) && value > 0)) {
+      preferred = {left: saved.left, right: saved.right};
+    }
+  } catch {
+    // Layout preferences must not prevent the task UI from starting.
+  }
+
+  function applyWidths() {
+    if (compact.matches) return;
+    const total = document.documentElement.clientWidth;
+    widths.left = Math.round(Math.max(minimum.left, Math.min(
+      preferred.left, total - centerMinimum - minimum.right,
+    )));
+    widths.right = Math.round(Math.max(minimum.right, Math.min(
+      preferred.right, total - centerMinimum - widths.left,
+    )));
+    for (const side of ["left", "right"]) {
+      document.body.style.setProperty(`--${side}-column-width`, `${widths[side]}px`);
+      const handle = handles[side];
+      handle.setAttribute("aria-valuemin", side === "left" ? minimum.left : widths.left + centerMinimum);
+      handle.setAttribute("aria-valuemax", side === "left"
+        ? total - widths.right - centerMinimum : total - minimum.right);
+      handle.setAttribute("aria-valuenow", side === "left" ? widths.left : total - widths.right);
+      handle.setAttribute("aria-valuetext", `${side === "left" ? "左" : "右"}栏 ${widths[side]} 像素`);
+    }
+  }
+
+  function saveWidths() {
+    try {
+      localStorage.setItem(key, JSON.stringify(preferred));
+    } catch {
+      // Resizing still works when browser preference storage is unavailable.
+    }
+  }
+
+  function adjust(side, value) {
+    const other = side === "left" ? "right" : "left";
+    preferred = {...widths, [side]: Math.max(minimum[side], Math.min(
+      Math.round(value), document.documentElement.clientWidth - centerMinimum - widths[other],
+    ))};
+    applyWidths();
+  }
+
+  function finish(cancel = false) {
+    if (!drag) return;
+    const previous = drag;
+    drag = null;
+    if (cancel) preferred = previous.preferred;
+    document.body.classList.remove("is-resizing-columns");
+    if (previous.handle.hasPointerCapture(previous.pointerId)) {
+      previous.handle.releasePointerCapture(previous.pointerId);
+    }
+    applyWidths();
+    if (!cancel) saveWidths();
+  }
+
+  function reset() {
+    finish(true);
+    preferred = {...defaults};
+    applyWidths();
+    saveWidths();
+  }
+
+  for (const [side, handle] of Object.entries(handles)) {
+    handle.addEventListener("pointerdown", (event) => {
+      if (compact.matches || event.button !== 0 || !event.isPrimary || drag) return;
+      event.preventDefault();
+      drag = {handle, pointerId: event.pointerId, x: event.clientX,
+        width: widths[side], preferred: {...preferred}};
+      handle.setPointerCapture(event.pointerId);
+      handle.focus({preventScroll: true});
+      document.body.classList.add("is-resizing-columns");
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (drag?.handle !== handle || drag.pointerId !== event.pointerId) return;
+      adjust(side, drag.width + (side === "left" ? 1 : -1) * (event.clientX - drag.x));
+    });
+    for (const name of ["pointerup", "pointercancel", "lostpointercapture"]) {
+      handle.addEventListener(name, (event) => {
+        if (drag?.handle === handle && drag.pointerId === event.pointerId) finish(name !== "pointerup");
+      });
+    }
+    handle.addEventListener("dblclick", reset);
+    handle.addEventListener("keydown", (event) => {
+      if (compact.matches) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        finish(true);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        reset();
+      } else if (["ArrowLeft", "ArrowRight"].includes(event.key) && !drag) {
+        event.preventDefault();
+        const delta = (event.key === "ArrowRight" ? 1 : -1) * (event.shiftKey ? 50 : 10);
+        adjust(side, widths[side] + (side === "left" ? delta : -delta));
+        saveWidths();
+      }
+    });
+  }
+  window.addEventListener("resize", () => { finish(true); applyWidths(); });
+  window.addEventListener("blur", () => finish(true));
+  applyWidths();
+}
+
 async function start() {
-  const compact = matchMedia("(max-width: 820px)");
-  $("history-panel").open = !compact.matches;
-  compact.addEventListener("change", (event) => { $("history-panel").open = !event.matches; });
+  const compact = matchMedia("(max-width: 1100px)");
+  function layoutPanels() {
+    for (const id of ["resource-panel", "task-panel"]) $(id).open = !compact.matches;
+  }
+  layoutPanels();
+  compact.addEventListener("change", layoutPanels);
+  initializeColumnResize(compact);
   renderLocation();
   renderProgress();
   try {

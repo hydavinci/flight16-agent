@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 .DS_Store
+.superpowers/
 __pycache__/
 *.py[cod]
 *.egg-info/

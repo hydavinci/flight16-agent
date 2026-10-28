@@ -55,7 +55,7 @@ def test_directory_agent_is_default_and_legacy_workbench_is_preserved(project, t
     ) as client:
         response = client.get("/")
         assert response.status_code == 200
-        assert "飞控工程 Agent" in response.text
+        assert "Flight Agent" in response.text
         assert 'id="resource-location"' in response.text
         assert 'id="scenario"' not in response.text
         assert "MATLAB 分析工作台" in client.get("/workbench").text
@@ -63,6 +63,16 @@ def test_directory_agent_is_default_and_legacy_workbench_is_preserved(project, t
             assert client.get(f"/static/{name}").status_code == 200
         assert client.get("/static/../config.py").status_code == 404
         assert "script-src 'self'" in response.headers["content-security-policy"]
+
+
+def test_favicon_is_served_as_a_local_svg_without_exposing_other_assets(project):
+    with TestClient(
+        web_module().create_web_app(project), base_url="http://127.0.0.1",
+    ) as client:
+        response = client.get("/static/favicon.svg")
+        assert response.status_code == 200
+        assert response.headers["content-type"].split(";")[0] == "image/svg+xml"
+        assert client.get("/static/unknown.svg").status_code == 404
 
 
 def test_recovery_plan_endpoint_requires_consent_and_does_not_execute(

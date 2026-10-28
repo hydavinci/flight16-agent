@@ -36,12 +36,15 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
+            if width <= 1100:
+                page.locator("#task-panel > summary").click()
             expect(page.locator("#scenario")).to_have_count(0)
             expect(page.get_by_label("任务需求", exact=True)).to_be_visible()
             expect(page.locator("#baseline-heading")).to_have_text("执行方案")
             page.get_by_label("任务需求", exact=True).fill("Analyze supplied synthetic arrays.")
             page.locator("#send").click()
             expect(page.locator("#confirm")).to_be_visible()
+            expect(page.locator("#conversation-status")).to_be_visible()
             expect(page.locator("#confirm")).to_be_disabled()
             expect(page.locator("#baseline")).to_contain_text("offline_rmse")
             expect(page.locator("#trust-warning")).not_to_contain_text("工程初始化代码")
@@ -50,6 +53,7 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
             page.locator("#trusted").check()
             page.locator("#confirm").click()
             expect(page.locator("#conversation-status")).to_have_text("已完成")
+            expect(page.locator("#conversation-status")).to_be_visible()
             expect(page.locator("#evaluation-heading")).to_have_text("分析结果")
             expect(page.locator("#evaluation")).to_contain_text("本任务未要求合格判定")
             expect(page.locator("#evaluation")).to_contain_text("RMSE")
@@ -90,8 +94,9 @@ def test_failed_check_and_missing_condition_remain_visible_with_sourced_criteria
         page.set_default_timeout(10000)
         try:
             page.goto(url)
-            if width < 820:
-                page.locator("#history-panel > summary").click()
+            if width <= 1100:
+                page.locator("#task-panel > summary").click()
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#conversation-status")).to_have_text("等待确认或补充")
             page.get_by_label("任务需求", exact=True).fill(message)
@@ -105,6 +110,14 @@ def test_failed_check_and_missing_condition_remain_visible_with_sourced_criteria
             expect(page.locator("#conversation-status")).to_have_text("已完成")
             expect(page.locator("#evaluation-heading")).to_have_text("评价结果")
             expect(page.locator("#evaluation .verdict")).to_have_text("UNDETERMINED")
+            cards = page.locator("#evaluation .metric-card")
+            expect(cards).to_have_count(2)
+            expect(cards.nth(0).locator(".metric-value")).to_have_text("1.41421")
+            expect(cards.nth(0)).to_contain_text("未通过")
+            expect(cards.nth(1).locator(".metric-value")).to_have_text("不可用")
+            expect(cards.nth(1)).to_contain_text("无法判定")
+            page.get_by_text("完整指标与判定依据", exact=True).click()
+            expect(page.get_by_text("判据、工况与证据", exact=True)).to_be_visible()
             expect(page.locator("#evaluation tbody tr").filter(has_text="FAIL")).to_have_count(1)
             expect(page.locator("#evaluation")).to_contain_text(source["quote"])
             expect(page.locator("#evaluation")).to_contain_text("unobserved")
@@ -298,6 +311,8 @@ def test_browser_reconfirms_sourced_acceptance_and_runs_another_registered_metri
         page.set_default_timeout(10000)
         try:
             page.goto(url)
+            if width <= 1100:
+                page.locator("#task-panel > summary").click()
             page.get_by_label("任务需求", exact=True).fill(
                 "Analyze synthetic arrays [0,2] and [0,0]; JSON only, no acceptance.",
             )
@@ -339,6 +354,10 @@ def test_browser_reconfirms_sourced_acceptance_and_runs_another_registered_metri
             expect(page.locator("#evaluation .verdict")).to_have_text("FAIL")
             expect(page.locator("#evaluation")).to_contain_text("0.8")
             expect(page.locator("#evaluation")).to_contain_text(source["quote"])
+            expect(page.locator("#artifacts .artifact-report")).not_to_contain_text("SHA-256")
+            expect(page.locator("#artifacts .artifact-metadata")).to_contain_text("SHA-256:")
+            if width > 1100:
+                expect(page.locator("#artifacts .artifact-report")).to_be_in_viewport()
             assert len(rmse_calls) == 1
             assert (
                 runtime.store.get(original.id).archived_tasks[0].baseline == original.task.baseline

@@ -49,6 +49,9 @@ def test_local_default_static_browsing_unavailable_engine_and_saved_selection(
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
+            if width <= 1100:
+                page.locator("#resource-panel > summary").click()
+                page.locator("#task-panel > summary").click()
             expect(page.get_by_label("任务需求", exact=True)).to_be_visible()
             expect(page.get_by_label("评价指标（可选）", exact=True)).to_be_visible()
             expect(page.locator("#resource-location")).to_have_value("matlab_project")
@@ -145,6 +148,10 @@ def test_structured_sources_require_consent_and_download_real_json_and_word(
         "[工程分析要求]\n  Analyze supplied synthetic arrays; deliver JSON and Word.  \n"
         "[工程分析要求结束]\n\n[评价指标]\n Require RMSE <= 0.8 m. \n[评价指标结束]"
     )
+    display = (
+        "[工程分析要求]\n  Analyze supplied synthetic arrays; deliver JSON and Word.  \n\n"
+        "[评价指标]\n Require RMSE <= 0.8 m. "
+    )
     source = {
         "kind": "user_message", "reference": f"message:{saved.id}:0", "quote": criteria,
     }
@@ -161,13 +168,16 @@ def test_structured_sources_require_consent_and_download_real_json_and_word(
                 if request.method == "POST" and request.url.endswith("/messages") else None)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#conversation-status")).to_have_text("等待确认或补充")
             page.locator("#message").fill(analysis)
             page.locator("#evaluation-criteria").fill(criteria)
             page.locator("#send").click()
             expect(page.locator("#baseline")).to_contain_text(source["reference"])
-            expect(page.locator("#messages")).to_contain_text(canonical)
+            assert page.locator(
+                '#messages .message[data-role="user"] > span',
+            ).text_content() == display
             expect(page.locator("#message")).to_have_value("")
             expect(page.locator("#evaluation-criteria")).to_have_value("")
             assert posted == [{"analysis_request": analysis, "evaluation_criteria": criteria}]

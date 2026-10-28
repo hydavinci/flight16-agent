@@ -168,7 +168,7 @@ def create_web_app(
 
     @app.get("/static/{name}")
     def asset(name: str) -> FileResponse:
-        if name not in ("app.js", "style.css", "agent.js", "agent.css"):
+        if name not in ("app.js", "style.css", "agent.js", "agent.css", "favicon.svg"):
             raise HTTPException(status_code=404, detail="Unknown asset")
         return FileResponse(static / name)
 

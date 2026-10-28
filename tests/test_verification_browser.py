@@ -50,6 +50,8 @@ def test_browser_native_picker_fills_both_fields_without_submitting(
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
+            if viewport_width <= 1100:
+                page.locator("#resource-panel > summary").click()
             page.locator("#resource-location").select_option("simulink_project")
             page.get_by_label("资源目录（可选）", exact=True).fill(str(root.parent))
             page.get_by_label("任务需求", exact=True).fill("Keep this unsent request.")
@@ -263,6 +265,8 @@ def test_browser_browses_both_hosts_without_submitting(
             page.on("pageerror", lambda error: errors.append(str(error)))
             try:
                 page.goto(url)
+                if viewport_width <= 1100:
+                    page.locator("#resource-panel > summary").click()
                 page.locator("#resource-location").select_option("simulink_project")
                 for target in ("project", "output"):
                     button = page.locator(f"#browse-{target}")
@@ -490,8 +494,9 @@ def test_browser_directory_conversation_confirmation_delivery_and_history(projec
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
-            expect(page.get_by_role("heading", name="飞控工程 Agent")).to_be_visible()
+            expect(page.locator("#conversation-title")).to_have_text(saved.task.proposal.title)
             expect(page.locator("#baseline")).to_contain_text("v1", timeout=10000)
             expect(page.locator("#baseline")).to_contain_text("overshoot")
             expect(page.locator("#baseline")).to_contain_text("10")
@@ -529,6 +534,7 @@ def test_browser_directory_conversation_confirmation_delivery_and_history(projec
             expect(page.locator("#messages")).not_to_contain_text(
                 "Perform pitch step verification."
             )
+            page.locator("#history-panel > summary").click()
             page.locator("#conversation-history button").first.click()
             expect(page.locator("#evaluation")).to_contain_text("FAIL")
             assert errors == []
@@ -554,6 +560,7 @@ def test_browser_chat_directories_refresh_fields_without_resubmitting_stale_path
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text(str(output), timeout=10000)
             expect(page.locator("#baseline")).to_contain_text("Agent 所在机器")
@@ -605,6 +612,7 @@ def test_browser_output_selection_reset_and_reload_preserve_numerical_and_histor
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text(str(first_output), timeout=10000)
             page.locator("#trusted").check()
@@ -659,6 +667,7 @@ def test_browser_output_selection_reset_and_reload_preserve_numerical_and_histor
             page.locator("#resource-location").select_option("simulink_project")
             expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value("")
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{first.id}"]').click()
             expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value(str(root))
             expect(page.get_by_label("输出根目录", exact=True)).to_have_value("")
@@ -682,6 +691,7 @@ def test_browser_unsent_directory_edits_survive_confirmation_and_polling(project
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{planned.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text(str(output))
             page.get_by_label("输出根目录", exact=True).fill(str(unsent_output))
@@ -714,6 +724,7 @@ def test_browser_recovery_plan_adoption_still_requires_fresh_baseline_consent(
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{failed.id}"]').click()
             expect(page.locator("#conversation-status")).to_have_text("失败")
             expect(page.get_by_role("button", name="续接已有运行", exact=True)).to_be_visible()
@@ -757,6 +768,7 @@ def test_browser_interrupted_execution_can_resume_without_duplicate_submission(p
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text("v1", timeout=10000)
             page.locator("#trusted").check()
@@ -789,6 +801,7 @@ def test_browser_renders_model_messages_as_text_and_keeps_failed_input(project, 
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#messages")).to_contain_text(injection, timeout=10000)
             assert page.locator("#messages img").count() == 0
@@ -827,10 +840,13 @@ def test_browser_rejects_mismatched_conversation_and_clears_old_evidence(project
         )
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{first.id}"]').click()
             expect(page.locator("#evaluation")).to_contain_text("PASS")
             page.locator(f'#conversation-history button[data-id="{second.id}"]').click()
             expect(page.locator("#notice")).to_contain_text("会话 ID 不匹配")
+            expect(page.locator("#conversation-status")).to_have_text("加载失败")
+            expect(page.locator("#conversation-status")).to_be_visible()
             expect(page.locator("#messages")).not_to_contain_text("First verification request.")
             expect(page.locator("#evaluation-card")).to_be_hidden()
             expect(page.locator("#delivery-card")).to_be_hidden()
@@ -856,10 +872,14 @@ def test_browser_discards_old_selection_response_after_starting_a_new_conversati
         page.route(path, lambda route: delayed.append(route), times=1)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             with page.expect_request(path):
                 page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
+            expect(page.locator("#conversation-status")).to_have_text("正在加载")
+            expect(page.locator("#conversation-status")).to_be_visible()
             expect(page.get_by_role("button", name="发送", exact=True)).to_be_disabled()
             page.get_by_role("button", name="新建会话", exact=True).click()
+            expect(page.locator("#conversation-status")).to_be_hidden()
             page.locator("#resource-location").select_option("simulink_project")
             page.get_by_label("任务需求", exact=True).fill("New unsent request.")
             page.get_by_label("资源目录（可选）", exact=True).fill("/new/project")
@@ -871,6 +891,7 @@ def test_browser_discards_old_selection_response_after_starting_a_new_conversati
                 "() => requestAnimationFrame(resolve)))"
             )
             expect(page.locator("#conversation-status")).to_have_text("新会话")
+            expect(page.locator("#conversation-status")).to_be_hidden()
             expect(page.locator("#messages")).not_to_contain_text("Previous conversation.")
             expect(page.get_by_label("任务需求", exact=True)).to_have_value("New unsent request.")
             expect(page.get_by_label("资源目录（可选）", exact=True)).to_have_value("/new/project")
@@ -896,6 +917,7 @@ def test_browser_rejects_mismatched_updates_to_the_current_conversation(project,
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{first.id}"]').click()
             expect(page.locator("#baseline")).to_contain_text("v1")
             endpoint = f"**/api/conversations/{first.id}"

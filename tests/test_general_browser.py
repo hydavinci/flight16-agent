@@ -74,6 +74,7 @@ def test_browser_reads_historical_knowledge_without_a_directory(project, tmp_pat
     )
     saved = runtime.submit(None, "增益裕度是什么？", scenario="auto")
     with browser_page(project, runtime) as page:
+        page.locator("#history-panel > summary").click()
         page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
         expect(page.locator("#scenario")).to_have_count(0)
         expect(page.locator("#conversation-status")).to_have_text("已完成")
@@ -90,6 +91,7 @@ def test_browser_historical_verification_confirmation_revision_and_reuse(project
     )
     saved = runtime.submit(None, "Verify synthetic pitch step.", str(root))
     with browser_page(project, runtime) as page:
+        page.locator("#history-panel > summary").click()
         page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
         expect(page.locator("#baseline")).to_contain_text("v1")
         expect(page.locator("#confirm")).to_be_disabled()
@@ -110,6 +112,7 @@ def test_browser_historical_verification_confirmation_revision_and_reuse(project
         assert len(backend.calls) == 1
         page.locator("#new-conversation").click()
         expect(page.locator("#trusted")).not_to_be_checked()
+        page.locator("#history-panel > summary").click()
         page.locator("#conversation-history button").first.click()
         expect(page.locator("#evaluation")).to_contain_text("FAIL")
 
@@ -140,8 +143,9 @@ def test_browser_historical_generic_baseline_outputs_without_f16_fields(project,
     register_mass(runtime, calls)
     saved = runtime.submit(None, "Sum synthetic masses 2 and 3.5 kg.", scenario="auto")
     with browser_page(project, runtime, width=width) as page:
-        if width < 820:
-            page.locator("#history-panel > summary").click()
+        if width <= 1100:
+            page.locator("#task-panel > summary").click()
+        page.locator("#history-panel > summary").click()
         page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
         expect(page.locator("#confirm")).to_be_visible()
         expect(page.locator("#baseline-heading")).to_have_text("执行方案")
@@ -166,6 +170,7 @@ def test_browser_resource_location_change_does_not_grant_or_forward_authorizatio
     runtime, _, _, root = runtime_fixture(tmp_path)
     saved = confirm(runtime, runtime.submit(None, "Verify.", str(root)))
     with browser_page(project, runtime) as page:
+        page.locator("#history-panel > summary").click()
         page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
         expect(page.locator("#evaluation")).to_contain_text("PASS")
         page.locator("#project-root").fill("/old/project")
