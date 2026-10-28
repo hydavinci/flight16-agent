@@ -3,134 +3,176 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>飞控工程 Agent</title>
+  <title>Flight Agent</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/agent.css">
   <script src="/static/agent.js" defer></script>
 </head>
 <body>
-  <aside class="sidebar">
+  <aside id="project-sidebar" class="sidebar" aria-label="工程配置与会话">
     <div class="sidebar-top">
-      <div class="brand">FLIGHT <span>ENGINEERING</span></div>
-      <button id="new-conversation" type="button">新建会话</button>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">F</span>Flight Agent</div>
     </div>
-    <details id="history-panel" open>
-      <summary>最近会话</summary>
-      <nav id="conversation-history" aria-label="最近会话"></nav>
-      <details class="environment">
-        <summary>运行环境</summary>
-        <p id="worker-state">正在检查 Worker 配置…</p>
-        <p id="local-matlab-state">正在检查本机 MATLAB Engine…</p>
-        <p id="model-state">正在检查模型配置…</p>
-        <a href="/workbench">打开原 MATLAB 分析工作台</a>
-      </details>
-    </details>
-  </aside>
-  <main>
-    <header>
-      <div>
-        <p class="eyebrow">知识、验证与诊断</p>
-        <h1>飞控工程 Agent</h1>
-        <p class="subtitle">从需求到证据，每一步都可追溯。</p>
+    <details id="resource-panel" class="settings-panel" open>
+      <summary>工程配置</summary>
+      <label for="resource-location">资源位置（可选）</label>
+      <select id="resource-location" form="composer">
+        <option value="">不使用目录或尚未选择</option>
+      </select>
+      <label id="project-label" for="project-root">资源目录（可选）</label>
+      <div class="directory-field">
+        <input id="project-root" form="composer" type="text" maxlength="4096" autocomplete="off"
+               placeholder="资源位置可见的绝对目录">
+        <button id="browse-project" type="button" aria-label="浏览资源目录"
+                aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
       </div>
-      <span id="conversation-status" class="badge" role="status">新会话</span>
-    </header>
-    <div class="workflow">
-      <ol id="task-progress" aria-label="任务进度">
-        <li aria-current="step"><span>1</span>明确需求</li>
-        <li><span>2</span>确认基线</li>
-        <li><span>3</span>执行分析</li>
-        <li><span>4</span>查看交付</li>
-      </ol>
-      <p id="next-action" role="status">直接描述需求；知识问答不需要目录，工程任务执行前需确认基线。</p>
-    </div>
-    <p id="capability-boundary" class="boundary">
-      仅调用已注册能力；判据来自本次需求及其明确来源，不预设演示阈值。
-      知识回答不是工程证据；执行前分别确认资源、能力版本、权限与预算。
-    </p>
-    <div id="notice" role="alert" hidden></div>
-    <section id="evaluation-card" class="card" aria-labelledby="evaluation-heading" hidden>
-      <h2 id="evaluation-heading">评价结果</h2>
-      <div id="evaluation"></div>
-      <p id="explanation" class="hint"></p>
-    </section>
-    <section id="delivery-card" class="card" aria-labelledby="delivery-heading" hidden>
-      <h2 id="delivery-heading">交付物</h2>
-      <p class="hint">下载时核对文件类型、大小与 SHA-256；历史版本保留，不覆盖原报告。</p>
-      <p id="results-directory" class="hint"></p>
-      <div id="artifacts"></div>
-    </section>
-    <section id="baseline-card" class="card" aria-labelledby="baseline-heading" hidden>
-      <h2 id="baseline-heading">执行方案</h2>
-      <div id="baseline"></div>
-      <div id="decision-controls" hidden>
-        <p id="decision-message"></p>
-        <label id="trust-label" class="consent">
-          <input id="trusted" type="checkbox">
-          <span id="trust-text">我已核对需求、资源、能力版本、权限与预算，同意执行本方案</span>
-        </label>
-        <p id="trust-warning" class="hint">
-          仅授权当前方案，不沿用其他任务的执行授权。
-        </p>
-        <div class="actions">
-          <button id="confirm" type="button" hidden disabled>确认基线并执行</button>
-          <button id="resume" type="button" hidden>续接已有运行</button>
-          <button id="retry" type="button" hidden disabled>确认重试失败分支</button>
-          <button id="replan" type="button" hidden disabled>采纳恢复方案（不执行）</button>
-        </div>
+      <label for="output-root">输出根目录</label>
+      <div class="directory-field">
+        <input id="output-root" form="composer" type="text" maxlength="4096" autocomplete="off"
+               placeholder="留空使用默认位置">
+        <button id="browse-output" type="button" aria-label="浏览输出根目录"
+                aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
       </div>
-    </section>
-    <section id="execution-card" class="card" aria-labelledby="execution-heading" hidden>
-      <h2 id="execution-heading">任务与执行证据</h2>
-      <p id="stage" role="status"></p>
-      <ol id="nodes"></ol>
-      <details>
-        <summary>执行日志与调用记录</summary>
-        <pre id="execution-log"></pre>
-      </details>
-    </section>
-    <section class="card" aria-labelledby="conversation-heading">
-      <h2 id="conversation-heading">任务会话</h2>
-      <div id="messages" aria-live="polite"></div>
-      <form id="composer">
-        <label for="resource-location">资源位置（可选）</label>
-        <select id="resource-location">
-          <option value="">不使用目录或尚未选择</option>
-        </select>
-        <label id="project-label" for="project-root">资源目录（可选）</label>
-        <div class="directory-field">
-          <input id="project-root" type="text" maxlength="4096" autocomplete="off"
-                 placeholder="选择资源位置后填写该位置可见的绝对目录">
-          <button id="browse-project" type="button" aria-label="浏览资源目录"
-                  aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
-        </div>
+      <details class="directory-help">
+        <summary>目录使用说明</summary>
         <p id="project-hint" class="hint">
           位置只说明资源所在主机与登记方式，不选择任务类型或注入判据。
           知识问答与显式输入能力不需要目录。
         </p>
-        <label for="output-root">输出根目录</label>
-        <div class="directory-field">
-          <input id="output-root" type="text" maxlength="4096" autocomplete="off"
-                 placeholder="Agent 所在机器的绝对目录；留空使用默认位置">
-          <button id="browse-output" type="button" aria-label="浏览输出根目录"
-                  aria-haspopup="dialog" aria-controls="directory-picker" disabled>浏览…</button>
-        </div>
+        <p class="hint">输出根目录是 Agent 所在机器的绝对目录，不是远程 Worker 路径。</p>
         <p class="hint">
-          不是远程 Worker 路径。每个任务新建独立子目录，不覆盖历史成果。
+          每个任务新建独立子目录，不覆盖历史成果。
           可在聊天中写“输出目录：/绝对路径”；修改或清空目录栏后，随任务需求发送才会生效。
         </p>
-        <label id="request-label" for="message">任务需求</label>
-        <textarea id="message" rows="3" maxlength="4000" required
-                  placeholder="工程分析要求或会话补充：描述目标、已有入口、工况与所需输出。"></textarea>
-        <label for="evaluation-criteria">评价指标（可选）</label>
-        <textarea id="evaluation-criteria" rows="2" maxlength="4000"
-                  placeholder="需要合格判定时填写阈值、单位、工况与来源；纯分析可留空。"></textarea>
-        <div class="composer-actions">
-          <span id="composer-hint" class="hint">缺少标准时先澄清；能力不足时明确说明，不猜测通过或失败。</span>
-          <button id="send" class="primary" type="submit" disabled>发送</button>
+      </details>
+    </details>
+    <details id="history-panel">
+      <summary>最近会话</summary>
+      <nav id="conversation-history" aria-label="最近会话"></nav>
+    </details>
+    <details class="environment">
+      <summary>运行环境</summary>
+      <p id="worker-state">正在检查 Worker 配置…</p>
+      <p id="local-matlab-state">正在检查本机 MATLAB Engine…</p>
+      <p id="model-state">正在检查模型配置…</p>
+      <a href="/workbench">MATLAB分析工作台</a>
+    </details>
+  </aside>
+  <div id="left-resizer" class="column-resizer" role="separator" tabindex="0"
+       aria-label="调整左栏宽度" aria-orientation="vertical"
+       aria-controls="project-sidebar chat-column"
+       title="拖动或用左右方向键调宽；双击或按 Enter 恢复默认布局"></div>
+  <main id="chat-column" aria-label="任务对话">
+    <header class="chat-header">
+      <div>
+        <p class="eyebrow">当前会话</p>
+        <h1 id="conversation-title">工程对话</h1>
+      </div>
+      <div class="chat-actions">
+        <span id="conversation-status" class="badge" role="status" hidden>新会话</span>
+        <button id="new-conversation" type="button" aria-label="新建会话">新建会话</button>
+      </div>
+    </header>
+    <div id="notice" role="alert" hidden></div>
+    <section class="conversation" aria-labelledby="conversation-heading">
+      <h2 id="conversation-heading" class="visually-hidden">任务会话</h2>
+      <div class="conversation-feed">
+        <div id="messages" aria-live="polite"></div>
+        <div class="empty-state">
+          <p class="eyebrow">工程分析 · 对话驱动</p>
+          <h2>从一个工程问题开始</h2>
+          <p>在左侧选择工程目录，在右侧填写评价指标，<br>然后在这里描述你的分析需求。</p>
+        </div>
+      </div>
+      <form id="composer">
+        <div class="composer-box">
+          <label id="request-label" for="message">任务需求</label>
+          <textarea id="message" rows="2" maxlength="4000" required
+                    placeholder="描述分析需求，或继续追问…"></textarea>
+          <div class="composer-actions">
+            <span id="composer-hint" class="hint">缺少标准时先澄清；能力不足时明确说明，不猜测通过或失败。</span>
+            <button id="send" class="primary" type="submit" disabled>发送</button>
+          </div>
         </div>
       </form>
     </section>
   </main>
+  <div id="right-resizer" class="column-resizer" role="separator" tabindex="0"
+       aria-label="调整右栏宽度" aria-orientation="vertical"
+       aria-controls="chat-column task-sidebar"
+       title="拖动或用左右方向键调宽；双击或按 Enter 恢复默认布局"></div>
+  <aside id="task-sidebar" class="task-sidebar" aria-label="任务配置与结果">
+    <details id="task-panel" open>
+      <summary>任务配置与结果</summary>
+      <label for="evaluation-criteria">评价指标（可选）</label>
+      <textarea id="evaluation-criteria" form="composer" rows="3" maxlength="4000"
+                placeholder="需要合格判定时填写阈值、单位、工况与来源；纯分析可留空。"></textarea>
+      <p class="hint">指标随下一条需求提交，执行以你确认的方案为准。</p>
+      <div class="workflow">
+        <ol id="task-progress" aria-label="任务进度">
+          <li aria-current="step"><span>1</span>明确需求</li>
+          <li><span>2</span>确认方案</li>
+          <li><span>3</span>执行分析</li>
+          <li><span>4</span>查看交付</li>
+        </ol>
+        <p id="next-action" role="status">直接描述需求；知识问答不需要目录，工程任务执行前需确认基线。</p>
+      </div>
+      <section id="evaluation-card" class="card" aria-labelledby="evaluation-heading" hidden>
+        <h2 id="evaluation-heading">评价结果</h2>
+        <div id="evaluation"></div>
+        <p id="explanation" class="hint"></p>
+      </section>
+      <section id="delivery-card" class="card" aria-labelledby="delivery-heading" hidden>
+        <h2 id="delivery-heading">交付物</h2>
+        <div id="artifacts"></div>
+        <details class="delivery-location">
+          <summary>成果目录与下载说明</summary>
+          <p class="hint">下载时核对文件类型、大小与 SHA-256；历史版本保留，不覆盖原报告。</p>
+          <p id="results-directory" class="hint"></p>
+        </details>
+      </section>
+      <section id="baseline-card" class="card" aria-labelledby="baseline-heading" hidden>
+        <details id="baseline-details">
+          <summary><h2 id="baseline-heading">执行方案</h2></summary>
+          <div id="baseline"></div>
+          <div id="decision-controls" hidden>
+            <p id="decision-message"></p>
+            <label id="trust-label" class="consent">
+              <input id="trusted" type="checkbox">
+              <span id="trust-text">我已核对需求、资源、能力版本、权限与预算，同意执行本方案</span>
+            </label>
+            <p id="trust-warning" class="hint">
+              仅授权当前方案，不沿用其他任务的执行授权。
+            </p>
+            <div class="actions">
+              <button id="confirm" type="button" hidden disabled>确认基线并执行</button>
+              <button id="resume" type="button" hidden>续接已有运行</button>
+              <button id="retry" type="button" hidden disabled>确认重试失败分支</button>
+              <button id="replan" type="button" hidden disabled>采纳恢复方案（不执行）</button>
+            </div>
+          </div>
+        </details>
+      </section>
+      <section id="execution-card" class="card" aria-labelledby="execution-heading" hidden>
+        <details>
+          <summary><h2 id="execution-heading">任务与执行证据</h2></summary>
+          <p id="stage" role="status"></p>
+          <ol id="nodes"></ol>
+          <details>
+            <summary>执行日志与调用记录</summary>
+            <pre id="execution-log"></pre>
+          </details>
+        </details>
+      </section>
+      <details class="boundary-notes">
+        <summary>能力与执行边界</summary>
+        <p id="capability-boundary" class="boundary">
+          仅调用已注册能力；判据来自本次需求及其明确来源，不预设演示阈值。
+          知识回答不是工程证据；执行前分别确认资源、能力版本、权限与预算。
+        </p>
+      </details>
+    </details>
+  </aside>
   <dialog id="directory-picker" aria-labelledby="directory-title" aria-describedby="directory-host">
     <h2 id="directory-title">选择目录</h2>
     <p id="directory-host" class="hint"></p>

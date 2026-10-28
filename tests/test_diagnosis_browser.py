@@ -29,8 +29,9 @@ def test_browser_d2_runs_adaptive_rounds_and_shows_cited_unknowns(project, tmp_p
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
             page.goto(url)
-            if width < 820:
-                page.locator("#history-panel > summary").click()
+            if width <= 1100:
+                page.locator("#task-panel > summary").click()
+            page.locator("#history-panel > summary").click()
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#scenario")).to_have_count(0)
             expect(page.locator("#baseline-heading")).to_have_text("执行方案")
@@ -87,7 +88,7 @@ def test_browser_light_task_first_layout_and_keyboard_controls(project, tmp_path
                 == "rgb(245, 245, 247)"
             )
             history = page.locator("#history-panel")
-            assert history.evaluate("(node) => node.open") is (width > 820)
+            expect(history).not_to_have_attribute("open", "")
             assert page.locator("main h1").bounding_box()["y"] < 300
             expect(page.locator("#task-progress [aria-current='step']")).to_contain_text("需求")
             expect(page.locator("#next-action")).to_contain_text("直接描述需求")
@@ -98,6 +99,8 @@ def test_browser_light_task_first_layout_and_keyboard_controls(project, tmp_path
                 page.locator("#send").evaluate("(node) => getComputedStyle(node).outlineStyle")
                 != "none"
             )
+            if width <= 1100:
+                page.locator("#resource-panel > summary").click()
             for selector in (
                 "#send",
                 "#new-conversation",
@@ -105,11 +108,11 @@ def test_browser_light_task_first_layout_and_keyboard_controls(project, tmp_path
                 "#resource-location",
                 "#history-panel > summary",
             ):
-                assert page.locator(selector).bounding_box()["height"] >= 44
+                minimum_height = 44 if width <= 1100 else 34
+                assert page.locator(selector).bounding_box()["height"] >= minimum_height
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth") is True
-            if width < 820:
-                page.locator("#history-panel > summary").click()
-                assert history.evaluate("(node) => node.open") is True
+            page.locator("#history-panel > summary").click()
+            expect(history).to_have_attribute("open", "")
         finally:
             browser.close()
 
@@ -129,6 +132,7 @@ def test_browser_followup_planning_does_not_claim_execution(project, tmp_path, c
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator("#conversation-history button").first.click()
             expect(page.locator("#baseline-heading")).to_have_text("执行方案")
             expect(page.locator("#baseline")).to_contain_text("v1")
@@ -164,8 +168,10 @@ def test_browser_poll_render_preserves_reading_position_and_expanded_details(pro
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator("#conversation-history button").first.click()
             expect(page.locator("#conversation-status")).to_have_text("已完成")
+            page.get_by_text("完整指标与判定依据", exact=True).click()
             page.get_by_text("技术记录", exact=True).click()
             details = page.locator('[data-detail-key="技术记录"]')
             messages = page.locator("#messages")
@@ -173,6 +179,9 @@ def test_browser_poll_render_preserves_reading_position_and_expanded_details(pro
             messages.evaluate("(node) => { node.scrollTop = 0; }")
             page.evaluate("() => render(JSON.parse(JSON.stringify(current)))")
             assert messages.evaluate("(node) => node.scrollTop") == 0
+            assert page.locator('[data-detail-key="evaluation-evidence"]').evaluate(
+                "(node) => node.open",
+            ) is True
             assert details.evaluate("(node) => node.open") is True
             page.evaluate("""() => {
                 const record = JSON.parse(JSON.stringify(current));
@@ -181,6 +190,9 @@ def test_browser_poll_render_preserves_reading_position_and_expanded_details(pro
                 render(record);
             }""")
             assert messages.evaluate("(node) => node.scrollTop") == 0
+            assert page.locator('[data-detail-key="evaluation-evidence"]').evaluate(
+                "(node) => node.open",
+            ) is True
             assert details.evaluate("(node) => node.open") is True
         finally:
             browser.close()
@@ -203,6 +215,7 @@ def test_browser_legacy_diagnosis_does_not_invent_a_structured_conclusion(projec
         page.set_default_timeout(5000)
         try:
             page.goto(url)
+            page.locator("#history-panel > summary").click()
             page.locator("#conversation-history button").first.click()
             expect(page.locator('[data-finding="diagnosis-summary"]')).to_contain_text(
                 "结构化诊断未记录"
