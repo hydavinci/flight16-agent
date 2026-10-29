@@ -1,6 +1,10 @@
+import importlib
+from types import SimpleNamespace
+
 import pytest
 from pydantic import Field
 
+from flight_agent.verification.contracts import Conversation, DiagnosisTask, VerificationTask
 from flight_agent.verification.diagnosis_contracts import DiagnosisProposal
 from flight_agent.verification.structured_planner import StructuredPlanner, redact_text
 from tests.diagnosis_helpers import diagnosis_proposal
@@ -14,6 +18,34 @@ def test_redact_text_hides_local_paths_and_credentials():
     )
     assert "/private/project" not in value
     assert "secret-value" not in value
+
+
+def test_legacy_conversation_paths_redact_current_and_archived_task_projects():
+    archived = VerificationTask.model_construct(
+        project=SimpleNamespace(root="/private/archived-project"),
+        output_root="/private/archived-output",
+        result_directory="/private/archived-result",
+    )
+    current = DiagnosisTask.model_construct(
+        project=SimpleNamespace(root="/private/current-project"),
+        output_root="/private/current-output",
+        result_directory="/private/current-result",
+    )
+    conversation = Conversation.model_construct(
+        project_root="/private/different-conversation-project",
+        output_root="/private/conversation-output",
+        archived_tasks=[archived],
+        task=current,
+    )
+    planner = importlib.import_module("flight_agent.verification.planner")
+
+    value = redact_text(
+        "current=/private/current-project archived=/private/archived-project",
+        planner._conversation_paths(conversation),
+    )
+
+    assert "/private/current-project" not in value
+    assert "/private/archived-project" not in value
 
 
 def test_structured_planner_rejects_nonpositive_timeout():

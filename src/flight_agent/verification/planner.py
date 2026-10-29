@@ -16,7 +16,7 @@ from .contracts import (
 )
 from .diagnosis_contracts import DiagnosisProposal, DiagnosisReview
 from .diagnostic_data import DiagnosticProject
-from .structured_planner import StructuredPlanner, conversation_paths, redact_text
+from .structured_planner import StructuredPlanner, redact_text
 
 SYSTEM_PROMPT = """
 你是目录式飞控验证助手。你只提出类型化计划、澄清问题，或解释已记录的数值证据。
@@ -152,6 +152,18 @@ def _diagnostic_text(value: object, paths: Sequence[str | None]) -> object:
     return value
 
 
+def _conversation_paths(conversation: Conversation) -> list[str | None]:
+    tasks = [*conversation.archived_tasks, *([conversation.task] if conversation.task else [])]
+    return [
+        conversation.project_root,
+        conversation.output_root,
+        *(path for task in tasks for path in (
+            task.project.root if isinstance(task, (VerificationTask, DiagnosisTask)) else None,
+            task.output_root, task.result_directory
+        )),
+    ]
+
+
 class VerificationPlanner(StructuredPlanner):
     def _call(
         self,
@@ -167,7 +179,7 @@ class VerificationPlanner(StructuredPlanner):
         self, message: str, conversation: Conversation, *,
         workflows: list[dict[str, object]], phase: str = "request",
     ) -> IntentProposal:
-        paths = conversation_paths(conversation)
+        paths = _conversation_paths(conversation)
         task = conversation.task
         if isinstance(task, AgentTask):
             raise ValueError("Use the generic v2 planner for this task")
@@ -215,7 +227,7 @@ class VerificationPlanner(StructuredPlanner):
         self, request: WorkflowRequest, conversation: Conversation, *,
         tools: list[dict[str, object]],
     ) -> GeneralProposal:
-        paths = conversation_paths(conversation)
+        paths = _conversation_paths(conversation)
         return self._call(
             "propose_general", GeneralProposal,
             {
@@ -235,7 +247,7 @@ class VerificationPlanner(StructuredPlanner):
         *,
         tools: list[dict[str, object]] | None = None,
     ) -> PlanProposal:
-        local_paths = conversation_paths(conversation)
+        local_paths = _conversation_paths(conversation)
         return self._call(
             "propose_verification",
             PlanProposal,
@@ -269,7 +281,7 @@ class VerificationPlanner(StructuredPlanner):
         *,
         tools: list[dict[str, object]],
     ) -> DiagnosisProposal:
-        paths = [project.root, *conversation_paths(conversation)]
+        paths = [project.root, *_conversation_paths(conversation)]
         pending = conversation.pending_decision or (
             conversation.turn_origin.pending_decision if conversation.turn_origin else None
         )
