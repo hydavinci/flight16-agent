@@ -97,17 +97,14 @@ def test_structured_api_persists_canonical_source_on_create_and_followup(tmp_pat
 
 
 @pytest.mark.parametrize(
-    ("location", "scenario", "expected"),
+    "location",
     [
-        ("agent", None, "diagnostic_data"),
-        ("worker", None, "simulink_project"),
-        (None, "d1", "simulink_project"),
-        ("matlab_project", None, "matlab_project"),
+        "diagnostic_data",
+        "simulink_project",
+        "matlab_project",
     ],
 )
-def test_explicit_resource_aliases_do_not_change(tmp_path, location, scenario, expected):
-    from flight_agent.verification.compat import resolve_location
-
+def test_registered_resource_locations_are_explicit(tmp_path, location):
     app = create_web_app(tmp_path)
     with TestClient(app, base_url="http://127.0.0.1") as client:
         headers = {"X-Flight-Token": client.get("/api/bootstrap").json()["token"]}
@@ -117,9 +114,11 @@ def test_explicit_resource_aliases_do_not_change(tmp_path, location, scenario, e
             ResourceLocation.model_validate(item)
             for item in client.get("/api/resource-locations", headers=headers).json()
         ]
-        assert resolve_location(location, scenario, locations) == expected
-        with pytest.raises(ValueError, match="conflicts"):
-            resolve_location("matlab_project", "d1", locations)
+        assert location in {item.id for item in locations}
+        assert (
+            MessageRequest(message="Inspect registered resource", location=location).location
+            == location
+        )
 
 
 def test_bootstrap_trust_gate_does_not_probe_or_execute(tmp_path, monkeypatch):

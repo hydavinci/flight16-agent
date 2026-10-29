@@ -5,6 +5,8 @@
 本项目把“理解需求”“执行计算”“评价结果”分开。
 大模型提出受约束的方案，已注册工具产生证据，程序按已确认判据评价并交付。
 这种分层支持扩展新能力，但不代表已经能执行任意 MATLAB 分析。
+只有一个通用 v2 运行时，没有 D1/D2 场景选择。
+Worker 工程与离线诊断数据都是注册资源，不是独立产品。
 
 [能力与资源](#注册能力与资源) · [执行机制](#方案授权与证据) · [源码目录](#源码目录) · [开发验证](#开发与验证)
 
@@ -58,9 +60,10 @@ Web 启动时装配 `CapabilityRegistry(agent_mode=True)`、`ResourceRegistry`�
 `EngineeringRuntime`、`AgentPlanner` 和 `AgentExecutor`。
 本机后端直接使用兼容 Python 子进程与 MATLAB Engine；远程后端通过 `RemoteSimulinkBackend`。
 
-目录 Agent 的版本化状态保存在本地文件，不依赖 LangGraph checkpoint。
-旧固定算例 CLI 使用 LangChain/LangGraph 工具循环，两条路径不能混为一谈。
-服务没有 Redis、Celery 或业务数据库；目录任务与兼容上传任务共享单服务执行槽。
+通用 Agent 的版本化状态保存在本地文件；不使用 LangGraph 或顶层 LangChain 运行时。
+结构化模型传输保留 `langchain-core`、`langchain-openai`、`langsmith` 和 `openai`。
+服务没有 Redis、Celery、SQLite 或任务队列；单进程只接纳一个后台任务。
+Future 完成前不释放执行槽；状态持久化与后台接纳顺序保持一致。
 
 ## 注册能力与资源
 
@@ -128,8 +131,9 @@ Engine 探测、启动、许可、仿真和指标有效性是不同检查，不�
 有状态能力保存原调用检查点，恢复时核对规格与回执。
 缺少可核验回执时明确停止；新需求也不能绕过尚未对账的旧调用。
 
-失败阶段保留已有证据，未完成阶段不伪造结果。旧 v1 任务按原契约执行和恢复，
-只读投影到统一视图；缺少历史来源或适配器版本时标记未记录，不补造。
+失败阶段保留已有证据，未完成阶段不伪造结果。
+v1 历史不再读取、执行、恢复或投影；旧上传/demo 与恢复提案入口不受支持。
+已有 v2 状态继续保留确认、调用身份、哈希、检查点与交付，不生成兼容任务。
 
 ## 大模型调用边界
 
@@ -162,11 +166,9 @@ Copilot 适配在空临时目录运行，仅允许加载技能，禁止其文件
 
 将注册表、资源表和会话存储注入 `EngineeringRuntime`，即可复用确认、执行、展示和交付链路。
 不需要在新能力中引入 F16、配平点或固定三节点假设。
-最小装配例子见 [D1 技术参考](d1-agent.md)。插件是可信 Python 代码，不是可由模型动态安装的脚本。
-
-若只扩展上传计算，保持 `params/result` 契约即可；要参与判定，还须适配观测与判据。
-替换固定 CLI 算例则需同步 `models.py`、`matlab_worker.py`、入口快照、规则、知识与真实参考测试，
-不能仅修改阈值就视为完成工程接入。
+装配使用 `plugins.register_builtin_plugins`，分别注入 Worker 后端与诊断 reviewer。
+插件是可信 Python 代码，不是可由模型动态安装的脚本。
+资源准备见 [Simulink Worker 参考](simulink-worker.md)与[离线诊断参考](offline-diagnostics.md)。
 
 ## 源码目录
 
@@ -191,13 +193,13 @@ src/flight_agent/
 |   |-- loop.py                  # 有界执行驱动
 |   |-- budget.py                # 预算计算
 |   |-- evidence.py              # 工件、摘要与不可变回执
-|   `-- tasks.py / workflows.py / intents.py
+|   `-- tasks.py                 # 通用依赖图节点与祖先校验
 |-- verification/
 |   |-- coordinator.py           # 会话与任务协调
 |   |-- agent_planner.py         # 通用规划与来源校验
 |   |-- agent_runtime.py         # 依赖执行、复用和对账
 |   |-- routes.py                # 会话 API
-|   |-- views.py                 # 新旧任务只读视图
+|   |-- views.py                 # v2 当前与归档任务只读视图
 |   |-- store.py                 # 会话与任务目录
 |   |-- intake.py                # 目录识别、冲突与路径约束
 |   |-- plugins.py               # 生产能力装配
@@ -214,17 +216,13 @@ src/flight_agent/
 |   |   `-- delivery.py          # JSON/Word 交付
 |   |-- diagnostic_data.py       # 数据清单与快照
 |   |-- diagnostic_engine.py / diagnostic_signals.py
-|   |-- diagnosis.py / diagnosis_contracts.py / diagnosis_reports.py
+|   |-- diagnosis_contracts.py / diagnostic_planner.py
 |   |-- projects.py / backend.py / worker.py / matlab.py
-|   `-- runtime.py / planner.py / compat.py
+|   `-- legacy_cleanup.py        # 原始记录分类与显式清理，不执行旧任务
 |-- remote.py                    # 远端提交、轮询与下载
-|-- jobs.py                      # 兼容上传任务调度
-|-- matlab.py / matlab_worker.py # 固定 CLI 算例
-|-- upload_engine.py             # 单文件上传执行
-|-- agent.py                     # 兼容工具循环
-|-- session.py                   # 兼容分析结果持久化
-|-- models.py / upload_models.py # 兼容输入输出契约
-|-- rules.py / knowledge.py      # 规则比较与知识检索
+|-- background.py                # Future 与后台执行槽生命周期
+|-- matlab.py                    # Engine 探测与进程组清理
+|-- models.py                    # 共用严格契约与有限数值
 |-- service.py                   # HTTP 校验、鉴权与文件访问
 |-- directories.py               # 目录选择
 |-- matlab_support/
@@ -234,16 +232,13 @@ src/flight_agent/
 |   |-- flight_agent_local_allmargin.m
 |   |-- flight_agent_step_metrics.m
 |   |-- flight_agent_margin_metrics.m
-|   |-- flight_agent_verify.m
-|   `-- flight_agent_execute_upload.m
+|   `-- flight_agent_verify.m
 `-- static/
     |-- agent.html / agent.css / agent.js
-    |-- index.html / style.css / app.js
     `-- favicon.svg
 ```
 
-其他目录：`matlab/` 放固定算例，`examples/` 放示例输入和合成诊断数据，
-`rules/` 放版本化判据，`knowledge/` 放 Markdown 依据，`tests/` 放各层回归。
+其他目录：`examples/` 放合成诊断数据，`tests/` 放各层回归。
 `.env.example` 是配置模板，`pyproject.toml` 管理依赖、打包和开发工具。
 
 ## 开发与验证
@@ -252,7 +247,7 @@ src/flight_agent/
 
 ```bash
 python -m pip install -e '.[dev]'
-python -m pytest -q
+python -m pytest -m "not matlab" -q
 python -m ruff check .
 python -m mypy src
 python -m build
@@ -264,17 +259,16 @@ python -m build
 ```bash
 python -m playwright install chromium --only-shell
 RUN_BROWSER_TESTS=1 python -m pytest \
-  tests/test_agent_browser.py tests/test_verification_browser.py \
-  tests/test_diagnosis_browser.py tests/test_general_browser.py \
+  tests/test_agent_browser.py \
   tests/test_matlab_project_browser.py tests/test_agent_layout_browser.py \
-  tests/test_agent_column_resize_browser.py tests/test_web_browser.py -v
+  tests/test_agent_column_resize_browser.py -v
 ```
 
 在已安装匹配 Engine 和许可证的环境中，可显式运行真实集成：
 
 ```bash
 RUN_MATLAB_TESTS=1 python -m pytest \
-  tests/test_matlab.py tests/test_verification_matlab.py tests/test_uploads.py -m matlab -v
+  tests/test_verification_matlab.py -m matlab -v
 
 RUN_MATLAB_TESTS=1 MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
 MATLAB_PYTHON_EXECUTABLE=/absolute/path/to/compatible/python \
@@ -283,21 +277,21 @@ MATLAB_PYTHON_EXECUTABLE=/absolute/path/to/compatible/python \
 ```
 
 本机集成包含解析响应、真正非线性闭环、不同初始化工作区、5%/2% 调节带、错误与报告下载。
-独立参考与容差见 [D1 技术参考](d1-agent.md)。这些测试准备夹具，不让生产 Agent 生成缺少的模型。
+独立参考与容差见 [Simulink Worker 参考](simulink-worker.md)。
+这些测试准备夹具，不让生产 Agent 生成缺少的模型。
 如需用 `--basetemp` 保留产物，只能指定新的专用目录，因为 pytest 会清空该目录。
 
 软件回归不等于目标工程验收。真实服务、平台依赖、独立数值参考和业务流程仍须分别核对；
 没有标注故障案例，也不能声称已验证诊断准确率。
 
 Python 包包含静态资源和受控 MATLAB 支持函数，不包含 MATLAB、用户工程、
-固定演示入口、知识或规则文件。完整部署需保留项目目录，并正确设置 `--project-root`。
+知识或规则文件。完整部署需正确设置 `--project-root`。
 
-### 当前范围与原始需求
+## CLI 与历史清理
 
-| 原始需求 | 已覆盖 | 仍需验收或实现 |
-|---|---|---|
-| D1 功能流程 v0.5 | 发现、规划、确认、执行、追问、交付、恢复 | 目标平台与模型服务的独立业务验收 |
-| D1 案例 v0.3 | Worker 配平点 1 的时域与裕度链路 | 真实工程参考与逐项容差对照 |
-| Demo Roadmap | D1 软件闭环、有界 D2 证据循环 | 主动补跑 Simulink、真实故障案例、D3–D6 |
-
-D3–D6 只保留部分设计版本和效果契约，不是已实现的优化、拓扑编辑或候选采纳工作流。
+支持 `doctor`、`web`、`worker`、`directory-task propose/confirm/status/resume`
+和 `cleanup-legacy`；不提供场景、工作流目录或恢复提案接口。
+`cleanup-legacy --project-root ...` 默认 dry-run，仅报告原始记录分类。
+显式 `--apply` 才删除正面识别为 v1 的会话目录，保留 v2、未知记录和外部成果。
+源路径必须通过 `Path.resolve(strict=True)` 严格解析；无法解析或包含于待删目录时跳过。
+清理器不依赖任何旧任务契约；详见[历史清理](usage.md#历史清理)。

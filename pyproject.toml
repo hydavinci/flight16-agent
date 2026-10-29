@@ -5,13 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "flight-matlab-agent"
 version = "0.1.0"
-description = "A local LangChain agent with controlled MATLAB Engine tools"
+description = "A generic engineering agent with controlled MATLAB Engine capabilities"
 requires-python = ">=3.11"
 dependencies = [
-    "langchain>=1.0,<2",
     "langchain-core>=1.0,<2",
     "langchain-openai>=1.0,<2",
-    "langgraph>=1.0,<2",
     "langsmith>=0.3,<1",
     "openai>=1.100,<3",
     "pydantic>=2.10,<3",

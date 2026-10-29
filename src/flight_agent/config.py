@@ -66,8 +66,7 @@ def create_model() -> ChatOpenAI:
     settings = ModelSettings.from_environment()
     if settings.provider == "copilot-cli":
         raise ValueError(
-            "Copilot CLI supports directory workflows only; CLI analyze and workbench "
-            "Agent analysis require LLM_PROVIDER=openai-compatible"
+            "Copilot CLI requires StructuredPlanner, not an API chat model"
         )
     return ChatOpenAI(
         model=settings.model,

@@ -8,11 +8,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flight_agent.config import ModelSettings, create_model
-from flight_agent.verification.legacy_contracts import PlanProposal
+from flight_agent.verification.agent_planner import AgentDecision, AgentPlanner
 from flight_agent.verification.diagnostic_planner import DiagnosticReviewer
-from flight_agent.verification.planner import VerificationPlanner
+from flight_agent.verification.structured_planner import StructuredPlanner
 from flight_agent.web import create_web_app
-from tests.test_verification_runtime import proposal, runtime_fixture
+from tests.agent_helpers import draft_data, make_agent_web
 
 
 @pytest.fixture
@@ -66,9 +66,9 @@ def events(content, *, complete=True, tool=None):
 
 
 def call_planner():
-    return VerificationPlanner()._call(
-        "propose_plan",
-        PlanProposal,
+    return StructuredPlanner().call(
+        "propose_agent",
+        AgentDecision,
         {"request": "Synthetic test only"},
         system_prompt="Propose a plan; never execute it.",
     )
@@ -76,13 +76,13 @@ def call_planner():
 
 def test_copilot_returns_validated_plan_without_api_credentials(copilot_cli, monkeypatch):
     monkeypatch.setenv(
-        "PROBE_EVENTS", events('{"action":"clarify","question":"Which synthetic fixture?"}')
+        "PROBE_EVENTS", events('{"action":"clarify","text":"Which synthetic fixture?"}')
     )
     monkeypatch.setenv("LLM_API_KEY", "do-not-forward-api-secret")
     monkeypatch.setenv("MATLAB_WORKER_TOKEN", "do-not-forward-worker-secret")
     result = call_planner()
     assert result.action == "clarify"
-    assert result.question == "Which synthetic fixture?"
+    assert result.text == "Which synthetic fixture?"
     captured = json.loads(copilot_cli.read_text())
     assert captured["has_api_secret"] is False
     assert captured["has_worker_secret"] is False
@@ -117,9 +117,9 @@ def test_copilot_losslessly_shares_catalog_schemas_and_reduces_request_size(
         }]},
     }
     original = deepcopy(context)
-    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","question":"Synthetic only"}'))
-    result = VerificationPlanner()._call(
-        "propose_plan", PlanProposal, context, system_prompt="Never execute the plan."
+    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","text":"Synthetic only"}'))
+    result = StructuredPlanner().call(
+        "propose_agent", AgentDecision, context, system_prompt="Never execute the plan."
     )
     assert result.action == "clarify"
     prompt = json.loads(copilot_cli.read_text())["args"][-1]
@@ -157,9 +157,9 @@ def test_copilot_shares_only_identical_whole_schemas_and_preserves_local_refs(
         {"name": "second", "output_schema": dict(reversed(list(original_schema.items())))},
         {"name": "different", "output_schema": different_schema},
     ]}
-    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","question":"Synthetic only"}'))
-    VerificationPlanner()._call(
-        "propose_plan", PlanProposal, context, system_prompt="Never execute the plan."
+    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","text":"Synthetic only"}'))
+    StructuredPlanner().call(
+        "propose_agent", AgentDecision, context, system_prompt="Never execute the plan."
     )
     payload = json.loads(json.loads(copilot_cli.read_text())["args"][-1].split("\n", 1)[1])
     catalog = payload["request_context"]["catalog"]
@@ -179,9 +179,9 @@ def test_copilot_shares_only_identical_whole_schemas_and_preserves_local_refs(
     ],
 )
 def test_copilot_keeps_unhelpful_sharing_inline(copilot_cli, monkeypatch, context):
-    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","question":"Synthetic only"}'))
-    VerificationPlanner()._call(
-        "propose_plan", PlanProposal, context, system_prompt="Never execute the plan."
+    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","text":"Synthetic only"}'))
+    StructuredPlanner().call(
+        "propose_agent", AgentDecision, context, system_prompt="Never execute the plan."
     )
     payload = json.loads(json.loads(copilot_cli.read_text())["args"][-1].split("\n", 1)[1])
     assert payload["request_context"] == context
@@ -192,9 +192,9 @@ def test_copilot_keeps_unhelpful_sharing_inline(copilot_cli, monkeypatch, contex
     ("output", "message"),
     [
         (events("not JSON"), "JSON"),
-        (events('{"action":"plan","title":"Incomplete","rationale":"test"}'), "analyses|criteria"),
-        (events('{"action":"clarify","question":"test"}', complete=False), "complete"),
-        (events('{"action":"clarify","question":"test"}', tool="shell"), "tool"),
+        (events('{"action":"plan","text":"Incomplete"}'), "plan"),
+        (events('{"action":"clarify","text":"test"}', complete=False), "complete"),
+        (events('{"action":"clarify","text":"test"}', tool="shell"), "tool"),
         ("not JSONL", "JSON"),
     ],
 )
@@ -225,7 +225,7 @@ def test_copilot_rejects_complete_output_when_process_does_not_finish_in_time(
 ):
     monkeypatch.setenv("LLM_TIMEOUT_SECONDS", "1")
     monkeypatch.setenv("PROBE_EXIT_DELAY", "10")
-    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","question":"Complete text"}'))
+    monkeypatch.setenv("PROBE_EVENTS", events('{"action":"clarify","text":"Complete text"}'))
     with pytest.raises(ValueError, match="timed out"):
         call_planner()
     assert json.loads(copilot_cli.read_text())["calls"] == 1
@@ -279,8 +279,8 @@ def test_unknown_provider_does_not_fall_back_to_external_api(monkeypatch):
         ModelSettings.from_environment()
 
 
-def test_legacy_agent_rejects_directory_only_copilot_backend(copilot_cli):
-    with pytest.raises(ValueError, match="directory"):
+def test_api_chat_model_requires_structured_planner_for_copilot_backend(copilot_cli):
+    with pytest.raises(ValueError, match="StructuredPlanner"):
         create_model()
 
 
@@ -288,16 +288,18 @@ def test_copilot_runtime_stops_at_confirmation_without_executing(
     copilot_cli, monkeypatch, tmp_path
 ):
     monkeypatch.setenv(
-        "PROBE_EVENTS", events(json.dumps(proposal(("step_response", "stability_margins"))))
+        "PROBE_EVENTS",
+        events(json.dumps({"action": "plan", "text": "Confirm analysis.", "plan": draft_data()})),
     )
-    runtime, backend, _, root = runtime_fixture(tmp_path)
-    runtime.planner = VerificationPlanner()
-    conversation = runtime.submit(None, "Verify both analyses using demo criteria.", str(root))
+    _, runtime, calls, _ = make_agent_web(tmp_path, [])
+    runtime.planner = AgentPlanner()
+    queued = runtime.queue_message(None, "Analyze the synthetic RMSE.")
+    conversation = runtime.continue_submission(queued.id)
     assert conversation.status == "waiting_for_user", conversation.error
     assert conversation.pending_decision.kind == "confirm_baseline"
     assert not conversation.task.baseline.confirmed
-    assert conversation.task.baseline.analyses == ["step_response", "stability_margins"]
-    assert backend.calls == []
+    assert conversation.task.baseline.nodes[0].tool == "offline_rmse"
+    assert calls == []
 
 
 @pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf"])

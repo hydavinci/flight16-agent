@@ -12,8 +12,7 @@ from flight_agent.verification.resources import ResourceRegistry
 from flight_agent.verification.store import ConversationStore
 from tests.agent_helpers import analysis_plan_data, register_rmse
 from tests.diagnosis_helpers import AdaptivePlanner, diagnostic_project
-from tests.test_verification_runtime import ControlledBackend
-from tests.verification_helpers import project_tree
+from tests.verification_helpers import ControlledBackend, project_tree
 
 
 def plugins():

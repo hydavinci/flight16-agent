@@ -147,25 +147,6 @@ def test_oversized_v2_state_cannot_replace_last_readable_conversation(tmp_path):
     assert raw["task"]["schema_version"] == "2.0"
 
 
-def test_legacy_entry_points_explicitly_refuse_v2_execution_and_planning(tmp_path):
-    from flight_agent.verification.planner import VerificationPlanner
-    from flight_agent.verification.runtime import VerificationRuntime
-    from tests.helpers import ScriptedModel
-
-    runtime = VerificationRuntime(tmp_path / "state")
-    record = runtime.store.create()
-    directory = runtime.store.task_directory(record.id, "a" * 32, create=True)
-    record.task = agent_task(directory)
-    runtime.store.save(record)
-    with pytest.raises(ValueError, match="generic|v2"):
-        runtime.confirm(record.id, 1, trusted=True)
-    with pytest.raises(ValueError, match="generic|v2"):
-        runtime._task_workflow(record.task)
-    planner = VerificationPlanner(model=ScriptedModel(responses=[]))
-    with pytest.raises(ValueError, match="generic|v2"):
-        planner.plan_intent("Explain.", record, workflows=[])
-
-
 def test_existing_authenticated_history_api_can_read_v2_and_download_checked_artifacts(
     project, tmp_path
 ):
@@ -173,10 +154,10 @@ def test_existing_authenticated_history_api_can_read_v2_and_download_checked_art
 
     from flight_agent.runtime.evidence import describe_evidence
     from flight_agent.runtime.observations import OutputArtifact
-    from flight_agent.verification.runtime import VerificationRuntime
-    from tests.helpers import headers, web_module
+    from tests.agent_helpers import make_agent_web
+    from tests.helpers import headers
 
-    runtime = VerificationRuntime(tmp_path / "state")
+    app, runtime, _, _ = make_agent_web(tmp_path, [])
     record = runtime.store.create()
     directory = runtime.store.task_directory(record.id, "a" * 32, create=True)
     record.task = agent_task(directory)
@@ -190,7 +171,7 @@ def test_existing_authenticated_history_api_can_read_v2_and_download_checked_art
     )
     runtime.store.save(record)
     with TestClient(
-        web_module().create_web_app(project, verification_runtime=runtime),
+        app,
         base_url="http://127.0.0.1",
     ) as client:
         auth = headers(client)
@@ -202,55 +183,3 @@ def test_existing_authenticated_history_api_can_read_v2_and_download_checked_art
         assert response.json() == {"rmse": 1}
         (directory / "metric.json").write_text('{"rmse":2}')
         assert client.get(endpoint, headers=auth).status_code == 409
-
-
-@pytest.mark.parametrize(
-    "worker_status,same_id,unresolved",
-    [
-        ("failed", True, False),
-        ("interrupted", True, False),
-        ("failed", False, True),
-        ("interrupted", False, True),
-        ("running", True, True),
-        ("completed", True, True),
-    ],
-)
-def test_legacy_worker_terminal_failure_is_not_confused_with_unknown_call(
-    tmp_path, worker_status, same_id, unresolved
-):
-    from flight_agent.verification.compat import has_unresolved_call
-    from flight_agent.verification.store import request_digest
-    from flight_agent.verification.legacy_contracts import EvaluationBaseline, VerificationTask
-    from flight_agent.verification.projects import ProjectInspector
-    from tests.test_verification_runtime import proposal
-    from tests.verification_helpers import baseline_data, project_tree
-
-    root = project_tree(tmp_path / "source")
-    project = ProjectInspector().inspect(str(root))
-    task = VerificationTask(
-        id="a" * 32,
-        project=project,
-        baseline=EvaluationBaseline.model_validate(
-            {**baseline_data(), "project_fingerprint": project.fingerprint}
-        ),
-        proposal=proposal(),
-        nodes=proposal()["nodes"],
-        result_directory=str(tmp_path),
-    )
-    request = contracts.AnalysisRunRequest(
-        id="1" * 32,
-        project_root=str(root),
-        project_fingerprint=task.project.fingerprint,
-        trim_point=1,
-        analyses=["step_response"],
-        trusted=True,
-    )
-    task.pending_request = request
-    task.worker_run = contracts.RunRecord(
-        id=request.id if same_id else "2" * 32,
-        status=worker_status,
-        request_sha256=request_digest(request),
-        created_at=now(),
-        updated_at=now(),
-    )
-    assert has_unresolved_call(task) is unresolved

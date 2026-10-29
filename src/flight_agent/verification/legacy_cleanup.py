@@ -2,7 +2,7 @@ import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from ..models import JOB_ID
 from .intake import safe_directory
@@ -64,7 +64,7 @@ def cleanup_legacy_records(root: Path, *, apply: bool) -> CleanupReport:
         try:
             with path.open("rb") as stream:
                 content = stream.read(8_000_001)
-            data = json.loads(content) if len(content) <= 8_000_000 else None
+            data: Any = json.loads(content) if len(content) <= 8_000_000 else None
             kind = classify_record(data)
         except (OSError, ValueError):
             kind = "unknown"

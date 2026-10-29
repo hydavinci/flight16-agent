@@ -1,13 +1,13 @@
-import importlib
-from types import SimpleNamespace
-
 import pytest
 from pydantic import Field
 
-from flight_agent.verification.contracts import Conversation
-from flight_agent.verification.legacy_contracts import DiagnosisTask, VerificationTask
+from flight_agent.verification.contracts import AgentTask, Conversation
 from flight_agent.verification.diagnosis_contracts import DiagnosisProposal
-from flight_agent.verification.structured_planner import StructuredPlanner, redact_text
+from flight_agent.verification.structured_planner import (
+    StructuredPlanner,
+    conversation_paths,
+    redact_text,
+)
 from tests.diagnosis_helpers import diagnosis_proposal
 from tests.helpers import ScriptedModel, tool_message
 
@@ -21,14 +21,12 @@ def test_redact_text_hides_local_paths_and_credentials():
     assert "secret-value" not in value
 
 
-def test_legacy_conversation_paths_redact_current_and_archived_task_projects():
-    archived = VerificationTask.model_construct(
-        project=SimpleNamespace(root="/private/archived-project"),
+def test_conversation_paths_redact_current_and_archived_task_outputs():
+    archived = AgentTask.model_construct(
         output_root="/private/archived-output",
         result_directory="/private/archived-result",
     )
-    current = DiagnosisTask.model_construct(
-        project=SimpleNamespace(root="/private/current-project"),
+    current = AgentTask.model_construct(
         output_root="/private/current-output",
         result_directory="/private/current-result",
     )
@@ -38,15 +36,13 @@ def test_legacy_conversation_paths_redact_current_and_archived_task_projects():
         archived_tasks=[archived],
         task=current,
     )
-    planner = importlib.import_module("flight_agent.verification.planner")
-
     value = redact_text(
-        "current=/private/current-project archived=/private/archived-project",
-        planner._conversation_paths(conversation),
+        "current=/private/current-output archived=/private/archived-result",
+        conversation_paths(conversation),
     )
 
-    assert "/private/current-project" not in value
-    assert "/private/archived-project" not in value
+    assert "/private/current-output" not in value
+    assert "/private/archived-result" not in value
 
 
 def test_structured_planner_rejects_nonpositive_timeout():

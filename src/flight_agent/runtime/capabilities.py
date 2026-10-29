@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Generic, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
 
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
@@ -176,7 +176,7 @@ class CapabilityRegistry(Generic[Context]):
             raise ValueError("Unknown capability input field")
         for field_name, field in fields.items():
             if field_name in inputs:
-                annotation = (
+                annotation: Any = (
                     Annotated[field.annotation, *field.metadata]
                     if field.metadata
                     else field.annotation

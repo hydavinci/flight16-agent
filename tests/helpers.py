@@ -7,6 +7,7 @@ import pytest
 import uvicorn
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
+from pydantic import Field
 
 TOKEN = "test-worker-token-with-at-least-32-characters"
 HEADERS = {"Authorization": "Bearer " + TOKEN}
@@ -15,6 +16,14 @@ HEADERS = {"Authorization": "Bearer " + TOKEN}
 class ScriptedModel(FakeMessagesListChatModel):
     def bind_tools(self, tools, *, tool_choice=None, **kwargs):
         return self
+
+
+class RecordingModel(ScriptedModel):
+    seen: list = Field(default_factory=list)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.seen.append([message.content for message in messages])
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
 
 def tool_message(name, args=None, call_id=None):

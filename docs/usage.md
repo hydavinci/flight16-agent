@@ -3,9 +3,9 @@
 [返回项目首页](../README.md) · [项目架构](architecture.md) · [输入与输出](inputs-outputs.md)
 
 第一次使用，按“准备环境 → 配置模型 → 运行本机工程”的顺序阅读即可。
-只有需要远程执行、离线诊断或兼容入口时，再查看对应章节。
+只有一个通用 v2 运行时；远程工程与离线诊断是注册资源，没有 D1/D2 场景选择。
 
-[本机工程](#运行本机工程) · [Worker](#使用-worker) · [离线诊断](#离线诊断) · [目录 CLI](#目录-cli) · [兼容入口](#兼容入口) · [常见问题](#常见问题)
+[本机工程](#运行本机工程) · [Worker](#使用-worker) · [离线诊断](#离线诊断) · [目录 CLI](#目录-cli) · [历史清理](#历史清理) · [常见问题](#常见问题)
 
 ## 准备环境
 
@@ -53,7 +53,6 @@ MATLAB Runtime 不能替代 MATLAB 安装与许可；工程依赖的工具箱和
 - Engine 安装：`https://www.mathworks.com/help/matlab/matlab_external/install-the-matlab-engine-for-python.html`
 - Python 兼容性：`https://www.mathworks.com/support/requirements/python-compatibility.html`
 - Engine 仓库：`https://github.com/mathworks/matlab-engine-for-python`
-- LangChain Agent：`https://docs.langchain.com/oss/python/langchain/agents`
 
 ## 配置大模型
 
@@ -92,8 +91,7 @@ LLM_TIMEOUT_SECONDS=180
 CLI 须支持 JSON 输出和工具过滤。每次规划会创建新会话，使用当前账户的模型额度，
 不导入已有聊天记录。配置检查不会发起模型请求，也不会证明登录仍然有效。
 
-此后端支持目录 Agent 的规划与证据解释。兼容 CLI `analyze` 和上传工作台的
-“Agent 分析”仍要求 API 后端；普通 MATLAB 执行则不依赖大模型。
+此后端支持通用 Agent 的结构化规划与证据解释，不直接执行工程。
 
 全部环境变量见[配置项参考](inputs-outputs.md#环境变量)。
 
@@ -210,7 +208,7 @@ condition: bench
 规格、版本和哈希全部匹配时才复用数值证据，只改阈值不必重跑相同计算。
 
 已知失败可以显式重试。执行状态未知时只能核对原调用 ID，不能自动重发；
-关闭浏览器或客户端超时都不代表后台计算已停止。旧 v1 任务每个基线最多保留一次恢复提案。
+关闭浏览器或客户端超时都不代表后台计算已停止。
 解释失败原因不会自动把任务变成已完成，也不会清除原来的待办决定。
 
 完整 MATLAB 日志位于调用目录的 `local-matlab/matlab.log`；
@@ -228,8 +226,7 @@ condition: bench
 指标摘要最多显示 6 位有效数字，完整精度、条件和来源在详情中。
 聊天仅在显示时去除结构化输入的结束标记，服务器原文和报告来源不变。
 
-“运行环境”中的“MATLAB分析工作台”进入兼容上传页面；
-工作台顶部“返回 Flight Agent”可回到会话页。
+`/` 与 `/workbench` 是同一个通用工作台；没有单文件上传入口。
 
 同一桌面 macOS 可启用系统目录选择器：
 
@@ -242,7 +239,7 @@ flight-agent web --native-directory-picker --port 8000
 
 ## 使用 Worker
 
-只有选择 `simulink_project` 或使用兼容上传后端时才需要 Worker。
+只有使用 `simulink_project` 注册资源时才需要 Worker。
 Worker 可以与 Web 同机，也可以部署在另一台有 MATLAB 的计算机器上。
 远程路径不会自动上传工程。
 
@@ -251,7 +248,6 @@ Worker 可以与 Web 同机，也可以部署在另一台有 MATLAB 的计算机
 ```dotenv
 MATLAB_WORKER_TOKEN=replace-with-at-least-32-random-ASCII-characters
 MATLAB_ALLOW_TRUSTED_PROJECTS=1
-MATLAB_ALLOW_TRUSTED_UPLOADS=0
 ```
 
 自行生成随机令牌并安全复制到两端，不要直接使用上面的占位值：
@@ -283,10 +279,10 @@ ssh -N -L 9001:127.0.0.1:9001 USER@MATLAB_HOST
 后者只内置已准备 F-16 布局，其他工程需提供 `flight-agent.project.json`。
 阶跃分析沿用初始化后的模型设置；裕度分析读取已有的 `openinput/openoutput` 点、
 工作点模式和反馈符号，不通过聊天猜断点或重写仿真参数。
-完整准备方式见 [D1 参考](d1-agent.md)。
+完整准备方式见 [Simulink Worker 参考](simulink-worker.md)。
 
-目录执行有 Windows 进程清理路径，但尚未在 Windows 实机验收；
-兼容上传与固定算例 CLI 仍要求 macOS/Linux。原生依赖必须匹配执行平台。
+目录执行有 Windows 进程清理路径，但尚未在 Windows 实机验收。
+原生依赖必须匹配执行平台。
 
 ## 离线诊断
 
@@ -303,7 +299,7 @@ ssh -N -L 9001:127.0.0.1:9001 USER@MATLAB_HOST
 高/中/低优先级表示分析顺序，不是置信度。建议不会自动修改设计或补跑 Simulink。
 
 恢复时有有效回执才复用；在途调用缺少可核验回执会以 `unknown_execution` 停止，
-不会自动补跑。格式、能力参数与恢复边界见 [D2 参考](d2-agent.md)。
+不会自动补跑。格式、能力参数与恢复边界见[离线诊断参考](offline-diagnostics.md)。
 
 ## 目录 CLI
 
@@ -329,72 +325,42 @@ flight-agent directory-task resume CONVERSATION_ID
 单消息形式仍可用 `--request`，不能和 `--analysis-request` 混用。
 `--output-root` 指定 Agent 成果根目录，空字符串恢复默认位置。
 
-旧 `--scenario d1/d2` 只分别映射 Worker 工程和 Agent 离线数据位置；
-`auto` 不选资源，均不会自动注入场景判据。
+使用明确注册的 `--location`；不支持 `--scenario`、场景别名或工作流选择。
 CLI 自行获取页面令牌，只连接本机 HTTP origin，不跟随重定向或环境代理。
 等待超时不会取消服务端任务，请先查询状态，勿重复提交。
 
-## 兼容入口
+## 支持的命令
 
-这些入口保留旧流程，与本机目录 Agent 的输入契约不同。
+| 命令 | 用途 |
+|---|---|
+| `doctor` | 只检查模型配置与 Engine 导入，不启动 MATLAB 或请求模型 |
+| `web` | 启动唯一的通用 Agent 工作台 |
+| `worker` | 启动受控 Simulink 工程计算服务 |
+| `directory-task propose/confirm/status/resume` | 连接本机 Web，共用确认、执行与恢复链路 |
+| `cleanup-legacy` | 默认只读预览，显式 `--apply` 才清理正面识别的旧记录 |
 
-### 单文件上传工作台
+不支持旧 `analyze`、上传/demo、工作流目录或恢复提案 `replan` 接口。
+目录 CLI 的退出码 0 不等于判据通过；1 表示失败/中断或请求错误，130 表示用户中断。
 
-打开 `/workbench`，在 Worker 端设置 `MATLAB_ALLOW_TRUSTED_UPLOADS=1`：
-选择单个 UTF-8 `.m` 文件，填写 JSON 参数，确认可信代码后运行。
-页面显示程序返回的 `result`、日志和 PNG，不自动导出整个工作区。
+## 历史清理
 
-函数形式：
+v1 历史不再读取、执行、恢复或转换为兼容视图。会话列表略过不支持的旧记录；
+直接读取旧记录会明确拒绝。已有 v2 记录保留任务、调用身份、确认、证据与交付，
+不会被重写成其他契约。
 
-```matlab
-function result = example_function(params)
-result = struct('value', params.value * 2);
-end
-```
-
-脚本形式读取同一个 `params` 并赋值 `result`：
-
-```matlab
-result = struct('value', params.value * 2);
-```
-
-传入 `{"value": 3}` 时，上例返回 `{"value": 6}`。只有实际绘图才有图片。
-函数名须与文件名一致；脚本不能清掉 `params`，也不能依赖交互输入或未上传的配套文件。
-不支持 ZIP、多文件、`.mlx` 或 `.slx`；完整限制见[兼容入口契约](inputs-outputs.md#兼容入口契约)。
-
-“Agent 分析”复用已完成计算，不重跑 `.m`；只有符合演示指标契约的结果才可按演示规则判定。
-示例见 `examples/web_script.m`、`examples/web_function.m`、`examples/web_metrics.m`。
-普通波形结果不适用飞行器演示规则，显示 `undetermined` 是预期行为。
-
-上传源码发送给 Worker，不作为源码附件发送给模型；请求分析时，结果可能进入模型上下文。
-重启后旧上传任务标记为 `interrupted`，不自动重跑。
-网络中断不表示远端终止，应按页面记录的远程 ID 核查。
-
-### 固定算例 CLI
+在停止相关服务并核对备份后，从项目根目录运行：
 
 ```bash
-flight-agent doctor
-flight-agent analyze examples/parameters.json \
-  --request "检查演示要求，并引用知识库解释结果。"
+flight-agent cleanup-legacy --project-root /absolute/path/to/flight-agent
+flight-agent cleanup-legacy --project-root /absolute/path/to/flight-agent --apply
 ```
 
-`doctor` 只检查配置和演示文件，不启动 MATLAB 或请求模型。
-`analyze` 只读取 JSON 参数，调用固定的 `matlab/analyze_demo.m`；
-它不是已有工程目录入口，也不执行用户上传文件。
-
-可指定 `--project-root`、`--matlab-timeout` 和 `--max-steps`。
-参数相对路径以项目根目录为基准；未激活环境时，可用 `.venv/bin/flight-agent`
-或该环境的 `python -m flight_agent`。
-
-退出码 0 表示报告生成，不代表通过；1 表示执行/报告失败，130 表示用户中断。
-实际结论在 `assessment.json`，字段与文件说明见[兼容入口契约](inputs-outputs.md#兼容入口契约)。
-
-其工具循环可重复检索并复用同次计算，但不能修改输入、固定入口或规则。
-检索使用中文双字词项和英文词项匹配，不是向量检索；无匹配返回空结果。
-解释的引用完整性检查不等于已证明模型文字正确，仍需人工复核。
-
-超时会清理本次 worker 及同进程组后代。若出现 `MATLAB cleanup incomplete`，
-原失败原因与进程组 ID 会保留；须人工核查，不应视作已清理成功。
+第一条是 dry-run，仅报告 `runs/verification/` 下的 `v1/v2/unknown/deleted`，
+不写盘；第二条才删除正面识别为 v1 的会话目录。要求该运行目录已存在。
+未知/损坏记录、v2、符号链接和外部成果目录不会被删除。
+若源工程位于待删目录内，或源路径无法通过 `Path.resolve(strict=True)` 严格解析，
+则保留该目录；清理不猜测源路径，也不追踪外部交付目录。
+只有 `deleted` 列出的目录实际被删除，不能把全部 `v1` 都当作已删。
 
 ## 常见问题
 

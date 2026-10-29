@@ -4,8 +4,7 @@ from flight_agent.verification.diagnostic_data import diagnostic_capabilities
 from flight_agent.verification.diagnostic_engine import DiagnosticEngine
 from flight_agent.verification.diagnostic_planner import DiagnosticReviewer
 from tests.diagnosis_helpers import AdaptivePlanner, EvolvingPlanner, diagnostic_state
-from tests.helpers import tool_message
-from tests.test_verification_runtime import RecordingModel
+from tests.helpers import RecordingModel, tool_message
 
 
 def test_diagnostic_reviewer_returns_grounded_review(tmp_path):

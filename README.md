@@ -6,7 +6,8 @@
 
 ## 项目说明
 
-Flight Agent 是一个通用工程分析 Agent，提供 Web 和 CLI 入口，当前内置飞控分析与离线诊断适配器。
+Flight Agent 只有一个通用 v2 工程分析 Agent，提供 Web 和 CLI 入口。
+Worker 工程与离线诊断数据都是注册资源，不是独立产品；没有 D1/D2 场景选择。
 它直接使用已有工程的入口和模型，不要求先改写成固定飞机算例。
 
 ```text
@@ -145,7 +146,7 @@ flight-agent web --port 8000
 
 ## 项目框架
 
-技术栈为 **LangChain + MATLAB Engine for Python + FastAPI**；
+技术栈为 **LangChain Core/OpenAI 客户端 + MATLAB Engine for Python + FastAPI**；
 前端使用原生 HTML/CSS/JavaScript，无需 Node 构建。
 
 请求从 Web/CLI 进入会话协调与规划层，经注册能力和执行内核调度计算，
@@ -159,7 +160,7 @@ flight-agent web --port 8000
 | `runtime/` | 需求契约、能力注册、预算和证据 |
 | `verification/` | 会话、规划、执行、资源及计算适配器 |
 | `matlab_support/` | 受控 MATLAB 桥接函数 |
-| `static/` | 三栏 Agent 页面和兼容上传工作台 |
+| `static/` | 唯一的三栏通用 Agent 工作台 |
 
 完整执行链路、模块职责、源码树和扩展方式见[项目架构](docs/architecture.md)。
 
@@ -198,22 +199,40 @@ runs/verification/<conversation_id>/tasks/<task_id>/
 | [项目架构](docs/architecture.md) | 系统分层、能力边界、源码、扩展和开发验证 |
 | [输入与输出](docs/inputs-outputs.md) | 表单/API、判据、预算、结果字段与成果目录 |
 
-Worker 工程准备见 [D1 技术参考](docs/d1-agent.md)；
-离线诊断数据格式见 [D2 技术参考](docs/d2-agent.md)。
-单文件上传工作台保留在 `/workbench`，不与工程目录入口混用。
+Worker 工程准备见 [Simulink Worker 参考](docs/simulink-worker.md)；
+离线诊断数据格式见[离线诊断参考](docs/offline-diagnostics.md)。
+`/` 与 `/workbench` 展示同一个通用工作台，不支持旧上传或固定演示。
+
+## CLI 与历史清理
+
+支持 `doctor`、`web`、`worker`、`directory-task propose/confirm/status/resume`
+和 `cleanup-legacy`；不提供旧 `analyze`、场景、工作流目录或恢复提案入口。
+确认当前基线、权限与预算后才执行，执行状态未知时只对账原调用，不盲目重发。
+
+v1 历史记录不再读取、执行、恢复或投影为兼容视图。先预览，再显式删除：
+
+```bash
+flight-agent cleanup-legacy --project-root /absolute/path/to/flight-agent
+flight-agent cleanup-legacy --project-root /absolute/path/to/flight-agent --apply
+```
+
+默认仅报告 `v1/v2/unknown`，只有 `--apply` 才删除正面识别的 v1 会话目录。
+v2、未知记录、外部交付目录与源工程保留；源路径无法严格解析或位于候选目录内时跳过删除。
+详见[历史清理](docs/usage.md#历史清理)。
 
 ## 开发与验证
 
 ```bash
 python -m pip install -e '.[dev]'
-python -m pytest -q
+python -m pytest -m "not matlab" -q
 python -m ruff check .
 python -m mypy src
+python -m build
 ```
 
 默认测试不需要真实 MATLAB，也不调用真实模型。
 浏览器与 MATLAB 集成的运行方法见[开发验证](docs/architecture.md#开发与验证)。
-仓库自带的是软件演示，不包含真实 F-16 模型或审核过的航空标准。
+合成测试夹具不是真实工程验收；仓库不包含真实 F-16 模型或审核过的航空标准。
 
 ## 许可证
 

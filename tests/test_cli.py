@@ -132,7 +132,9 @@ def test_directory_task_rejects_scenario_alias(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("structured", [False, True])
-def test_directory_task_sends_only_generic_request_fields(tmp_path, monkeypatch, capsys, structured):
+def test_directory_task_sends_only_generic_request_fields(
+    tmp_path, monkeypatch, capsys, structured
+):
     from fastapi.testclient import TestClient
 
     from tests.agent_helpers import make_agent_web

@@ -12,27 +12,17 @@ from ..runtime.agent_contracts import (
     InvocationRun,
     InvocationSpec,
 )
-from ..runtime.contracts import Name
 from ..runtime.contracts import MutableRecord as MutableRecord
+from ..runtime.contracts import Name
 from ..runtime.contracts import ToolCall as ToolCall
 from ..runtime.observations import CapabilityOutcome, OutputArtifact, TaskResult
 from ..runtime.observations import MetricValue as MetricValue
 from ..runtime.requirements import CapabilityGap
-from ..runtime.tasks import PlanNode as PlanNode
-from ..runtime.tasks import plan_ancestors as plan_ancestors
 
 AnalysisKind = Literal["step_response", "stability_margins"]
-EvaluationStatus = Literal["pass", "fail", "undetermined"]
-SpecialValue = Literal["positive_infinity", "negative_infinity", "undefined"]
 Digest = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
 Identifier = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 
-METRICS: dict[str, tuple[AnalysisKind, str, str]] = {
-    "overshoot": ("step_response", "<=", "%"),
-    "settling_time": ("step_response", "<=", "s"),
-    "gain_margin": ("stability_margins", ">=", "dB"),
-    "phase_margin": ("stability_margins", ">=", "deg"),
-}
 
 
 def relative_path(value: str) -> str:
@@ -154,24 +144,6 @@ class ProjectDescriptor(Contract):
     warnings: list[str] = []
 
 
-class Criterion(Contract):
-    metric: Nonempty
-    operator: Literal["<=", ">="]
-    threshold: FiniteNumber
-    unit: Nonempty
-
-    @model_validator(mode="after")
-    def supported_metric(self) -> Self:
-        definition = METRICS.get(self.metric)
-        if definition is None:
-            raise ValueError(f"Unsupported verification metric: {self.metric}")
-        if (self.operator, self.unit) != definition[1:]:
-            raise ValueError(f"{self.metric} requires {definition[1]} in {definition[2]}")
-        if self.metric in ("overshoot", "settling_time") and self.threshold < 0:
-            raise ValueError(f"{self.metric} threshold cannot be negative")
-        return self
-
-
 class Artifact(FileDigest):
     media_type: Nonempty
     role: Literal["figure", "data", "report", "record"]
@@ -260,42 +232,19 @@ class InspectProjectRequest(Contract):
     root: Nonempty
 
 
-class MetricCheck(Contract):
-    analysis: AnalysisKind
-    metric: str
-    value: float | None
-    special: SpecialValue | None = None
-    value_unit: str | None
-    operator: str
-    threshold: float
-    unit: str
-    status: EvaluationStatus
-    reason: str
-    evidence: list[str]
-
-
-class Evaluation(Contract):
-    status: EvaluationStatus
-    baseline_version: int
-    checks: list[MetricCheck]
-    by_analysis: dict[AnalysisKind, EvaluationStatus]
-    warnings: list[str] = []
-
-
 NodeIdentifier = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
-ToolName = NodeIdentifier
 NodeStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
 
 
 class PendingDecision(Contract):
     kind: Literal[
-        "clarify", "capability_gap", "confirm_baseline", "confirm_replan", "resume", "retry",
+        "clarify", "capability_gap", "confirm_baseline", "resume", "retry",
     ]
     message: Nonempty
 
 
 class Decision(Contract):
-    action: Literal["confirm_baseline", "confirm_replan", "resume", "retry"]
+    action: Literal["confirm_baseline", "resume", "retry"]
     baseline_version: int
     created_at: Nonempty
     trusted: bool = False

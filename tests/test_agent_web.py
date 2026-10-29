@@ -207,7 +207,9 @@ def test_location_resolution_requires_a_unique_registered_id_or_host():
     with pytest.raises(ValueError, match="unknown or ambiguous"):
         resolve_location("unregistered", locations)
     with pytest.raises(ValueError, match="unknown or ambiguous"):
-        resolve_location("first", [locations[0], locations[1].model_copy(update={"location": "first"})])
+        resolve_location(
+            "first", [locations[0], locations[1].model_copy(update={"location": "first"})]
+        )
 
 
 def test_default_bootstrap_does_not_import_or_construct_legacy_conversation_runtime():

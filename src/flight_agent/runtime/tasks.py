@@ -1,10 +1,10 @@
 from collections.abc import Sequence
-from typing import Annotated, Literal, Self
+from typing import Annotated
 
-from pydantic import Field, JsonValue, field_validator, model_validator
+from pydantic import Field, JsonValue, field_validator
 
-from ..models import Contract, Nonempty
-from .contracts import AnalysisSpec, DesignContext, Effect, Name, ResourceBudget, finite_mapping
+from ..models import Contract
+from .contracts import Name, finite_mapping
 
 
 class PlanNode(Contract):
@@ -43,33 +43,3 @@ def plan_ancestors(nodes: Sequence[PlanNode]) -> dict[str, set[str]]:
     for node in nodes:
         visit(node.id, frozenset())
     return ancestors
-
-
-class GeneralProposal(Contract):
-    action: Literal["plan"] = "plan"
-    title: Annotated[str, Field(min_length=1, max_length=200)]
-    rationale: Annotated[str, Field(min_length=1, max_length=2000)]
-    design: DesignContext
-    nodes: Annotated[list[PlanNode], Field(min_length=1, max_length=40)]
-    allowed_effects: tuple[Effect, ...] = ("read_only", "write_delivery")
-    budget: ResourceBudget = ResourceBudget()
-
-    @model_validator(mode="after")
-    def bounded_plan(self) -> Self:
-        plan_ancestors(self.nodes)
-        if len(self.nodes) > self.budget.max_calls:
-            raise ValueError("Plan exceeds the proposed call budget")
-        if any(effect in ("write_candidate", "adopt_candidate") for effect in self.allowed_effects):
-            raise ValueError("General tasks do not provide an isolated candidate/adoption scope")
-        return self
-
-
-class GeneralBaseline(Contract):
-    version: Annotated[int, Field(strict=True, ge=1)]
-    confirmed: Annotated[bool, Field(strict=True)] = False
-    confirmed_at: str | None = None
-    objective: Nonempty
-    design: DesignContext
-    specs: dict[Name, AnalysisSpec]
-    allowed_effects: tuple[Effect, ...]
-    budget: ResourceBudget

@@ -1,27 +1,28 @@
-# Offline diagnosis adapter and historical D2 contracts
+# Offline diagnostic resources
 
-The current Web page has one requirements entry, **no D1/D2 selector**.
-This document retains the diagnostic data, internal evidence-loop and saved v1
-contracts. New tasks use a v2 baseline and the registered `offline_diagnosis`
-capability, with `diagnostic_data` on the Agent host. The loop below runs inside
-that capability using the same outer budget and authenticated checkpoints.
-Legacy task-level baseline/review fields are not the common v2 display schema;
-see README and `docs/d1-agent.md` for the unified entry and registration example.
+[README](../README.md) · [Usage](usage.md) · [Architecture](architecture.md) ·
+[Inputs and outputs](inputs-outputs.md) · [Simulink Worker](simulink-worker.md)
+
+There is one generic v2 Agent, with no D1/D2 selection. `diagnostic_data` is a
+registered resource on the Agent host, not a separate product. The registered
+`offline_diagnosis` capability runs the bounded evidence loop below under the
+confirmed outer budget and authenticated v2 checkpoints. Old upload/demo
+execution and v1 task history are unsupported, not projected into a
+compatibility view.
 
 ## Scope and deployment
 
-D2 analyzes explicitly registered time-series and frequency-response JSON data
+The diagnostic adapter analyzes registered time-series and frequency-response JSON data
 on the **Agent/Web host**. It does not run the MATLAB worker, execute project
 code, import arbitrary files, generate new simulations or modify a controller.
-This is the bounded offline portion of Demo 2, not the full roadmap workflow:
-active additional Simulink runs and real fault-attribution acceptance remain
+Active additional Simulink runs and real fault-attribution acceptance remain
 unimplemented or unverified.
 The registered Simulink adapter accepts prepared projects on the **Worker host**;
-its limitations do not become generic task restrictions; see `docs/d1-agent.md`.
+its limitations do not become generic task restrictions; see [Worker resources](simulink-worker.md).
 
-Both scenarios share conversation persistence, explicit baseline confirmation,
+All resources share conversation persistence, explicit baseline confirmation,
 typed capability contracts, immutable analysis receipts and authenticated
-artifact downloads. D2 adds a bounded policy loop:
+artifact downloads. Diagnosis adds an internal bounded policy loop:
 
 ```text
 inspect registered data -> propose hypotheses, scope and initial analyses
@@ -30,14 +31,15 @@ inspect registered data -> propose hypotheses, scope and initial analyses
   -> review cited evidence, record bounded hypothesis revisions and a summary
   -> assess every current hypothesis, preserving the original baseline
   -> append the next plan within the confirmed scope, or stop explicitly
-  -> persist diagnosis JSON, Word report and evidence index
+  -> publish findings, unknowns, internal receipts and an authenticated checkpoint
+  -> evaluate or deliver through generic capabilities only when requested
 ```
 
 A real tool-calling model service is required for planning and review. Configure
 the existing `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` and optional
 `LLM_TIMEOUT_SECONDS` on Web, then run `flight-agent web --port 8000`.
 No MATLAB installation, Worker token or trusted-project Worker switch is needed
-for these D2 adapters. There is no production scripted-model fallback.
+for diagnostic analysis. There is no production scripted-model fallback.
 
 Knowledge questions need no directory or Worker. Select the registered offline
 diagnostic **resource location**, provide its Agent-host directory and describe
@@ -48,9 +50,9 @@ Worker projects or verification reports as diagnostic data.
 Missing registered diagnostic data pauses planning and cannot
 resume the old task. Previous tasks and downloads remain archived. Unknown
 in-flight calls must be reconciled before switching or dispatching new work.
-D2 project browsing lists Agent-host
+Diagnostic resource browsing lists Agent-host
 directories; output browsing also uses that host. The optional native macOS
-picker still requires a same-machine desktop, but D2 does not require a local
+picker still requires a same-machine desktop, but diagnosis does not require a local
 Worker. Browsing or selecting a folder never grants confirmation.
 The light, task-first interface shows progress, the next required action and
 structured findings before technical records. History is initially collapsed
@@ -184,14 +186,14 @@ integrity failures and execution errors are reported separately.
 
 ## Confirmation, review and stopping
 
-The proposed baseline records the objective, design and project identity,
+The capability's confirmed inputs record the objective, design and data identity,
 up to eight initial hypotheses, an allowlist of capability names and versions,
 and a resource budget. Each hypothesis has an ID, statement and `priority`
 (`high`, `medium` or `low`, default `medium`). Priority is analysis ordering,
 not confidence or a calibrated likelihood. Each plan revision has up to four analyses, exact validated
 inputs, the confirmed baseline version and its preceding evidence references.
 Confirmation must identify the current version and explicitly set `trusted`.
-For D2 this authorizes the recorded read-only scope, not project execution,
+For diagnosis this authorizes the recorded read-only scope, not project execution,
 model editing, parameter changes or arbitrary Python.
 
 After each completed round, the model must assess **every current hypothesis**
@@ -225,9 +227,8 @@ Attributing responsibility to `model` or `control` requires supported
 hypotheses and valid citations already used by those hypotheses. Otherwise
 the review must retain `undetermined`; the UI displays this as "尚无法归属".
 Recommendations do not authorize simulation, parameter changes or model edits.
-Old persisted reviews without these new fields remain readable. A missing
-legacy summary is explicitly marked unavailable, rather than generated from
-the old status labels.
+When evidence cannot support a structured summary, the output retains an
+explicit termination detail rather than inventing attribution.
 
 The runtime verifies citation existence, output validity and these structural
 attribution conditions. It does **not**
@@ -242,10 +243,11 @@ not deterministic flight-control acceptance.
 | `max_seconds` | 300 | 1-3600 |
 | `max_no_progress` | 2 | 1-5 |
 
-The shared `runtime.loop.run_loop` drives D1 dependency nodes, D2 rounds and
-generic capability nodes. D2's decision policy still owns evidence review,
-hypothesis changes and its explicit stop reasons; D1 does not gain an LLM review
-after every numerical result.
+The shared `runtime.loop.run_loop` drives generic capability nodes and internal
+diagnostic rounds. The diagnostic engine owns evidence review, hypothesis
+changes and its stop reasons; other capabilities do not gain an LLM review
+after every numerical result. Internal analyses/reviews consume the same
+outer task budget, not an independent allowance.
 
 Budgets are checked at loop boundaries, not enforced as operating-system
 resource quotas. The wall-clock budget starts with execution and includes
@@ -276,18 +278,21 @@ digest, input artifact hashes and timestamps. The spec includes the capability
 version, design versions/digests, exact parameters, data fingerprints,
 conditions and numerical settings. Only an exact matching, integrity-checked
 spec can reuse a numerical result; a different window or design is another
-branch, even when its capability name is unchanged. The same evidence kernel
-serves D1; D1 evaluation and report caches remain separate from numerical data.
+branch, even when its capability name is unchanged. Outer v2 invocation
+receipts separately bind the capability inputs, resource and dependency hashes.
 
-Hypothesis revisions are stored inside `task.rounds[].review`, not as a second
-mutable baseline. The current set is derived by replaying those snapshots.
+Hypothesis revisions are stored inside `DiagnosticRunState.rounds[].review` in
+the call-bound v2 checkpoint, not as a second conversation task.
+The current set is derived by replaying those snapshots.
 Resume and delivery validate the contiguous plan/review history: each next
 plan must match the preceding review's requested capabilities, hypothesis
 references and normalized inputs. Citations can use only evidence available
 at that round, not later receipts. A changed projection or inconsistent
 history fails explicitly rather than silently becoming the current state.
 
-Receipts live in `numerical/analysis-runs/<run-id>.json`. A call is recorded as
+Internal receipts live in
+`calls/<call_id>/diagnosis/numerical/analysis-runs/<run_id>.json`.
+A call is recorded as
 pending before dispatch and its receipt is persisted before task acknowledgement.
 On explicit resume, a matching valid receipt is recovered without calling the
 adapter again. If an in-flight call has no receipt, execution is unknown:
@@ -299,18 +304,15 @@ dispatch. A pending adapter upgrade requires a new proposal and confirmation;
 completed or recovered calls retain the version in their original specification,
 not the currently registered adapter's version.
 
-Deliveries under `delivery-v<baseline-version>/` include a DOCX diagnosis
-report, `diagnosis.json`, `execution_record.json` and an artifact index.
-They retain design/baseline identity, plan revisions, current hypotheses and
-priorities, structured diagnosis, run/metric citations, unknowns, budget state
-and the termination reason. `diagnosis.json` includes `summary`,
-`current_hypotheses` and `hypothesis_revisions` (each with `plan_version` and
-the recorded `revision`); the execution record and Word report retain the same
-evolution. Legacy deliveries can have a null summary with an explicit
-"Structured diagnosis unavailable" explanation in Word.
-History and citation validation are repeated at delivery. Downloads use recorded paths and
-verified hashes, not arbitrary filesystem paths. These local files are not a
-cryptographically signed or externally witnessed audit log.
+The outer Agent task keeps `schema_version: "2.0"` and saves authenticated
+call-bound `DiagnosticRunState` checkpoints under `agent/checkpoints/`.
+No legacy task class is required. Generic results publish a `diagnosis_summary`
+finding, hypothesis findings, the `diagnostic_unknowns` table, internal receipt
+artifacts and details containing termination, summary, design and conditions.
+The immutable internal history remains in the checkpoint; generic JSON/Word
+delivery uses the declared dependency outputs when requested, not a mandatory
+diagnosis-specific report pipeline. Downloads use recorded paths and verified
+hashes. These files are not an externally witnessed audit log.
 
 Model requests contain bounded metadata and metrics, not full raw arrays or
 project source. Path/credential-shaped text is redacted recursively, including
@@ -327,27 +329,26 @@ Use the existing Web bootstrap token (`X-Flight-Token`) and same-origin policy:
 | `POST /api/conversations/{id}/messages` | Follow-up or clarification; optional resource `location` and roots, subject to unknown-execution guards; questions preserve existing lifecycle |
 | `POST /api/conversations/{id}/confirm` | `{"version":1,"trusted":true}` confirms the current baseline |
 | `POST /api/conversations/{id}/resume` | Continue saved work with receipt reconciliation, not a duplicate unknown dispatch |
-| `GET /api/conversations/{id}` | Read the original durable record, including generic calls/receipts or historical diagnostic fields |
+| `GET /api/conversations/{id}` | Read the v2 durable record, including generic calls, receipts and checkpoints |
 | `GET /api/conversations/{id}/view` | Common observations, findings, tables, gaps and artifacts; no invented acceptance verdict |
 | `GET /api/conversations/{id}/tasks/{task-id}/artifacts/{path}` | Download a registered, integrity-checked artifact |
 
 Mutation acknowledgements are not completion responses; poll the conversation.
-Historical D2 tasks retain their original recovery rules. Generic v2 tasks may
-retry known failed nodes after explicit consent; unknown calls require resume.
-Saved failure-proposal `replan` is a v1 compatibility action, not v2 replanning.
+Known failed nodes may retry after explicit consent; unknown calls require resume.
+Saved recovery proposals and their adoption endpoint are not supported.
 Omitting `output_root` preserves the current choice, and `""` resets it to the
 default. Changing resource location requires a new source directory; check the
 output root separately. Diagnosis never falls back to Worker or silently switches
 host. `GET /api/conversations/capabilities` is the current capability catalog;
-`GET /api/resource-locations` lists resource adapters. The old workflows route is
-compatibility-only. Omitting `scenario` uses the generic coordinator.
+`GET /api/resource-locations` lists resource adapters. There is no workflow
+catalog or scenario-dispatch API.
 
 The CLI talks to the already-running local Web API, so it uses the same state
 owner as the browser:
 
 ```bash
 flight-agent directory-task --server http://127.0.0.1:8000 --timeout 360 propose \
-  --scenario d2 --project-root "$PWD/examples/diagnosis/synthetic-read-only" \
+  --location diagnostic_data --project-root "$PWD/examples/diagnosis/synthetic-read-only" \
   --request "Inspect the registered data, propose testable hypotheses and state unknowns."
 
 flight-agent directory-task confirm CONVERSATION_ID --version 1 --trusted-project
@@ -356,8 +357,8 @@ flight-agent directory-task resume CONVERSATION_ID
 flight-agent directory-task propose --conversation CONVERSATION_ID \
   --request "Explain the cited evidence and remaining limitations."
 
-# Legacy CLI resource alias; supply separate Agent-host registered data.
-flight-agent directory-task propose --conversation CONVERSATION_ID --scenario d2 \
+# Supply separate Agent-host registered data when changing resources.
+flight-agent directory-task propose --conversation CONVERSATION_ID --location diagnostic_data \
   --project-root "$PWD/examples/diagnosis/synthetic-read-only" \
   --request "Diagnose the recorded response after the completed verification."
 ```
@@ -370,9 +371,16 @@ follow redirects or environment proxies, and does not load `.env` from the
 data directory. A client timeout does not cancel the server-side task.
 Output is the persisted conversation JSON. Exit code 0 does not establish
 diagnostic sufficiency; inspect the termination and unknowns.
-CLI new sessions need no scenario. Existing `--scenario d1|d2` options remain
-resource-location aliases (`auto` selects neither), not task-type or standards
-switches. Omit them on follow-ups to preserve the selected resource location.
+Use explicit registered locations rather than host aliases that may be
+ambiguous. Omit `--location` on follow-ups to preserve the selected resource.
+
+Supported commands are `doctor`, `web`, `worker`,
+`directory-task propose/confirm/status/resume`, and `cleanup-legacy`.
+The latter defaults to dry-run reporting of `v1/v2/unknown`; only
+`cleanup-legacy --project-root ... --apply` deletes positively identified v1
+conversation directories. v2, unknown records and external deliveries remain.
+Source roots must resolve strictly and must not lie inside the deletion
+candidate; otherwise the candidate is kept. See [cleanup safety](usage.md#历史清理).
 
 ## Extension and acceptance boundaries
 
@@ -380,18 +388,15 @@ The shared kernel distinguishes read-only analysis, trusted project execution,
 delivery writes, isolated candidate writes and separately approved candidate
 adoption. A typed capability validates its input and output and must pass the
 confirmed effect scope. These are trusted-code contracts, not a sandbox for a
-malicious local plugin. D3-D6 have design/effect extension seams only: no
-optimization algorithms, topology representation, automatic design changes or
-adoption UI is implemented.
+malicious local plugin. No optimization algorithms, topology representation,
+automatic design changes or adoption UI is implemented.
 
 Automated synthetic cases cover known calculations, multiple successful
 evidence-driven rounds, cited hypothesis revisions and priorities, conservative
 structured attribution, exact-spec reuse, real run/metric references, explicit
 unknowns, budget stops, snapshot integrity and receipt-based recovery. They
-establish software behavior, not real fault attribution. Real labeled D2 data
-and engineering-reviewed diagnostic criteria are still needed. D1 likewise
-still needs independent numerical references and agreed tolerances; D2 does not
-replace those acceptance requirements.
-The full roadmap's active additional Simulink analysis is not implemented:
-these adapters work only on already registered records. D1 execution support
-does not make that capability available to the D2 policy loop.
+establish software behavior, not real fault attribution. Real labeled data and
+engineering-reviewed diagnostic criteria are still needed. Worker execution
+also needs independent numerical references and tolerances; diagnosis does
+not replace those acceptance requirements. Active additional Simulink analysis
+is not implemented: these adapters use only already registered records.

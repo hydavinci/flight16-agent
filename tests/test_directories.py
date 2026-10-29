@@ -330,10 +330,9 @@ def test_project_browse_surfaces_worker_connection_failure(
 @pytest.mark.parametrize(
     "params,expected",
     [
-        ({"location": "agent"}, 200),
+        ({"location": "agent"}, 422),
         ({"location": "diagnostic_data"}, 200),
         ({"location": "unregistered"}, 422),
-        ({"location": "agent", "scenario": "d1"}, 422),
         ({}, 422),
     ],
 )

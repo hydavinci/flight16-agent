@@ -1248,7 +1248,7 @@ def test_optional_existing_manifest_is_explicit_local_configuration(local_planni
     assert facts["explicit_configuration"]["value"] == configuration
     assert facts["explicit_configuration"]["path"] == "flight-agent.project.json"
     assert record.task.baseline.nodes[0].inputs["model"] == "plant.slx"
-    assert not backend.requests and runtime.legacy.backend is None
+    assert not backend.requests
 
 
 def _configured_draft(context):

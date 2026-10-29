@@ -38,7 +38,9 @@ def test_conversation_envelope_is_v2_without_legacy_orchestration_fields():
     record = Conversation(id="a" * 32, created_at="now", updated_at="now")
     assert record.schema_version == "2.0"
     assert Task is AgentTask
-    assert not {"scenario", "goal", "active_workflow", "workflow_agenda"} & record.model_dump().keys()
+    assert not (
+        {"scenario", "goal", "active_workflow", "workflow_agenda"} & record.model_dump().keys()
+    )
 
 
 def test_v2_contract_store_view_and_executor_import_without_legacy_orchestration():
@@ -75,17 +77,30 @@ for name in ("contracts", "store", "views", "agent_runtime"):
 def test_conversation_rejects_complete_legacy_task(tmp_path, field):
     from flight_agent.verification.contracts import Conversation
     from flight_agent.verification.projects import ProjectInspector
-    from tests.test_verification_runtime import proposal
     from tests.verification_helpers import baseline_data, project_tree
 
     project = ProjectInspector().inspect(str(project_tree(tmp_path / "source")))
+    nodes = [
+        {"id": "analyze", "tool": "analyze_project", "depends_on": []},
+        {"id": "evaluate", "tool": "evaluate_results", "depends_on": ["analyze"]},
+        {"id": "deliver", "tool": "deliver_report", "depends_on": ["evaluate"]},
+    ]
     legacy = {
         "scenario": "d1",
         "id": "b" * 32,
         "project": project.model_dump(mode="json"),
         "baseline": {**baseline_data(), "project_fingerprint": project.fingerprint},
-        "proposal": proposal(),
-        "nodes": proposal()["nodes"],
+        "proposal": {
+            "action": "plan",
+            "title": "Obsolete verification",
+            "analyses": ["step_response"],
+            "criteria": baseline_data()["criteria"],
+            "trim_point": 1,
+            "grouping": "combined",
+            "rationale": "Unsupported saved record.",
+            "nodes": nodes,
+        },
+        "nodes": nodes,
         "result_directory": str(tmp_path),
     }
     data = {"id": "a" * 32, "created_at": "now", "updated_at": "now"}
