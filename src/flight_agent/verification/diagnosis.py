@@ -10,6 +10,7 @@ from .contracts import (
     ConversationMessage,
     Decision,
     DiagnosisTask,
+    ExecutionNode,
     PendingDecision,
 )
 from .diagnosis_contracts import DiagnosisBaseline, HypothesisAssessment
@@ -84,7 +85,7 @@ class DiagnosisRuntime:
             capability_versions=versions,
             budget=proposal.budget,
         )
-        plan = self.engine._plan(baseline, project, proposal.analyses, proposal.rationale, 1, [])
+        plan = self.engine.plan(baseline, project, proposal.analyses, proposal.rationale, 1, [])
         task_id = uuid4().hex
         task = DiagnosisTask(
             id=task_id,
@@ -96,7 +97,7 @@ class DiagnosisRuntime:
             ),
             output_root=output_root,
             plan_revisions=[plan],
-            nodes=self.engine._nodes(plan),
+            nodes=[ExecutionNode(**node.model_dump()) for node in self.engine.nodes(plan)],
             assessments=[
                 HypothesisAssessment(
                     hypothesis_id=item.id, status="unknown", reason="尚未执行已确认范围内的分析。"
@@ -162,8 +163,16 @@ class DiagnosisRuntime:
         conversation.error = None
         task.started_at = task.started_at or now()
         self.store.save(conversation)
+
+        def checkpoint(current: DiagnosisTask) -> None:
+            current.nodes = [
+                node if isinstance(node, ExecutionNode) else ExecutionNode(**node.model_dump())
+                for node in current.nodes
+            ]
+            self.store.save(conversation)
+
         try:
-            self.engine.run(task, checkpoint=lambda task: self.store.save(conversation))
+            self.engine.run(task, checkpoint=checkpoint)
             self._finish(conversation, task)
         except (APIError, OSError, ValueError, RuntimeError) as exc:
             logger.exception("Diagnosis execution failed for %s", task.id)

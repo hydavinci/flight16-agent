@@ -12,7 +12,7 @@ from ..runtime.agent_contracts import (
     InvocationRun,
     InvocationSpec,
 )
-from ..runtime.contracts import AnalysisRun, AnalysisSpec, Name, Version
+from ..runtime.contracts import AnalysisRun, AnalysisSpec, EvidenceFile, Name, Version
 from ..runtime.contracts import MutableRecord as MutableRecord
 from ..runtime.contracts import ToolCall as ToolCall
 from ..runtime.intents import WorkflowRequest
@@ -451,6 +451,19 @@ class DiagnosisTask(MutableRecord):
     started_at: str | None = None
     dispatch_count: Annotated[int, Field(strict=True, ge=0, le=40)] = 0
     no_progress_rounds: Annotated[int, Field(strict=True, ge=0)] = 0
+
+    @field_validator("artifacts", mode="before")
+    @classmethod
+    def engine_evidence_artifacts(cls, value: list[object]) -> list[object]:
+        return [
+            Artifact(
+                **item.model_dump(),
+                media_type="application/json",
+                role="record",
+            )
+            if isinstance(item, EvidenceFile) else item
+            for item in value
+        ]
 
     @property
     def current_hypotheses(self) -> list[Hypothesis]:

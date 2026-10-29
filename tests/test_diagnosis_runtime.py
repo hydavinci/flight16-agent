@@ -7,20 +7,31 @@ from docx import Document
 
 from flight_agent.runtime.evidence import load_run
 from flight_agent.verification.artifacts import verify_artifact
-from flight_agent.verification.contracts import DiagnosisTask
+from flight_agent.verification.contracts import Artifact, DiagnosisTask, ExecutionNode
 from flight_agent.verification.diagnosis_contracts import (
+    DiagnosisProposal,
     DiagnosisReview,
     DiagnosisTermination,
     EvidenceCitation,
 )
 from flight_agent.verification.runtime import VerificationRuntime
-from tests.diagnosis_helpers import AdaptivePlanner, EvolvingPlanner, diagnostic_project
+from tests.diagnosis_helpers import (
+    AdaptivePlanner,
+    EvolvingPlanner,
+    diagnostic_project,
+    diagnostic_state,
+)
 from tests.test_diagnosis_contracts import diagnosis_proposal
 from tests.test_verification_runtime import ControlledBackend
 
 
+class LegacyPlanner(AdaptivePlanner):
+    def propose_diagnosis(self, message, conversation, project, *, tools):
+        return DiagnosisProposal.model_validate(diagnosis_proposal())
+
+
 def runtime_fixture(tmp_path, planner=None):
-    planner = planner or AdaptivePlanner()
+    planner = planner or LegacyPlanner()
     backend = ControlledBackend()
     runtime = VerificationRuntime(tmp_path / "state", backend=backend, planner=planner)
     root = diagnostic_project(tmp_path / "source")
@@ -174,6 +185,73 @@ def test_d2_receipt_before_acknowledgement_is_recovered_without_duplicate_dispat
     assert completed.task.analysis_runs[0].id == run_id
     assert writes.count(run_id) == 1
     assert len(completed.task.analysis_runs) == 2
+
+
+@pytest.mark.parametrize("receipt_saved", [True, False])
+def test_d2_legacy_state_checkpoints_engine_evidence_and_reconciles(
+    tmp_path, monkeypatch, receipt_saved,
+):
+    from flight_agent.verification import diagnosis
+
+    state = diagnostic_state(tmp_path)
+    runtime = VerificationRuntime(tmp_path / "state", planner=AdaptivePlanner())
+    conversation = runtime.store.create()
+    task = DiagnosisTask(
+        **state.model_dump(exclude={"schema_version", "nodes"}),
+        proposal=DiagnosisProposal.model_validate(diagnosis_proposal()),
+        nodes=[ExecutionNode(**node.model_dump()) for node in state.nodes],
+    )
+    task.result_directory = str(
+        runtime.store.task_directory(conversation.id, task.id, create=True)
+    )
+    conversation.scenario = "d2"
+    conversation.project_root = task.project.root
+    conversation.task = task
+    runtime.store.save(conversation)
+    original = diagnosis.persist_run
+    dispatched = []
+
+    def interrupted_receipt(directory, run):
+        dispatched.append(run.id)
+        if len(dispatched) == 1:
+            if not receipt_saved:
+                raise KeyboardInterrupt("Interrupted legacy analysis without a receipt")
+            original(directory, run)
+            raise OSError("Lost legacy receipt acknowledgement")
+        return original(directory, run)
+
+    monkeypatch.setattr(diagnosis, "persist_run", interrupted_receipt)
+    if receipt_saved:
+        failed = runtime.resume(conversation.id)
+        assert failed.status == "failed"
+        assert failed.task.pending_analysis is not None, failed.error
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            runtime.resume(conversation.id)
+    saved = runtime.store.get(conversation.id).task
+    assert saved.pending_analysis.id == dispatched[0]
+    assert len(saved.artifacts) == 3
+    for artifact in saved.artifacts:
+        assert isinstance(artifact, Artifact)
+        assert artifact.media_type == "application/json" and artifact.role == "record"
+        verify_artifact(Path(saved.result_directory), artifact)
+
+    restored = VerificationRuntime(tmp_path / "state", planner=AdaptivePlanner())
+    completed = restored.resume(conversation.id)
+    assert completed.status == "completed", completed.error
+    assert isinstance(completed.task, DiagnosisTask)
+    assert dispatched.count(dispatched[0]) == 1
+    if receipt_saved:
+        assert completed.task.termination.reason == "evidence_sufficient"
+        assert completed.task.analysis_runs[0].id == dispatched[0]
+        assert len(completed.task.analysis_runs) == len(dispatched) == 2
+        assert completed.task.calls[0].output["source"] == "recovered"
+    else:
+        assert completed.task.termination.reason == "unknown_execution"
+        assert not completed.task.analysis_runs
+        assert len(dispatched) == 1
+    for artifact in restored.store.get(conversation.id).task.artifacts:
+        verify_artifact(Path(completed.task.result_directory), artifact)
 
 
 def test_d2_unknown_inflight_execution_stops_instead_of_redispatching(tmp_path, monkeypatch):
