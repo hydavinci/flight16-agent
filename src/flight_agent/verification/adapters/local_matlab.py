@@ -18,6 +18,9 @@ from ...runtime.resources import ResourceReference
 from ..agent_runtime import AgentContext, ExecutionUncertain, ReconciledFailure
 from ..local_matlab import LocalMatlabBackend, _read_model, _verify_result
 from ..matlab_contracts import (
+    AllmarginInput,
+    LinearizeInput,
+    LocalMatlabInput,
     LocalMatlabRequest,
     LocalMatlabResult,
     MatlabExecutionMetadata,
@@ -59,14 +62,58 @@ def _series(context: AgentContext, inputs: StepinfoInput) -> Path:
     raise ValueError("stepinfo requires the exact published series of a direct dependency")
 
 
+def _linear_model(context: AgentContext, inputs: AllmarginInput) -> list[OutputArtifact]:
+    model = inputs.linear_model
+    for producer, output in context.outputs.items():
+        if (
+            model.node_id == producer and model.id == "linear_model"
+            and model in output.artifacts
+            and output.details.get("linear_model") == model.model_dump(mode="json")
+            and output.details.get("operation") == "linearize"
+            and output.details.get("valid") is True
+            and output.details.get("execution_status") == "completed"
+            and model.path == f"calls/{output.details.get('call_id')}/published/linear-model.mat"
+        ):
+            if output.details.get("conditions") != inputs.conditions:
+                raise ValueError("Margin conditions differ from the linear model conditions")
+            metadata = next(
+                (item for item in output.artifacts
+                 if item.id == "metadata" and item.node_id == producer
+                 and item.path == f"calls/{output.details.get('call_id')}/published/metadata.json"),
+                None,
+            )
+            if metadata is None:
+                raise ValueError("Missing published linear model producer metadata")
+            verify_evidence(context.directory, model)
+            path = verify_evidence(context.directory, metadata)
+            actual = _read_model(path, MatlabExecutionMetadata)
+            if (
+                actual.id != output.details.get("call_id")
+                or not isinstance(actual.inputs, LinearizeInput)
+                or actual.conditions != inputs.conditions
+                or actual.inputs.conditions != inputs.conditions
+            ):
+                raise ValueError("Linear model producer metadata/conditions differ")
+            return [model, metadata]
+    raise ValueError("allmargin requires the exact published linear model of a direct dependency")
+
+
 def _request(
-    context: AgentContext, inputs: ProjectExecutionInput | StepinfoInput, *, resume: bool
+    context: AgentContext, inputs: LocalMatlabInput, *, resume: bool
 ) -> LocalMatlabRequest:
     context.scope.authorize("execute_project")
-    project = _project(context) if isinstance(inputs, ProjectExecutionInput) else None
+    project = (
+        _project(context) if isinstance(inputs, (ProjectExecutionInput, LinearizeInput)) else None
+    )
     saved = context.load_checkpoint()
-    operation: Literal["execute_project", "stepinfo"] = (
-        "execute_project" if project is not None else "stepinfo"
+    operation: Literal["execute_project", "linearize", "stepinfo", "allmargin"] = (
+        "execute_project" if isinstance(inputs, ProjectExecutionInput) else
+        "linearize" if isinstance(inputs, LinearizeInput) else
+        "stepinfo" if isinstance(inputs, StepinfoInput) else "allmargin"
+    )
+    evidence = (
+        [inputs.series] if isinstance(inputs, StepinfoInput) else
+        _linear_model(context, inputs) if isinstance(inputs, AllmarginInput) else []
     )
     if resume:
         if saved is None or "request" not in saved:
@@ -90,7 +137,7 @@ def _request(
             operation=operation,
             inputs=inputs,
             project=project,
-            input_evidence=[inputs.series] if isinstance(inputs, StepinfoInput) else [],
+            input_evidence=evidence,
             timeout_seconds=timeout,
         )
         context.save_checkpoint({"request": request.model_dump(mode="json")})
@@ -99,7 +146,7 @@ def _request(
         or request.operation != operation
         or request.inputs != inputs
         or request.project != project
-        or request.input_evidence != ([inputs.series] if isinstance(inputs, StepinfoInput) else [])
+        or request.input_evidence != evidence
     ):
         raise ValueError("Local MATLAB checkpoint differs from the original confirmed invocation")
     return request
@@ -136,6 +183,7 @@ def _outcome(
         "execution_status": result.execution_status,
         "call_id": context.call_id,
         "conditions": request.inputs.conditions,
+        "operation": request.operation,
     }
     metadata = _read_model(directory / "metadata.json", MatlabExecutionMetadata)
     details.update(
@@ -147,13 +195,16 @@ def _outcome(
     if request.project is not None:
         details["project_fingerprint"] = request.project.fingerprint
     for artifact in artifacts:
-        if artifact.id == "series":
-            details["series"] = artifact.model_dump(mode="json")
+        if artifact.id in {"series", "linear_model"}:
+            details[artifact.id] = artifact.model_dump(mode="json")
     observations = []
-    if isinstance(request.inputs, StepinfoInput) and result.valid:
+    if isinstance(request.inputs, (StepinfoInput, AllmarginInput)) and result.valid:
         metrics = result.details["metrics"]
         assert isinstance(metrics, dict)
-        for name in ("overshoot", "settling_time"):
+        for name in (
+            ("overshoot", "settling_time") if isinstance(request.inputs, StepinfoInput)
+            else ("gain_margin", "phase_margin")
+        ):
             metric = metrics[name]
             assert isinstance(metric, dict)
             observations.append(
@@ -188,12 +239,12 @@ def _outcome(
 
 def local_matlab_capabilities(
     backend: LocalMatlabBackend,
-) -> list[Capability[AgentContext, ProjectExecutionInput | StepinfoInput, CapabilityOutcome]]:
+) -> list[Capability[AgentContext, LocalMatlabInput, CapabilityOutcome]]:
     def readiness(resources: tuple[ResourceReference, ...]) -> Availability:
         return backend.readiness()
 
     def execute(
-        context: AgentContext, inputs: ProjectExecutionInput | StepinfoInput, *, resume: bool
+        context: AgentContext, inputs: LocalMatlabInput, *, resume: bool
     ) -> CapabilityOutcome:
         request = _request(context, inputs, resume=resume)
         directory = context.directory / f"calls/{context.call_id}/local-matlab"
@@ -202,6 +253,11 @@ def local_matlab_capabilities(
             # Backend evidence locators are relative to the enclosing call directory.
             publish_evidence(directory.parent, inputs.series.path, source.read_bytes())
             _series(context, inputs)
+        if not resume and isinstance(inputs, AllmarginInput):
+            for item in _linear_model(context, inputs):
+                source = verify_evidence(context.directory, item)
+                publish_evidence(directory.parent, item.path, source.read_bytes())
+            _linear_model(context, inputs)
         try:
             result = backend.execute(request, directory, resume=resume)
         except (OSError, ValueError, RuntimeError) as exc:
@@ -220,12 +276,14 @@ def local_matlab_capabilities(
         try:
             if isinstance(inputs, StepinfoInput):
                 _series(context, inputs)
+            if isinstance(inputs, AllmarginInput):
+                _linear_model(context, inputs)
             return _outcome(context, request, result, directory)
         except (OSError, ValueError) as exc:
             raise ExecutionUncertain(f"Local MATLAB evidence changed: {exc}") from exc
 
     return [
-        Capability[AgentContext, ProjectExecutionInput | StepinfoInput, CapabilityOutcome](
+        Capability[AgentContext, LocalMatlabInput, CapabilityOutcome](
             name="matlab_execute_project",
             version="1",
             description="Execute a confirmed existing entry or model in a local project snapshot.",
@@ -248,7 +306,7 @@ def local_matlab_capabilities(
                 ),
             ),
         ),
-        Capability[AgentContext, ProjectExecutionInput | StepinfoInput, CapabilityOutcome](
+        Capability[AgentContext, LocalMatlabInput, CapabilityOutcome](
             name="matlab_stepinfo",
             version="1",
             description="Compute MATLAB stepinfo from a verified dependency series artifact.",
@@ -278,6 +336,79 @@ def local_matlab_capabilities(
                     "match its actual conditions. Explicit settling_band defines calculation "
                     "and plots, not acceptance. Invalid evidence retains diagnostics/plots "
                     "without valid observations. No signal, aircraft or trim constants."
+                ),
+            ),
+        ),
+        Capability[AgentContext, LocalMatlabInput, CapabilityOutcome](
+            name="matlab_linearize", version="1",
+            description=(
+                "Linearize a sourced existing model at its explicitly selected operating point."
+            ),
+            input_model=LinearizeInput, output_model=CapabilityOutcome, effect="execute_project",
+            operation=lambda context, inputs: execute(context, inputs, resume=False),
+            reconcile=lambda context, inputs: execute(context, inputs, resume=True),
+            readiness=readiness,
+            metadata=CapabilityMetadata(
+                resources=[
+                    ResourceRequirement(role="project", kind="matlab_project", location="agent")
+                ],
+                conditions_schema={"type": "object"},
+                validity_policy={
+                    "version": "1", "source": "existing_active_SISO_getlinio_points",
+                    "operating_point": "explicit_sourced_initialized_or_workspace",
+                    "feedback_sign": "explicit_sourced_no_default",
+                    "artifact": "hash_verified_immutable_MAT_with_runtime_provenance",
+                },
+                planning_notes=(
+                    "Bind exact project. Use discovered model and authoritative initializer; "
+                    "never replace initializer with a preparation. Preparations run before "
+                    "initialization within this isolated node; discovered functions accept JSON "
+                    "varargin. Sources are project documentation/workspace_sources paths, "
+                    "setting locations or authorized user-message references, with exact quotes. "
+                    "Map preparation.argument_conditions to sourced conditions for a symbolic "
+                    "documented call. workspace_assertions compare a workspace field to its named "
+                    "condition and record actual values; cover every claimed condition. "
+                    "operating_point.mode initialized "
+                    "means operpoint after initialization, not trim search; workspace needs path. "
+                    "feedback_sign must follow engineering declarations, never guessed. Uses "
+                    "one existing active openinput and openoutput; rejects other loops. Publishes "
+                    "details.linear_model for optional dependency analysis. No fixed sequence."
+                ),
+            ),
+        ),
+        Capability[AgentContext, LocalMatlabInput, CapabilityOutcome](
+            name="matlab_allmargin", version="1",
+            description="Compute SISO loop margins from a verified dependency linear-model MAT.",
+            input_model=AllmarginInput, output_model=CapabilityOutcome, effect="execute_project",
+            operation=lambda context, inputs: execute(context, inputs, resume=False),
+            reconcile=lambda context, inputs: execute(context, inputs, resume=True),
+            readiness=readiness,
+            metadata=CapabilityMetadata(
+                metrics=[
+                    MetricDefinition(
+                        id="gain_margin", label="Gain margin", unit="dB",
+                        comparable_specials=["positive_infinity", "negative_infinity"],
+                    ),
+                    MetricDefinition(
+                        id="phase_margin", label="Phase margin", unit="deg",
+                        comparable_specials=["positive_infinity", "negative_infinity"],
+                    ),
+                ],
+                conditions_schema={"type": "object"},
+                validity_policy={
+                    "version": "1",
+                    "source": "MATLAB_allmargin_on_verified_dependency_linear_model",
+                    "reduction": "least_margin_across_all_retained_crossings",
+                    "specials": "explicit_signed_infinities_undefined_is_invalid",
+                    "nominal_stability": "reported_separately_not_threshold_compliance",
+                },
+                planning_notes=(
+                    "Bind linear_model only from a direct matlab_linearize dependency's "
+                    "['details','linear_model']; never invent artifacts or accept directories. "
+                    "Conditions must equal producer and criterion conditions. Retains crossings, "
+                    "closed_loop_stable, validity, diagnostics, raw MAT and bode plot. Negative "
+                    "margins and nominal instability are reported, not masked. Optional generic "
+                    "evaluation/delivery only as requested; no threshold defaults."
                 ),
             ),
         ),

@@ -15,7 +15,13 @@ from ..runtime.requirements import CapabilityGap, CriterionSource, TaskRequireme
 from ..runtime.resources import AgentContract, ResourceReference, Text
 from .contracts import AgentTask, Conversation, SteadyStatePolicy
 from .local_matlab import _signature
-from .matlab_contracts import LocalMatlabRequest, MatlabProjectDescriptor, ProjectExecutionInput
+from .matlab_contracts import (
+    LinearizeInput,
+    LocalMatlabRequest,
+    LocalSelectionSource,
+    MatlabProjectDescriptor,
+    ProjectExecutionInput,
+)
 from .planner import StructuredPlanner, _conversation_paths, redact_text
 
 MAX_CONTEXT_BYTES = 240_000
@@ -40,6 +46,9 @@ capability_gap 的 plan=null、gaps 必须非空；plan 必须提供完整 plan�
 quote 含脱敏标记时完整复制该来源提供的 quote，不得自行还原路径或密钥。
 不得编造来源、条件、阈值或设计标识，也不得默认采用演示值。
 纯分析 mode=analysis，不强加 PASS/FAIL、评价或报告。仅检验用户要求的指标。
+has_output_directory=true 表示用户选择了外部成果目录；即使未要求报告，运行证据也会存入该目录，
+待确认方案的 allowed_effects 必须明确申请 write_delivery。目录选择不等于已获写入授权，
+仍须用户确认当前版本后才能执行和写盘；不能因此强加 deliver_results、Word/JSON 或额外分析。
 输入标准不完整时先澄清，不能用常见阈值填空。未要求整体判定时 overall_requested=false。
 仅服务端绑定资源：计划使用 resource_ids 与节点 resource_bindings，禁止回传 locator 或资源指纹。
 节点写明 depends_on；bindings 只引用直接依赖的输出路径，不生成表达式。
@@ -63,6 +72,22 @@ entry 模式也必须保留明确指定的初始化入口；未指定时不强�
 典型验证为 execute → stepinfo → evaluate → deliver，至少四次派发/四轮；
 series 只能绑定执行节点的 ["details","series"]，不能填写数组或伪造工件描述。
 指标生产者是 matlab_stepinfo，工况必须与执行来源相同；纯已有入口分析不强加 stepinfo。
+本机频域能力为可组合 matlab_linearize 与 matlab_allmargin，不是固定业务流程。
+linearize 保留权威 initializer；选择已有准备函数时用 preparations 在同一隔离节点内先运行，
+不能用 selector 替换 initializer。已发现 varargin 函数可接收显式 JSON 参数；参数来自源码/
+文档的明确调用，或 argument_conditions 对应的有来源 conditions。禁止生成 MATLAB 表达式。
+operating_point 与 feedback_sign 必须有原文来源；initialized 表示初始化后 operpoint(model)，
+workspace 必须显式字段路径。不猜工作点、环路开断点或符号，不将默认工况冒充请求工况。
+LocalSelectionSource 使用工程 documentation.path/设置 location 或用户 source.reference，
+quote 必须是其完整原文片段，不得编造声明。condition_sources 将条件键映射到原文片段，
+可用于中文“配平点 1”等自然语言而不要求用户重填清单。准备参数可通过条件键对应到该数值。
+若用准备入口选择工况，必须用 workspace_assertions 的 path、condition、source 对初始化后的
+实际变量/字段断言工况；保留任意索引，不默认第一个点或仅贴标签。工程声明的变量字段从源码
+归属设置/README 获取。每个 conditions 键均须有实际工作区断言；不额外添加未验证标签。
+运行时读取 getlinio 已有激活 SISO openinput/openoutput 对。
+allmargin.linear_model 只绑定直接 linearize 依赖的 ["details","linear_model"]；工况及判据工况
+必须完全相同。其指标为 gain_margin(dB)、phase_margin(deg)，保留所有交越、无穷值及名义稳定性；
+负裕度、名义不稳定不能掩盖或自动修复。只有用户要求才追加通用评价/JSON/Word交付。
 每个节点派发都消耗一轮和一次调用，包括分析、评价、报告交付与缓存复用；
 budget.max_rounds 和 max_calls 都必须至少覆盖全部节点数，轮数不是并行依赖层数。
 内部多轮分析还需额外预算；不能靠缓存、并行或省略交付节点来缩减所需轮次。
@@ -636,6 +661,8 @@ def _validate_local_execution(
     inputs: ProjectExecutionInput,
     project: MatlabProjectDescriptor,
     sources: dict[str, CriterionSource],
+    *,
+    allow_varargin: bool = False,
 ) -> None:
     texts, records, configuration = _local_facts(project, sources)
     signal_rows = [row for text in texts for row in _signal_table_declarations(text)]
@@ -663,7 +690,7 @@ def _validate_local_execution(
         )
         if selected is not None:
             try:
-                _, outputs = _signature(selected, project)
+                _, outputs = _signature(selected, project, allow_varargin=allow_varargin)
             except ValueError as exc:
                 raise _LocalPlanningIssue(str(exc), gap=True) from exc
             if selected.arguments and not any(
@@ -752,15 +779,254 @@ def _validate_local_execution(
             raise _LocalPlanningIssue(f"Execution condition {name} requires its original source")
 
 
+def _local_selection_text(
+    source: LocalSelectionSource,
+    project: MatlabProjectDescriptor,
+    sources: dict[str, CriterionSource],
+    *,
+    full: bool = False,
+) -> str:
+    original = sources.get(source.reference)
+    if (
+        original is not None and original.kind == "user_message" and source.quote in original.quote
+    ):
+        return original.quote if full else source.quote
+    for group in (
+        "documentation", "workspace_sources", "matlab_literals",
+        "model_parameters", "project_metadata",
+    ):
+        records = project.settings.get(group, [])
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            excerpt = group in {"documentation", "workspace_sources"}
+            reference = record.get("path" if excerpt else "location")
+            text = record.get("text") if excerpt else json.dumps(
+                record, ensure_ascii=False
+            )
+            if source.reference == reference and isinstance(text, str) and source.quote in text:
+                return text if full else source.quote
+    raise _LocalPlanningIssue(
+        "Linearization selection source differs from its original attribution"
+    )
+
+
+def _condition_declarations(text: str, labels: list[str]) -> list[tuple[JsonValue, bool]]:
+    label = "|".join(re.escape(item).replace("_", r"[\s_-]*") for item in labels)
+    pattern = (
+        r"(?<![A-Za-z0-9_])(?:" + label + r")(?![A-Za-z0-9_])"
+        r"\s*(?P<separator>[:=：]\s*|(?:is\b|为|是|defaults?\s+to\b)\s*|\s+)"
+    )
+    declarations: list[tuple[JsonValue, bool]] = []
+    for clause in re.split(r"[\n;；。]|(?<=[.!?])\s+", text):
+        for match in re.finditer(pattern, clause, re.IGNORECASE):
+            if re.search(
+                r"\b(?:do\s+not|don['’]t|never|not)\b[^,，]{0,40}$|"
+                r"(?:不要|禁止|勿|不应|不是|不选)[^,，]{0,20}$",
+                clause[:match.start()], re.IGNORECASE,
+            ):
+                continue
+            raw = clause[match.end():]
+            try:
+                value, _ = json.JSONDecoder().raw_decode(raw)
+            except ValueError:
+                token = re.match(r"'((?:''|[^'])*)'|([^\s,;；。]+)", raw)
+                if token is None or (
+                    token[1] is None and not match["separator"].strip()
+                ):
+                    continue
+                value = token[1].replace("''", "'") if token[1] is not None else token[2]
+            declarations.append(
+                (value, bool(re.search(r"\bdefaults?\b|默认", clause, re.IGNORECASE)))
+            )
+    return declarations
+
+
+def _operating_point_declarations(text: str) -> list[tuple[str, bool]]:
+    declarations = []
+    for clause in re.split(r"[\n;；。]|(?<=[.!?])\s+|\bbut\b|但是|但应", text):
+        denied = bool(re.search(
+            r"\b(?:(?:do|does|did|must|should|can)\s+not|don['’]t|never)\s+"
+            r"(?:use|select|choose)\b|\bavoid\b|"
+            r"\b(?:no|not)\s+(?:an?\s+|the\s+)?(?:initialized|workspace)\b|"
+            r"(?:不要|禁止|勿|不应|不能|不|避免|无需)(?:使用|采用|选择)|"
+            r"\b(?:maybe|perhaps|if)\b|是否|可能|如果",
+            clause, re.IGNORECASE,
+        ))
+        if re.search(
+            r"initialized(?:\s+(?:current|selected))*\s+operating[\s_-]*point|"
+            r"operating[\s_-]*point\s*[:=：]\s*initialized|operpoint\s*\(|"
+            r"初始化(?:工作|运行|配平)点",
+            clause, re.IGNORECASE,
+        ):
+            declarations.append(("initialized", denied))
+        if re.search(
+            r"workspace\s+operating[\s_-]*point|"
+            r"operating[\s_-]*point\s*[:=：]\s*workspace|"
+            r"operating[\s_-]*point\s*[:=：]\s*[A-Za-z]\w*(?:\.[A-Za-z]\w*)+|"
+            r"工作区[^;\n；。]{0,80}(?:工作点|运行点|配平点|OperatingPoint)",
+            clause, re.IGNORECASE,
+        ):
+            declarations.append(("workspace", denied))
+    return declarations
+
+
+def _validate_local_linearize(
+    inputs: LinearizeInput,
+    project: MatlabProjectDescriptor,
+    sources: dict[str, CriterionSource],
+) -> None:
+    execution = inputs.project_execution().model_copy(update={"conditions": {}})
+    _validate_local_execution(execution, project, sources, allow_varargin=True)
+    texts, records, configuration = _local_facts(project, sources)
+    documentation, _, _ = _local_facts(project, {})
+    for name, value in inputs.conditions.items():
+        labels = [name, *(
+            ".".join(assertion.path) for assertion in inputs.workspace_assertions
+            if assertion.condition == name
+        ), *(
+            assertion.path[-1] for assertion in inputs.workspace_assertions
+            if assertion.condition == name
+        )]
+        if any(
+            _setting_name(label) in {"pointindex", "pointnumber", "trimpoint"}
+            for label in labels
+        ):
+            labels.extend(["配平点", "trim point", "point index", "point number"])
+        facts = [
+            item for text in documentation for item in _condition_declarations(text, labels)
+        ]
+        user_requested = any(
+            original.kind == "user_message"
+            and any(
+                actual == value for actual, _ in _condition_declarations(original.quote, labels)
+            )
+            for original in sources.values()
+        )
+        selected = any(name in item.argument_conditions for item in inputs.preparations)
+        override_default = user_requested and selected
+        declared = [
+            record.get("value") for record in records
+            if _setting_name(str(record.get("name"))) == _setting_name(name)
+        ]
+        defaults = [actual for actual, default in facts if default]
+        if any(
+            actual != value and not (default and override_default) for actual, default in facts
+        ) or any(
+            item != value and not (override_default and item in defaults) for item in declared
+        ):
+            raise _LocalPlanningIssue(
+                f"Linearization condition {name} conflicts with project sources"
+            )
+        source = inputs.condition_sources.get(name)
+        if source is not None:
+            quote = _local_selection_text(source, project, sources)
+            if not any(actual == value for actual, _ in _condition_declarations(quote, labels)):
+                raise _LocalPlanningIssue(
+                    f"Condition {name} lacks condition-specific attribution in its original source"
+                )
+        elif not declared and not any(
+            actual == value
+            for text in texts for actual, _ in _condition_declarations(text, labels)
+        ):
+            raise _LocalPlanningIssue(
+                f"Linearization condition {name} requires its original source"
+            )
+    operating = _local_selection_text(inputs.operating_point.source, project, sources)
+    mode = inputs.operating_point.mode
+    if (mode, False) not in _operating_point_declarations(operating):
+        raise _LocalPlanningIssue(
+            "Operating point requires an affirmative mode-specific declaration"
+        )
+    context = _local_selection_text(
+        inputs.operating_point.source, project, sources, full=True
+    )
+    declarations = [
+        item for text in [*documentation, context] for item in _operating_point_declarations(text)
+    ]
+    if any(
+        (actual == mode and denied) or (actual != mode and not denied)
+        for actual, denied in declarations
+    ) or configuration.get("operating_point_mode", mode) != mode:
+        raise _LocalPlanningIssue(
+            "Operating point conflicts with its authoritative source selection"
+        )
+    if mode == "workspace" and ".".join(inputs.operating_point.path) not in operating:
+        raise _LocalPlanningIssue(
+            "Workspace operating point differs from its original field source"
+        )
+    feedback = _local_selection_text(inputs.feedback_source, project, sources)
+    signs = [
+        int(value) for value in re.findall(r"feedback_sign\s*[:=：]\s*([+-]?1)\b", feedback)
+    ]
+    no_negation = (
+        r"(?<!不是)(?<!并非)(?<!不能)(?:不(?:需要|应|必)|无需)"
+        r"\s*(?:再(?:次)?|额外)?\s*取负|"
+        r"not\s+(?:(?:need\s+to\s+)?be\s+)?negated|no\s+(?:sign\s+)?inversion|"
+        r"(?:do\s+not|no\s+need\s+to)\s+negate\b|"
+        r"(?:不|无需|不应)[^\n。；]{0,20}?(?:取反|负号|反号)"
+    )
+    if re.search(no_negation, feedback, re.IGNORECASE):
+        signs.append(1)
+    if re.search(
+        r"(?:must|should)\s+(?:be\s+)?negated|需要[^\n。；]{0,12}(?:取反|负号|反号)|"
+        r"(?<!是否)(?<!可能)(?<!也许)(?<!不)(?:需要|必须)[^\n。；]{0,12}取负",
+        re.sub(no_negation, "", feedback, flags=re.IGNORECASE), re.IGNORECASE,
+    ):
+        signs.append(-1)
+    declared_signs = [
+        int(value) for text in texts
+        for value in re.findall(r"feedback_sign\s*[:=：]\s*([+-]?1)\b", text)
+    ]
+    if not signs or any(sign != inputs.feedback_sign for sign in [*signs, *declared_signs]):
+        raise _LocalPlanningIssue(
+            "Feedback sign conflicts with or lacks its explicit original source"
+        )
+    if inputs.preparations and not inputs.workspace_assertions:
+        raise _LocalPlanningIssue(
+            "Prepared operating conditions require actual workspace assertions"
+        )
+    for preparation in inputs.preparations:
+        quote = _local_selection_text(preparation.source, project, sources)
+        name = preparation.entry.path.rsplit("/", 1)[-1].removesuffix(".m")
+        if not re.search(r"(?<!\w)" + re.escape(name) + r"\s*\(", quote):
+            raise _LocalPlanningIssue(
+                "Preparation must cite its existing function call declaration"
+            )
+        try:
+            _signature(preparation.entry, project, allow_varargin=True)
+        except ValueError as exc:
+            raise _LocalPlanningIssue(str(exc), gap=True) from exc
+        if preparation.entry.arguments and not preparation.argument_conditions:
+            literal = json.dumps(preparation.entry.arguments)
+            arguments = ", ".join(json.dumps(value) for value in preparation.entry.arguments)
+            if literal not in quote and not re.search(
+                re.escape(name) + r"\(\s*" + re.escape(arguments) + r"\s*\)", quote
+            ):
+                raise _LocalPlanningIssue(
+                    "Preparation JSON arguments require their original source"
+                )
+    for assertion in inputs.workspace_assertions:
+        quote = _local_selection_text(assertion.source, project, sources)
+        if ".".join(assertion.path) not in quote and not all(
+            re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", quote)
+            for name in assertion.path
+        ):
+            raise _LocalPlanningIssue("Workspace assertion differs from its original field source")
+
+
 def _validate_local_nodes(
     draft: AgentPlanDraft,
     resources: dict[str, ResourceReference],
     sources: dict[str, CriterionSource],
 ) -> None:
     nodes = {node.id: node for node in draft.nodes}
+    linearizations: dict[str, LinearizeInput] = {}
     executions: dict[str, tuple[ProjectExecutionInput, MatlabProjectDescriptor]] = {}
     for node in draft.nodes:
-        if node.tool != "matlab_execute_project":
+        if node.tool not in {"matlab_execute_project", "matlab_linearize"}:
             continue
         try:
             resource = resources[node.resource_bindings["project"]]
@@ -775,7 +1041,7 @@ def _validate_local_nodes(
                 raise ValueError("Local descriptor differs from its exact bound resource")
             if node.bindings:
                 raise ValueError("Execution selections must be explicit source-backed inputs")
-            mode = node.inputs.get("mode")
+            mode = node.inputs.get("mode", "simulink" if node.tool == "matlab_linearize" else None)
             required = (
                 {"simulink": "model", "entry": "entry"}.get(mode)
                 if isinstance(mode, str)
@@ -793,19 +1059,49 @@ def _validate_local_nodes(
                     texts,
                     configuration.get(required),
                 )
+            linear = node.tool == "matlab_linearize"
             request = LocalMatlabRequest(
                 id="0" * 32,
-                operation="execute_project",
+                operation="linearize" if linear else "execute_project",
                 project=project,
-                inputs=ProjectExecutionInput.model_validate(node.inputs),
+                inputs=(
+                    LinearizeInput.model_validate(node.inputs) if linear
+                    else ProjectExecutionInput.model_validate(node.inputs)
+                ),
             )
-            assert isinstance(request.inputs, ProjectExecutionInput)
-            _validate_local_execution(request.inputs, project, sources)
+            if isinstance(request.inputs, LinearizeInput):
+                _validate_local_linearize(request.inputs, project, sources)
+                linearizations[node.id] = request.inputs
+            else:
+                assert isinstance(request.inputs, ProjectExecutionInput)
+                _validate_local_execution(request.inputs, project, sources)
         except (ValueError, KeyError) as exc:
             if isinstance(exc, _LocalPlanningIssue):
                 raise
             raise _LocalPlanningIssue(f"Please clarify discovered entry/selection: {exc}") from exc
-        executions[node.id] = (request.inputs, project)
+        if isinstance(request.inputs, ProjectExecutionInput):
+            executions[node.id] = (request.inputs, project)
+    for node in draft.nodes:
+        if node.tool != "matlab_allmargin":
+            continue
+        reference = node.bindings.get("linear_model")
+        if (
+            reference is None or reference.path != ["details", "linear_model"]
+            or reference.node_id not in linearizations
+            or reference.node_id not in node.depends_on
+            or set(node.bindings) != {"linear_model"} or "linear_model" in node.inputs
+        ):
+            raise _LocalPlanningIssue(
+                "allmargin linear_model must bind an exact direct linearize details.linear_model"
+            )
+        actual = linearizations[reference.node_id]
+        if node.inputs.get("conditions", {}) != actual.conditions:
+            raise _LocalPlanningIssue("allmargin conditions differ from its linear model producer")
+        for criterion in draft.requirements.criteria:
+            if criterion.metric.node_id == node.id and criterion.conditions != actual.conditions:
+                raise _LocalPlanningIssue(
+                    "Criterion conditions differ from their exact margin producer"
+                )
     for node in draft.nodes:
         if node.tool != "matlab_stepinfo":
             continue
@@ -949,7 +1245,9 @@ def bind_plan(
             raise ValueError(f"Capability effect is outside the plan: {node.tool}")
         # needs_input may become available after binding specific resources.
         if availability[node.tool].state == "unavailable":
-            if node.tool in {"matlab_execute_project", "matlab_stepinfo"}:
+            if node.tool in {
+                "matlab_execute_project", "matlab_stepinfo", "matlab_linearize", "matlab_allmargin"
+            }:
                 raise _LocalPlanningIssue(availability[node.tool].reason, gap=True)
             raise ValueError(availability[node.tool].reason)
         roles = {item.role: item for item in entry.metadata.resources}
@@ -1118,6 +1416,7 @@ class AgentPlanner(StructuredPlanner):
             }
         raw_context: dict[str, object] = {
             "request": message,
+            "has_output_directory": conversation.output_root is not None,
             "catalog": catalog,
             "resources": [
                 item.model_dump(mode="json", exclude={"locator"}) for item in resources.values()
@@ -1228,12 +1527,33 @@ class AgentPlanner(StructuredPlanner):
                             else [],
                         )
                 else:
-                    return AgentDecision.model_validate(
-                        {
-                            **decision.model_dump(mode="json"),
-                            "plan": plan.model_dump(mode="json"),
-                        }
-                    )
+                    if conversation.output_root is None or "write_delivery" in plan.allowed_effects:
+                        return AgentDecision.model_validate(
+                            {
+                                **decision.model_dump(mode="json"),
+                                "plan": plan.model_dump(mode="json"),
+                            }
+                        )
+                    if attempt:
+                        return AgentDecision(
+                            action="clarify",
+                            text=(
+                                "已选择外部成果目录，但规划器修正后仍未明确申请 "
+                                "write_delivery 写入权限；尚未生成可确认方案，也未执行或写入。"
+                                "请重新提交任务，或清空输出目录使用默认成果位置。"
+                            ),
+                        )
+                    feedback = {
+                        "errors": [{
+                            "location": ["allowed_effects"],
+                            "code": "external_output_permission_required",
+                            "message": (
+                                "External evidence storage requires write_delivery in the proposed "
+                                "allowed_effects, subject to explicit user confirmation. Preserve "
+                                "the requested analysis; do not add unrequested report nodes."
+                            ),
+                        }],
+                    }
             context = {
                 **context,
                 "validation_feedback": _redact_context(feedback, paths),

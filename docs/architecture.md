@@ -68,6 +68,8 @@ Web 启动时装配 `CapabilityRegistry(agent_mode=True)`、`ResourceRegistry`�
 |---|---|---|
 | `matlab_execute_project` | `matlab_project / agent` | 已有入口/模型结果、回执、可选时序 |
 | `matlab_stepinfo` | 直接依赖发布的时序 | 超调量、调节时间、曲线与有效性说明 |
+| `matlab_linearize` | `matlab_project / agent` | 已有工作点/分析点的线性模型 MAT、实际选择与运行证据 |
+| `matlab_allmargin` | 直接线性化依赖发布的 MAT 与元数据 | dB/deg 裕度、全部交越、名义稳定性、有效性与图 |
 | `simulink_step_response` | `simulink_project / worker` | Worker 时域指标 |
 | `simulink_stability_margins` | `simulink_project / worker` | 幅值裕度、相角裕度 |
 | `offline_diagnosis` | `diagnostic_data / agent` | 诊断发现、假设与证据 |
@@ -76,13 +78,20 @@ Web 启动时装配 `CapabilityRegistry(agent_mode=True)`、`ResourceRegistry`�
 
 同一物理目录不自动等于同一种资源。本机和 Worker 工程有不同的发现、输入和授权契约；
 能力只有获得匹配的资源角色绑定后才能执行。
-当前本机没有线性化/`allmargin` 适配器，不能借 Worker 工具名绕过这种区别。
+本机线性化/`allmargin` 同样不能借 Worker 工具名绕过这种区别。
 
 本机有判据、要求报告的典型链路是：
 
 ```text
 matlab_execute_project -> matlab_stepinfo -> evaluate_criteria -> deliver_results
+matlab_linearize -> matlab_allmargin -> evaluate_criteria -> deliver_results
 ```
+
+这些是组合示例，不是固定节点序列。线性化同一节点内可先调用有来源的已有准备入口，
+再运行权威初始化器，验证明确工作区字段与条件相等；不依赖其他节点的 Engine 工作区。
+普通入口签名限制不变；仅新线性化入口支持明确参数的已有 `varargin` 函数。
+已有 `getlinio` 点、工作点来源和反馈符号写入运行证据；线性模型与生产者元数据在发布、
+消费、完成和恢复时验证摘要。指标保留有符号无穷值及全部交越，不把名义稳定性混同阈值达标。
 
 Worker 的配平点 1、预设日志/分析点和稳态策略属于适配器约定，不是通用内核的限制。
 离线诊断不主动补跑 Simulink，测试里的 RMSE、峰值等能力也不属于生产注册项。
@@ -198,7 +207,7 @@ src/flight_agent/
 |   |-- local_matlab.py          # 专用解释器与执行后端
 |   |-- local_matlab_worker.py   # Engine 子进程
 |   |-- adapters/
-|   |   |-- local_matlab.py      # 本机执行与 stepinfo
+|   |   |-- local_matlab.py      # 本机执行、stepinfo、线性化与 allmargin
 |   |   |-- simulink.py          # Worker 时域与裕度
 |   |   |-- diagnostics.py       # 离线诊断
 |   |   |-- evaluation.py        # 确定性比较
@@ -221,6 +230,8 @@ src/flight_agent/
 |-- matlab_support/
 |   |-- flight_agent_run_project.m
 |   |-- flight_agent_local_stepinfo.m
+|   |-- flight_agent_local_linearize.m
+|   |-- flight_agent_local_allmargin.m
 |   |-- flight_agent_step_metrics.m
 |   |-- flight_agent_margin_metrics.m
 |   |-- flight_agent_verify.m

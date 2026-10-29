@@ -332,6 +332,13 @@ def discover_matlab_project(root: str) -> MatlabProjectDescriptor:
             settings["explicit_configuration"] = configuration
             settings_size = len(json.dumps(settings, ensure_ascii=False).encode("utf-8"))
         elif suffix == ".m":
+            if re.search(r"""assignin\s*\(\s*['"]base['"]\s*,""", text):
+                excerpt = text[:16_000]
+                append_setting("workspace_sources", {"path": item.path, "text": excerpt})
+                if len(excerpt) != len(text):
+                    notes.append(
+                        f"{item.path}: workspace source excerpt truncated at 16000 characters."
+                    )
             counts = _default_argument_counts(statements)
             if counts:
                 record(

@@ -18,9 +18,12 @@ from .local_matlab import (
     _verify_result,
 )
 from .matlab_contracts import (
+    LinearizeInput,
     LocalMatlabRequest,
     LocalMatlabResult,
+    MatlabAllmarginOutput,
     MatlabExecutionMetadata,
+    MatlabLinearizeOutput,
     MatlabProjectOutput,
     MatlabRuntimeMetadata,
     MatlabStepinfoOutput,
@@ -66,12 +69,18 @@ def _child(directory: Path) -> None:
         snapshot = discover_matlab_project(execution.snapshot_root)
         if snapshot.model_copy(update={"root": request.project.root}) != request.project:
             raise ValueError("Prepared snapshot changed before Engine execution")
-    else:
-        assert isinstance(request.inputs, StepinfoInput)
+    elif isinstance(request.inputs, StepinfoInput):
         verify_evidence(
             Path(execution.snapshot_root),
             request.inputs.series.model_copy(update={"path": "series.json"}),
         )
+    else:
+        for source, name in zip(
+            request.input_evidence, ("linear-model.mat", "producer-metadata.json"), strict=True
+        ):
+            verify_evidence(
+                Path(execution.snapshot_root), source.model_copy(update={"path": name})
+            )
     engine = None
     result = LocalMatlabResult(
         id=request.id, request_sha256=digest, execution_status="failed", valid=False
@@ -81,11 +90,12 @@ def _child(directory: Path) -> None:
         engine = module.start_matlab()
         engine.cd(str(_support()), nargout=0)
         engine.addpath(str(_support()), nargout=0)
-        helper = (
-            "flight_agent_run_project"
-            if request.operation == "execute_project"
-            else "flight_agent_local_stepinfo"
-        )
+        helper = {
+            "execute_project": "flight_agent_run_project",
+            "stepinfo": "flight_agent_local_stepinfo",
+            "linearize": "flight_agent_local_linearize",
+            "allmargin": "flight_agent_local_allmargin",
+        }[request.operation]
         resolved = engine.which(helper, nargout=1)
         if not isinstance(resolved, str) or Path(resolved).resolve() != _support() / (
             helper + ".m"
@@ -94,18 +104,21 @@ def _child(directory: Path) -> None:
         engine.feval(helper, str(directory / "execution.json"), nargout=0)
         result = result.model_copy(update={"execution_status": "unknown"})
         _output_bounds(directory)
-        output: MatlabProjectOutput = (
-            _read_model(directory / "bridge.json", MatlabStepinfoOutput)
-            if isinstance(request.inputs, StepinfoInput)
-            else _read_model(directory / "bridge.json", MatlabProjectOutput)
-        )
+        output_models: dict[str, type[MatlabProjectOutput]] = {
+            "execute_project": MatlabProjectOutput,
+            "stepinfo": MatlabStepinfoOutput,
+            "linearize": MatlabLinearizeOutput,
+            "allmargin": MatlabAllmarginOutput,
+        }
+        output = _read_model(directory / "bridge.json", output_models[request.operation])
         if output.id != request.id or output.request_sha256 != digest:
             raise ValueError("Bridge output identity mismatch")
-        allowed = (
-            {"raw.mat", "runtime-metadata.json", "series.json", "step-response.png"}
-            if isinstance(request.inputs, StepinfoInput)
-            else {"raw.mat", "runtime-metadata.json", "series.json", "return.json"}
-        )
+        allowed = {"raw.mat", "runtime-metadata.json"} | {
+            "execute_project": {"series.json", "return.json"},
+            "stepinfo": {"series.json", "step-response.png"},
+            "linearize": {"linear-model.mat"},
+            "allmargin": {"linear-model.mat", "producer-metadata.json", "bode.png"},
+        }[request.operation]
         if len(set(output.artifact_paths)) != len(output.artifact_paths):
             raise ValueError("Duplicate output artifact")
         if not set(output.artifact_paths) <= allowed:
@@ -147,7 +160,7 @@ def _child(directory: Path) -> None:
             "output_evidence": output.output_evidence,
             "conditions": request.inputs.conditions,
         }
-        if isinstance(output, MatlabStepinfoOutput):
+        if isinstance(output, (MatlabStepinfoOutput, MatlabAllmarginOutput)):
             details.update(
                 valid=output.valid,
                 metrics={
@@ -157,11 +170,15 @@ def _child(directory: Path) -> None:
         for artifact in artifacts:
             if artifact.path == "series.json":
                 details["series"] = artifact.model_dump(mode="json")
+            if artifact.path == "linear-model.mat" and isinstance(request.inputs, LinearizeInput):
+                details["linear_model"] = artifact.model_dump(mode="json")
         result = LocalMatlabResult(
             id=request.id,
             request_sha256=digest,
             execution_status="completed",
-            valid=output.valid if isinstance(output, MatlabStepinfoOutput) else True,
+            valid=output.valid if isinstance(
+                output, (MatlabStepinfoOutput, MatlabAllmarginOutput)
+            ) else True,
             details=details,
             diagnostics=output.diagnostics,
             artifacts=artifacts,
@@ -206,6 +223,9 @@ def main() -> int:
                 or not (_support() / "flight_agent_run_project.m").is_file()
                 or not (_support() / "flight_agent_local_stepinfo.m").is_file()
                 or not (_support() / "flight_agent_step_metrics.m").is_file()
+                or not (_support() / "flight_agent_local_linearize.m").is_file()
+                or not (_support() / "flight_agent_local_allmargin.m").is_file()
+                or not (_support() / "flight_agent_margin_metrics.m").is_file()
             ):
                 raise ValueError("Engine or packaged MATLAB support is unavailable")
             print(json.dumps({"available": True}))

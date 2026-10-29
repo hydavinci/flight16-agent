@@ -95,6 +95,80 @@ def test_analysis_plan_has_no_forced_criteria_judge_or_design(tmp_path):
     assert store.get(conversation.id).task is None
 
 
+@pytest.mark.parametrize("external_output", [False, True])
+def test_output_location_is_visible_to_planning_without_disclosing_the_path(
+    tmp_path, external_output
+):
+    proposed = draft()
+    if external_output:
+        proposed["allowed_effects"].append("write_delivery")
+    planner, store, conversation, tools, calls, model = setup(
+        tmp_path, {"action": "plan", "text": "Proposed analysis.", "plan": proposed}
+    )
+    directory = tmp_path / "private-results"
+    conversation.output_root = str(directory) if external_output else None
+    result = planner.propose(
+        "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+    )
+    context = json.loads(model._seen[0][-1].content)
+    assert context["has_output_directory"] is external_output
+    assert str(directory) not in str(model._seen)
+    assert result.plan.allowed_effects == (
+        ("read_only", "write_delivery") if external_output else ("read_only",)
+    )
+    assert not directory.exists()
+    assert store.get(conversation.id).task is None
+    assert not calls
+
+
+def test_missing_external_output_permission_gets_one_bounded_plan_correction(tmp_path):
+    broken = draft()
+    corrected = draft()
+    corrected["allowed_effects"].append("write_delivery")
+    planner, store, conversation, tools, calls, model = setup(tmp_path, {})
+    directory = tmp_path / "private-results"
+    conversation.output_root = str(directory)
+    model.responses = [
+        tool_message("propose_agent", {"action": "plan", "text": "Analysis.", "plan": broken}),
+        tool_message("propose_agent", {"action": "plan", "text": "Confirm.", "plan": corrected}),
+    ]
+    result = planner.propose(
+        "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+    )
+    assert result.action == "plan"
+    assert result.plan.allowed_effects == ("read_only", "write_delivery")
+    assert result.plan.requirements.model_dump(mode="json") == broken["requirements"]
+    assert [node.tool for node in result.plan.nodes] == ["offline_rmse"]
+    assert len(model._seen) == 2
+    original = json.loads(model._seen[0][-1].content)
+    repaired = json.loads(model._seen[1][-1].content)
+    feedback = repaired.pop("validation_feedback")
+    assert feedback["errors"][0]["code"] == "external_output_permission_required"
+    assert feedback["errors"][0]["location"] == ["allowed_effects"]
+    assert repaired == original
+    assert not directory.exists()
+    assert store.get(conversation.id).task is None
+    assert not calls
+
+
+def test_repeated_missing_output_permission_clarifies_without_granting_or_writing(tmp_path):
+    planner, store, conversation, tools, calls, model = setup(
+        tmp_path, {"action": "plan", "text": "Analysis.", "plan": draft()}
+    )
+    directory = tmp_path / "private-results"
+    conversation.output_root = str(directory)
+    result = planner.propose(
+        "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+    )
+    assert result.action == "clarify"
+    assert result.plan is None
+    assert "write_delivery" in result.text
+    assert len(model._seen) == 2
+    assert not directory.exists()
+    assert store.get(conversation.id).task is None
+    assert not calls
+
+
 def test_explicit_single_metric_threshold_is_not_replaced_by_demo_defaults(tmp_path):
     text = "Require RMSE <= 7.25 m."
     data = evaluation_plan()
@@ -416,10 +490,17 @@ def test_missing_output_producer_is_corrected_with_feedback_and_original_request
 
 
 @pytest.mark.parametrize("elapsed,expected_calls", [(4, 2), (11, 1)])
-def test_correction_shares_the_original_timeout(tmp_path, monkeypatch, elapsed, expected_calls):
+@pytest.mark.parametrize("failure", ["invalid-format", "external-output-permission"])
+def test_correction_shares_the_original_timeout(
+    tmp_path, monkeypatch, elapsed, expected_calls, failure
+):
     clock = [100.0]
     monkeypatch.setattr(module(), "monotonic", lambda: clock[0])
     planner, _, conversation, tools, calls, _ = setup(tmp_path, {})
+    broken = {"action": "plan", "text": "Missing draft."}
+    if failure == "external-output-permission":
+        conversation.output_root = str(tmp_path / "external")
+        broken["plan"] = draft()
 
     class TimedModel(CapturingModel):
         _timeouts: list = PrivateAttr(default_factory=list)
@@ -430,7 +511,7 @@ def test_correction_shares_the_original_timeout(tmp_path, monkeypatch, elapsed, 
             return super()._generate(messages, **kwargs)
 
     model = TimedModel(responses=[
-        tool_message("propose_agent", {"action": "plan", "text": "Missing draft."}),
+        tool_message("propose_agent", broken),
         tool_message("propose_agent", {"action": "clarify", "text": "Provide input."}),
     ])
     planner.model = model
