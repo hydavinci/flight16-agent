@@ -1,9 +1,11 @@
+import hashlib
 import importlib
 import json
 from pathlib import Path
 
 import pytest
 
+from flight_agent.json_io import write_json
 from flight_agent.runtime.agent_contracts import AgentPlan, BudgetState
 from flight_agent.runtime.budget import BudgetAccount
 from flight_agent.runtime.contracts import ResourceBudget
@@ -142,7 +144,132 @@ def test_diagnosis_checkpoint_recovers_original_inner_receipt_without_reexecutio
     assert store.get(first.id).task.calls[0].id == first.task.calls[0].id
 
 
-def test_unknown_internal_execution_never_redispatches_on_resume(tmp_path, monkeypatch):
+def prior_v2_checkpoint(store, record, proposal, *, fault=None, authenticate=True):
+    """Reproduce dabb0be's generic adapter state, not a legacy conversation."""
+    task = record.task
+    call_id = task.calls[0].id
+    path = Path(task.result_directory) / task.checkpoints[call_id]
+    payload = json.loads(path.read_text("utf-8"))
+    state = payload["data"]["task"]
+    state.pop("schema_version")
+    state.update(
+        scenario="d2", proposal=proposal, output_root=None,
+        stage="awaiting_confirmation", decisions=[],
+    )
+    for node in state["nodes"]:
+        node["depends_on"] = []
+    for artifact in state["artifacts"]:
+        artifact.update(media_type="application/json", role="record")
+    if fault:
+        fault(payload)
+    write_json(path, payload)
+    if authenticate:
+        task.checkpoint_sha256[call_id] = hashlib.sha256(path.read_bytes()).hexdigest()
+        store.save(record)
+    return state
+
+
+@pytest.mark.parametrize("lost_write", [1, 2])
+def test_upgrade_recovers_authenticated_prior_v2_diagnostic_lost_ack(
+    tmp_path, monkeypatch, lost_write
+):
+    module = importlib.import_module("flight_agent.verification.diagnostic_engine")
+    original = module.persist_run
+    writes = []
+
+    def lost_ack(directory, run):
+        original(directory, run)
+        writes.append(run.id)
+        if len(writes) == lost_write:
+            raise OSError("Prior-v2 diagnostic receipt acknowledgement lost")
+
+    monkeypatch.setattr(module, "persist_run", lost_ack)
+    runtime, store, pending, plan = proposed_diagnosis(tmp_path)
+    first = runtime.confirm(pending.id, 1, trusted=True)
+    assert first.status == "interrupted", first.error
+    state = prior_v2_checkpoint(store, first, plan["nodes"][0]["inputs"]["proposal"])
+    pending_id = state["pending_analysis"]["id"]
+    restored, _ = assembled(tmp_path)
+
+    done = restored.resume(first.id)
+
+    assert done.status == "completed", done.error
+    assert writes.count(pending_id) == 1
+    assert len(writes) == len(set(writes)) == 2
+    assert done.task.calls[0].id == first.task.calls[0].id
+    assert pending_id in done.task.outputs["compute"].details["internal_run_ids"]
+    assert all(
+        verify_evidence(Path(done.task.result_directory), item)
+        for item in done.task.outputs["compute"].artifacts
+    )
+
+
+@pytest.mark.parametrize("fault", [
+    "call_id", "resource", "baseline", "directory", "proposal", "output_root",
+    "dependencies", "artifact", "receipt", "digest", "unknown_field", "envelope",
+])
+def test_prior_v2_diagnostic_decoder_rejects_identity_or_evidence_changes(
+    tmp_path, monkeypatch, fault
+):
+    module = importlib.import_module("flight_agent.verification.diagnostic_engine")
+    original = module.persist_run
+    writes = []
+
+    def lost_ack(directory, run):
+        original(directory, run)
+        writes.append(run.id)
+        raise OSError("Lost acknowledgement before upgrade")
+
+    monkeypatch.setattr(module, "persist_run", lost_ack)
+    runtime, store, pending, plan = proposed_diagnosis(tmp_path)
+    first = runtime.confirm(pending.id, 1, trusted=True)
+    assert first.status == "interrupted"
+
+    def corrupt(payload):
+        state = payload["data"]["task"]
+        if fault == "call_id":
+            state["id"] = "f" * 32
+        elif fault == "resource":
+            state["project"]["fingerprint"] = "f" * 64
+        elif fault == "baseline":
+            state["baseline"]["version"] += 1
+        elif fault == "directory":
+            state["result_directory"] = str(tmp_path)
+        elif fault == "proposal":
+            state["proposal"]["title"] = "Different confirmed request"
+        elif fault == "output_root":
+            state["output_root"] = str(tmp_path)
+        elif fault == "dependencies":
+            state["nodes"][0]["depends_on"] = ["other-node"]
+        elif fault == "artifact":
+            state["artifacts"][0]["sha256"] = "f" * 64
+        elif fault == "unknown_field":
+            state["future_execution"] = True
+        elif fault == "envelope":
+            payload["call_id"] = "f" * 32
+
+    state = prior_v2_checkpoint(
+        store, first, plan["nodes"][0]["inputs"]["proposal"],
+        fault=corrupt, authenticate=fault != "digest",
+    )
+    if fault == "receipt":
+        receipt = (
+            Path(state["result_directory"]) / "numerical" / "analysis-runs" / f"{writes[0]}.json"
+        )
+        receipt.write_text("{}")
+    restored, _ = assembled(tmp_path)
+
+    done = restored.resume(first.id)
+
+    assert done.status != "completed"
+    assert writes == [state["pending_analysis"]["id"]]
+    assert not done.task.outputs
+
+
+@pytest.mark.parametrize("checkpoint_shape", ["current", "prior_v2"])
+def test_unknown_internal_execution_never_redispatches_on_resume(
+    tmp_path, monkeypatch, checkpoint_shape
+):
     module = importlib.import_module("flight_agent.verification.adapters.diagnostics")
     original = module.diagnostic_capabilities
     dispatched = []
@@ -158,14 +285,22 @@ def test_unknown_internal_execution_never_redispatches_on_resume(tmp_path, monke
         return tools
 
     monkeypatch.setattr(module, "diagnostic_capabilities", interrupted_tools)
-    runtime, _, pending, _ = proposed_diagnosis(tmp_path)
+    runtime, store, pending, plan = proposed_diagnosis(tmp_path)
     with pytest.raises(KeyboardInterrupt):
         runtime.confirm(pending.id, 1, trusted=True)
+    if checkpoint_shape == "prior_v2":
+        prior_v2_checkpoint(
+            store, store.get(pending.id), plan["nodes"][0]["inputs"]["proposal"]
+        )
     restored, _ = assembled(tmp_path)
     done = restored.resume(pending.id)
     assert done.status == "interrupted", done.error
     assert dispatched == [True]
     assert not done.task.analysis_runs
+    checkpoint = Path(done.task.result_directory) / next(iter(done.task.checkpoints.values()))
+    state = json.loads(checkpoint.read_text("utf-8"))["data"]["task"]
+    assert state["schema_version"] == "2.0"
+    assert state["termination"]["reason"] == "unknown_execution"
 
 
 def test_internal_capability_version_change_is_rejected_before_execution(tmp_path):

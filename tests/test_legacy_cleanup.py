@@ -68,7 +68,7 @@ def test_cleanup_cli_reports_all_classes_and_only_applies_to_v1(tmp_path, capsys
         ({"archived_tasks": [{"schema_version": "2.0"}]}, "v2"),
         (
             {"task": {"schema_version": "2.0"}, "archived_tasks": [{"scenario": "d1"}]},
-            "v1",
+            "unknown",
         ),
         (
             {"task": {"schema_version": "2.0"}, "archived_tasks": [{}]},
@@ -76,8 +76,19 @@ def test_cleanup_cli_reports_all_classes_and_only_applies_to_v1(tmp_path, capsys
         ),
         (
             {"schema_version": "2.0", "task": {"scenario": "d1"}},
-            "v2",
+            "unknown",
         ),
+        ({"task": {"scenario": "d1"}, "archived_tasks": [None]}, "unknown"),
+        ({"task": {"scenario": "d1"}, "archived_tasks": ["broken"]}, "unknown"),
+        ({"task": {"scenario": "d1"}, "archived_tasks": {}}, "unknown"),
+        ({"task": "broken", "archived_tasks": [{"scenario": "d1"}]}, "unknown"),
+        ({"schema_version": "3.0", "task": {"scenario": "d1"}}, "unknown"),
+        ({"schema_version": "3.0", "task": {"schema_version": "2.0"}}, "unknown"),
+        ({"schema_version": None, "task": {"scenario": "d1"}}, "unknown"),
+        ({"task": {"scenario": "d1", "schema_version": "3.0"}}, "unknown"),
+        ({"task": {"scenario": "d1", "schema_version": "2.0"}}, "unknown"),
+        ({"schema_version": "2.0", "archived_tasks": "broken"}, "unknown"),
+        ({"schema_version": "1.0", "task": {"scenario": "d1"}}, "v1"),
     ],
 )
 def test_raw_record_classification_requires_positive_evidence(data, expected):
@@ -147,6 +158,7 @@ def test_cleanup_preserves_recorded_source_project_inside_candidate(
     root.mkdir()
     candidate = root / ("a" * 32)
     record = write_record(candidate, {})
+    (tmp_path / "external-source").mkdir()
     source = candidate if source_path == "candidate" else candidate / "source"
     source.mkdir(exist_ok=True)
     sentinel = source / "model.slx"
@@ -165,7 +177,6 @@ def test_cleanup_preserves_recorded_source_project_inside_candidate(
         data["task"]["project"]["root"] = str(recorded_source)
     else:
         data["archived_tasks"] = [
-            None,
             {"scenario": "d2", "project": {"root": str(recorded_source)}},
         ]
     record.write_text(json.dumps(data), encoding="utf-8")
@@ -179,6 +190,129 @@ def test_cleanup_preserves_recorded_source_project_inside_candidate(
     assert report.v1 == [candidate.name]
     assert report.deleted == []
     assert report.unknown == []
+
+
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize(
+    "reference", [
+        "project_root", "output_root", "result_directory", "task_output", "resource",
+        "worker_resource", "diagnostic_resource",
+    ]
+)
+def test_cleanup_preserves_paths_owned_by_another_v2_record(
+    tmp_path, apply, archived, reference
+):
+    candidate = write_record(tmp_path / ("a" * 32), {"task": {"scenario": "d1"}})
+    protected = candidate.parent / "retained"
+    protected.mkdir()
+    sentinel = protected / "keep.json"
+    sentinel.write_bytes(b"v2 source, evidence or delivery")
+    task = {"schema_version": "2.0"}
+    data = {"schema_version": "2.0"}
+    if reference in ("project_root", "output_root"):
+        data[reference] = str(protected)
+    elif reference in ("result_directory", "task_output"):
+        task["output_root" if reference == "task_output" else reference] = str(protected)
+    else:
+        task["baseline"] = {"resources": [{
+            "id": "source",
+            "kind": {
+                "resource": "matlab_project", "worker_resource": "simulink_project",
+                "diagnostic_resource": "diagnostic_data",
+            }[reference],
+            "location": "worker" if reference == "worker_resource" else "agent",
+            "locator": str(protected), "fingerprint": "a" * 64,
+        }]}
+    if archived:
+        data["archived_tasks"] = [task]
+    else:
+        data["task"] = task
+    retained = write_record(tmp_path / ("b" * 32), data)
+    before = {path: path.read_bytes() for path in (candidate, retained, sentinel)}
+
+    report = cleanup_module().cleanup_legacy_records(tmp_path, apply=apply)
+
+    assert report.deleted == []
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("evidence", [
+    "missing", "nul", "symlink_loop", "relative", "malformed_resource", "unknown_location",
+    "unreadable_record", "missing_project_root", "null_project_root", "malformed_task",
+    "missing_artifact_owner",
+])
+def test_cleanup_fails_closed_on_unresolvable_retained_record_paths(tmp_path, evidence):
+    candidate = write_record(tmp_path / ("a" * 32), {"task": {"scenario": "d1"}})
+    source = tmp_path / "missing"
+    if evidence == "nul":
+        source = tmp_path / "bad\0path"
+    elif evidence == "symlink_loop":
+        source.symlink_to(source)
+    data = {"schema_version": "2.0", "project_root": str(source)}
+    if evidence == "relative":
+        data["project_root"] = "relative-source"
+    elif evidence in ("malformed_resource", "unknown_location"):
+        data = {"schema_version": "2.0", "task": {
+            "schema_version": "2.0",
+            "baseline": {"resources": [None if evidence == "malformed_resource" else {
+                "id": "source", "kind": "project", "location": "future_location",
+                "locator": str(tmp_path), "fingerprint": "a" * 64,
+            }]},
+        }}
+    elif evidence in ("missing_project_root", "null_project_root"):
+        data = {"schema_version": "2.0", "task": {
+            "schema_version": "2.0",
+            "project": {} if evidence == "missing_project_root" else {"root": None},
+        }}
+    elif evidence == "malformed_task":
+        data = {"task": {"unexpected_paths": [str(tmp_path)]}}
+    elif evidence == "missing_artifact_owner":
+        data = {"schema_version": "2.0", "task": {
+            "schema_version": "2.0",
+            "artifacts": [{"path": "keep.json", "sha256": "a" * 64, "size": 1}],
+        }}
+    retained = write_record(tmp_path / ("b" * 32), data)
+    if evidence == "unreadable_record":
+        retained.write_bytes(b"{")
+    before = candidate.read_bytes(), retained.read_bytes()
+
+    report = cleanup_module().cleanup_legacy_records(tmp_path, apply=True)
+
+    assert report.deleted == []
+    assert (candidate.read_bytes(), retained.read_bytes()) == before
+
+
+def test_cleanup_protects_delivery_referenced_by_a_retained_v1_record(tmp_path):
+    candidate = write_record(tmp_path / ("a" * 32), {"task": {"scenario": "d1"}})
+    delivery = candidate.parent / "delivery"
+    delivery.mkdir()
+    sentinel = delivery / "keep.json"
+    sentinel.write_bytes(b"retained delivery")
+    retained = write_record(tmp_path / ("b" * 32), {
+        "project_root": str(tmp_path / ("b" * 32)),
+        "task": {"scenario": "d2", "result_directory": str(delivery)},
+    })
+
+    report = cleanup_module().cleanup_legacy_records(tmp_path, apply=True)
+
+    assert report.deleted == []
+    assert retained.exists()
+    assert sentinel.read_bytes() == b"retained delivery"
+
+
+def test_cleanup_preserves_mixed_record_instead_of_deleting_its_v2_evidence(tmp_path):
+    record = write_record(tmp_path / ("a" * 32), {
+        "task": {"scenario": "d1"},
+        "archived_tasks": [{"schema_version": "2.0"}],
+    })
+    before = record.read_bytes()
+
+    report = cleanup_module().cleanup_legacy_records(tmp_path, apply=True)
+
+    assert report.unknown == [record.parent.name]
+    assert report.deleted == []
+    assert record.read_bytes() == before
 
 
 def test_cleanup_with_external_source_project_still_deletes_only_conversation(tmp_path):
