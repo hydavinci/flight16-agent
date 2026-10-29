@@ -1,4 +1,8 @@
+import os
+import subprocess
+import sys
 import threading
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -34,6 +38,218 @@ def pending(client, identifier, headers):
         headers,
         lambda item: (item.get("pending_decision") or {}).get("kind") == "confirm_baseline",
     )
+
+
+def test_scenario_alias_is_rejected_by_generic_api(tmp_path):
+    app, runtime, _, _ = make_agent_web(
+        tmp_path, [{"action": "answer", "text": "No execution."}]
+    )
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            API, json={"message": "Analyze.", "scenario": "d1"}, headers=auth(client)
+        )
+        assert response.status_code == 422
+        assert runtime.store.recent() == []
+
+
+def test_legacy_workflow_catalog_is_removed(tmp_path):
+    app, _, _, _ = make_agent_web(tmp_path, [])
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        assert client.get(f"{API}/workflows", headers=auth(client)).status_code == 404
+
+
+def test_legacy_replan_endpoint_is_removed(tmp_path):
+    app, _, _, _ = make_agent_web(
+        tmp_path, [{"action": "plan", "text": "Confirm.", "plan": draft_data()}]
+    )
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = auth(client)
+        identifier = post_message(client, headers)
+        before = pending(client, identifier, headers)
+        response = client.post(
+            f"{API}/{identifier}/replan", headers=headers, json={"version": 1, "trusted": True}
+        )
+        assert response.status_code == 404
+        assert client.get(f"{API}/{identifier}", headers=headers).json() == before
+
+
+def test_background_runner_keeps_one_slot_and_releases_after_failure():
+    from flight_agent.background import BackgroundRunner, BusyError
+
+    runner = BackgroundRunner()
+    entered, release = threading.Event(), threading.Event()
+    completed = []
+
+    def fail():
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError("Known background failure")
+
+    try:
+        runner.submit(fail)
+        assert entered.wait(5)
+        with pytest.raises(BusyError):
+            runner.submit(lambda: completed.append("must not run"))
+        release.set()
+        runner.close()
+        # A failed operation must release capacity, even if the pool then rejects submission.
+        with pytest.raises(RuntimeError, match="shutdown"):
+            runner.submit(lambda: completed.append("must not run"))
+        with pytest.raises(RuntimeError, match="shutdown"):
+            runner.submit(lambda: completed.append("must not run"))
+        assert completed == []
+    finally:
+        release.set()
+        runner.close()
+
+
+def test_background_runner_requires_positive_capacity():
+    from flight_agent.background import BackgroundRunner
+
+    with pytest.raises(ValueError, match="positive"):
+        BackgroundRunner(max_workers=0)
+
+
+@pytest.mark.parametrize("busy", [False, True])
+def test_scheduler_failure_is_durable_and_does_not_leak_the_slot(tmp_path, monkeypatch, busy):
+    from flight_agent.background import BackgroundRunner, BusyError
+
+    def unavailable(self, operation):
+        raise BusyError("Scheduler unavailable") if busy else RuntimeError("Scheduler unavailable")
+
+    app, runtime, calls, _ = make_agent_web(tmp_path, [])
+    monkeypatch.setattr(BackgroundRunner, "submit", unavailable)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = auth(client)
+        for _ in range(2):
+            response = client.post(API, headers=headers, json={"message": "Analyze."})
+            assert response.status_code == (409 if busy else 503)
+        records = runtime.store.recent()
+        assert len(records) == 2
+        assert all(record.status == "failed" for record in records)
+        assert all(record.error == "Scheduler unavailable" for record in records)
+        assert not calls
+
+
+def test_generic_and_workbench_execution_still_share_one_slot(tmp_path, monkeypatch):
+    from flight_agent import web
+    from flight_agent.upload_models import UploadRequest
+
+    managers = []
+    original = web.JobManager
+
+    def capture(store):
+        manager = original(store)
+        managers.append(manager)
+        return manager
+
+    monkeypatch.setattr(web, "JobManager", capture)
+    app, runtime, calls, _ = make_agent_web(
+        tmp_path, [{"action": "answer", "text": "No execution."}]
+    )
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(job_id):
+        entered.set()
+        assert release.wait(5)
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        try:
+            managers[0].submit(
+                UploadRequest(
+                    filename="test.m", source="% Not executed", kind="script",
+                    parameters={}, trusted=True,
+                ),
+                blocked,
+            )
+            assert entered.wait(5)
+            response = client.post(API, headers=auth(client), json={"message": "Explain RMSE."})
+            assert response.status_code == 409
+            assert all(record.status == "failed" for record in runtime.store.recent())
+            assert not calls
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize("requested", ["agent", "worker", "d1", "d2"])
+def test_unregistered_location_alias_is_rejected_before_creating_a_record(tmp_path, requested):
+    from flight_agent.verification.resources import ResourceAdapter
+
+    app, runtime, _, _ = make_agent_web(tmp_path, [])
+    for name in ("diagnostic_data", "simulink_project"):
+        runtime.resources.register(ResourceAdapter(
+            name=name, kind="data", location=f"host-{name}",
+            inspect=lambda _: pytest.fail("Alias must not inspect resources"),
+            verify=lambda _: None,
+            browse=lambda _: pytest.fail("Alias must not browse resources"),
+        ))
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            API, headers=auth(client), json={"message": "Analyze.", "location": requested}
+        )
+        assert response.status_code == 409
+        assert runtime.store.recent() == []
+
+
+def test_location_resolution_requires_a_unique_registered_id_or_host():
+    from flight_agent.verification.resources import ResourceLocation, resolve_location
+
+    locations = [
+        ResourceLocation(
+            id="first", display_name="First", kind="data", location="host",
+            availability={"state": "available"},
+        ),
+        ResourceLocation(
+            id="second", display_name="Second", kind="data", location="host",
+            availability={"state": "available"},
+        ),
+    ]
+    assert resolve_location(None, locations) is None
+    assert resolve_location("first", locations) == "first"
+    assert resolve_location("host", locations[:1]) == "first"
+    with pytest.raises(ValueError, match="unknown or ambiguous"):
+        resolve_location("host", locations)
+    with pytest.raises(ValueError, match="unknown or ambiguous"):
+        resolve_location("unregistered", locations)
+    with pytest.raises(ValueError, match="unknown or ambiguous"):
+        resolve_location("first", [locations[0], locations[1].model_copy(update={"location": "first"})])
+
+
+def test_default_bootstrap_does_not_import_or_construct_legacy_conversation_runtime():
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import sys
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from fastapi.testclient import TestClient
+from flight_agent.web import create_web_app
+
+with TemporaryDirectory() as root:
+    with TestClient(create_web_app(Path(root)), base_url="http://127.0.0.1") as client:
+        bootstrap = client.get("/api/bootstrap")
+        assert bootstrap.status_code == 200
+        headers = {"x-flight-token": bootstrap.json()["token"]}
+        assert client.get("/api/conversations", headers=headers).json() == []
+        assert client.get("/api/conversations/capabilities", headers=headers).status_code == 200
+        assert client.get("/api/resource-locations", headers=headers).status_code == 200
+for name in ("runtime", "compat", "planner"):
+    assert f"flight_agent.verification.{name}" not in sys.modules, name
+print("Default v2 bootstrap and imports passed")
+"""],
+        capture_output=True, text=True, check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_directory_selection_rejects_removed_scenario_field(tmp_path):
+    app, _, _, _ = make_agent_web(tmp_path, [])
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.post(
+            "/api/directories/select", headers=auth(client),
+            json={"target": "project", "scenario": "d1"},
+        )
+        assert response.status_code == 422
 
 
 def test_new_request_needs_no_scenario_directory_or_worker(tmp_path, monkeypatch):
@@ -428,6 +644,7 @@ def test_model_planning_occupies_the_shared_job_slot(tmp_path, monkeypatch):
             assert entered.wait(5)
             response = client.post(API, headers=headers, json={"message": "Another."})
             assert response.status_code == 409
+            assert len(runtime.store.recent()) == 1
         finally:
             release.set()
         wait_for_conversation(
@@ -436,13 +653,17 @@ def test_model_planning_occupies_the_shared_job_slot(tmp_path, monkeypatch):
 
 
 def test_store_injection_does_not_interrupt_an_existing_active_record(tmp_path):
-    from flight_agent.verification.runtime import VerificationRuntime
+    from flight_agent.verification.agent_planner import AgentPlanner
+    from flight_agent.verification.coordinator import EngineeringRuntime
+    from flight_agent.verification.resources import ResourceRegistry
 
     store = ConversationStore(tmp_path / "state")
     record = store.create()
     record.status = "running"
     store.save(record)
-    runtime = VerificationRuntime(store.root, store=store)
+    resources = ResourceRegistry()
+    executor = AgentExecutor(store, CapabilityRegistry(agent_mode=True), resources)
+    runtime = EngineeringRuntime(store, AgentPlanner(), executor, resources)
     assert runtime.store is store
     assert store.get(record.id).status == "running"
 
@@ -483,7 +704,7 @@ def test_location_clarification_retains_the_directory_already_supplied(tmp_path)
     record = runtime.queue_message(None, "Analyze.", str(tmp_path))
     assert record.status == "waiting_for_user"
     selected = runtime.queue_message(
-        record.id, "Use the local diagnostic location.", location="agent"
+        record.id, "Use the local diagnostic location.", location="diagnostic_data"
     )
     assert selected.project_root == str(tmp_path)
     assert selected.resource_location == "diagnostic_data"

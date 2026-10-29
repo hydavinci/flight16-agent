@@ -15,6 +15,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
 from .agent import execute_agent
+from .background import BackgroundRunner
 from .config import ModelSettings, create_model
 from .directories import (
     DirectoryListing,
@@ -32,15 +33,12 @@ from .upload_models import JobRecord, UploadRequest
 from .verification.agent_planner import AgentPlanner
 from .verification.agent_runtime import AgentContext, AgentExecutor
 from .verification.backend import AnalysisBackend, RemoteSimulinkBackend
-from .verification.compat import resolve_location
 from .verification.coordinator import EngineeringRuntime
 from .verification.diagnostic_planner import DiagnosticReviewer
 from .verification.local_matlab import LocalMatlabBackend
-from .verification.planner import VerificationPlanner
 from .verification.plugins import register_builtin_plugins
-from .verification.resources import ResourceLocation, ResourceRegistry
+from .verification.resources import ResourceLocation, ResourceRegistry, resolve_location
 from .verification.routes import verification_router
-from .verification.runtime import VerificationRuntime
 from .verification.store import ConversationStore
 
 
@@ -52,7 +50,6 @@ class DirectorySelectionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     target: Literal["project", "output"]
-    scenario: Literal["d1", "d2"] | None = None
     location: str | None = Field(default=None, min_length=1, max_length=128)
     path: str = Field(default="", max_length=4096)
 
@@ -70,44 +67,36 @@ class CachedRunner:
 def create_web_app(
     root: Path,
     *,
-    verification_runtime: VerificationRuntime | None = None,
     engineering_runtime: EngineeringRuntime | None = None,
     native_directory_picker: bool = False,
 ) -> FastAPI:
-    if verification_runtime is not None and engineering_runtime is not None:
-        raise ValueError("Inject only one conversation runtime")
     local_backend = LocalMatlabBackend.from_environment()
     resources = (
         engineering_runtime.resources if engineering_runtime is not None else ResourceRegistry()
     )
     if engineering_runtime is None:
-        if verification_runtime is None:
-            conversations = ConversationStore(root / "runs" / "verification")
-            backend: AnalysisBackend | None
-            try:
-                backend = RemoteSimulinkBackend.from_environment()
-            except ValueError:
-                backend = None
-            legacy = VerificationRuntime(conversations.root, store=conversations, backend=backend)
-        else:
-            legacy = verification_runtime
-            backend = legacy.backend
+        conversations = ConversationStore(root / "runs" / "verification")
+        backend: AnalysisBackend | None
+        try:
+            backend = RemoteSimulinkBackend.from_environment()
+        except ValueError:
+            backend = None
         tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
         register_builtin_plugins(
             tools, resources, backend=backend,
             diagnostic_reviewer=DiagnosticReviewer(), local_backend=local_backend,
         )
-        if verification_runtime is None:
-            engineering_runtime = EngineeringRuntime(
-                conversations, AgentPlanner(),
-                AgentExecutor(conversations, tools, resources), resources, legacy,
-            )
-    runtime = engineering_runtime if engineering_runtime is not None else verification_runtime
-    if runtime is None:
-        raise AssertionError("Conversation runtime was not assembled")
+        engineering_runtime = EngineeringRuntime(
+            conversations, AgentPlanner(),
+            AgentExecutor(conversations, tools, resources), resources,
+        )
+    runtime = engineering_runtime
     root = root.resolve()
     store = JobStore(root / "runs" / "web")
     manager = JobManager(store)
+    jobs = BackgroundRunner()
+    # Keep one shared execution slot until the legacy workbench is removed.
+    manager.slot = jobs.slot
     token = secrets.token_urlsafe(32)
     static = Path(__file__).parent / "static"
     native_picker_lock = Lock()
@@ -115,6 +104,7 @@ def create_web_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
+        jobs.close()
         manager.close()
 
     def same_origin(request: Request) -> None:
@@ -143,7 +133,7 @@ def create_web_app(
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     install_validation_handler(app)
     auth = [Depends(authorize)]
-    app.include_router(verification_router(runtime, manager, authorize))
+    app.include_router(verification_router(runtime, jobs, authorize))
 
     @app.middleware("http")
     async def response_headers(
@@ -182,9 +172,7 @@ def create_web_app(
             RemoteWorker.from_environment()
         except ValueError as exc:
             worker_error = str(exc)
-        if runtime.planner.model is None and type(runtime.planner) in (
-            AgentPlanner, VerificationPlanner,
-        ):
+        if runtime.planner.model is None and type(runtime.planner) is AgentPlanner:
             try:
                 ModelSettings.from_environment()
             except ValueError as exc:
@@ -212,10 +200,10 @@ def create_web_app(
     def resource_locations() -> list[ResourceLocation]:
         return resources.locations()
 
-    def project_location(location: str | None, scenario: str | None) -> ResourceLocation:
+    def project_location(location: str | None) -> ResourceLocation:
         locations = resources.locations()
         try:
-            identifier = resolve_location(location, scenario, locations)
+            identifier = resolve_location(location, locations)
             if identifier is None:
                 if len(locations) != 1:
                     raise ValueError("Select an explicit registered resource location")
@@ -228,11 +216,10 @@ def create_web_app(
     def directories(
         target: Literal["project", "output"],
         path: str = Query(default="", max_length=4096),
-        scenario: Literal["d1", "d2"] | None = None,
         location: str | None = Query(default=None, min_length=1, max_length=128),
     ) -> DirectoryListing:
         if target == "project":
-            selected = project_location(location, scenario)
+            selected = project_location(location)
             if selected.availability.state != "available":
                 raise HTTPException(status_code=503, detail=selected.availability.reason)
             try:
@@ -254,7 +241,7 @@ def create_web_app(
                 detail="Native directory selection requires --native-directory-picker",
             )
         selected = (
-            project_location(request.location, request.scenario)
+            project_location(request.location)
             if request.target == "project" else None
         )
         if selected is not None and selected.location == "worker":

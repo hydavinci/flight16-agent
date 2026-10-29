@@ -2,23 +2,23 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import partial
+from typing import Literal
 
-from ..jobs import BusyError
+from ..background import BusyError
 from ..runtime.resources import ResourceReference
 from .agent_planner import AgentPlanner, bind_plan, message_sources
-from .agent_runtime import AgentExecutor
-from .compat import Action, has_unresolved_call, legacy_decision, resolve_location
+from .agent_runtime import AgentExecutor, has_unresolved_call
 from .contracts import (
-    AgentTask,
     Conversation,
     ConversationMessage,
     ConversationState,
     PendingDecision,
 )
 from .intake import parse_directories, validate_output_root
-from .resources import ResourceRegistry
-from .runtime import VerificationRuntime
+from .resources import ResourceRegistry, resolve_location
 from .store import ConversationStore, now
+
+Action = Literal["confirm", "resume", "retry"]
 
 
 class EngineeringRuntime:
@@ -28,14 +28,13 @@ class EngineeringRuntime:
         planner: AgentPlanner,
         executor: AgentExecutor,
         resources: ResourceRegistry,
-        legacy: VerificationRuntime | None,
     ):
         if executor.store is not store or executor.resources is not resources:
-            raise ValueError("Coordinator and executor must share the same store and resources")
-        if legacy is not None and legacy.store is not store:
-            raise ValueError("Legacy recovery must share the coordinator store")
-        self.store, self.planner, self.executor = store, planner, executor
-        self.resources, self.legacy = resources, legacy
+            raise ValueError("Coordinator and executor must share store and resources")
+        self.store = store
+        self.planner = planner
+        self.executor = executor
+        self.resources = resources
         self.lock = threading.Lock()
 
     @contextmanager
@@ -76,12 +75,11 @@ class EngineeringRuntime:
         *,
         output_root: str | None = None,
         location: str | None = None,
-        scenario: str | None = None,
     ) -> Conversation:
         with self._operation():
             if not message.strip() or len(message) > 4000:
                 raise ValueError("A message between 1 and 4000 characters is required")
-            selected = resolve_location(location, scenario, self.resources.locations())
+            selected = resolve_location(location, self.resources.locations())
             record = self.store.get(conversation_id) if conversation_id else self.store.create()
             self._message(record, "user", message.strip())
             if record.task is not None and has_unresolved_call(record.task):
@@ -202,16 +200,6 @@ class EngineeringRuntime:
         task = record.task
         if task is None:
             raise ValueError("No task has been planned")
-        if not isinstance(task, AgentTask):
-            if self.legacy is None:
-                raise ValueError("Legacy task recovery is unavailable")
-            return legacy_decision(
-                self.legacy,
-                conversation_id,
-                action,
-                version=version,
-                trusted=trusted,
-            )
         if action != "resume" and (
             type(version) is not int or version != task.baseline.version or trusted is not True
         ):
@@ -260,6 +248,3 @@ class EngineeringRuntime:
 
     def capability_catalog(self) -> list[dict[str, object]]:
         return self.executor.tools.catalog()
-
-    def workflow_catalog(self) -> list[dict[str, object]]:
-        return self.legacy.workflows.catalog() if self.legacy is not None else []

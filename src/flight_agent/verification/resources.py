@@ -27,6 +27,24 @@ class ResourceLocation(AgentContract):
     availability: Availability
 
 
+def resolve_location(
+    requested: str | None,
+    locations: list[ResourceLocation],
+) -> str | None:
+    if requested is None:
+        return None
+    matches = [
+        item.id
+        for item in locations
+        if item.id == requested or item.location == requested
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "Resource location is unknown or ambiguous; select a registered location"
+        )
+    return matches[0]
+
+
 @dataclass(frozen=True)
 class ResourceAdapter:
     name: str

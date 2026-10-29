@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -97,14 +98,10 @@ def directory_task(args: argparse.Namespace) -> int:
             )
             if args.criteria is not None:
                 body["evaluation_criteria"] = args.criteria
-            for field in ("project_root", "output_root", "scenario", "location"):
+            for field in ("project_root", "output_root", "location"):
                 value = getattr(args, field)
                 if value is not None:
                     body[field] = value
-            if identifier is None and args.scenario is None:
-                body["scenario"] = "auto"
-                if structured and args.location is None:
-                    body["location"] = "matlab_project"
             record = request(
                 "POST", f"{base}/{identifier}/messages" if identifier else base, body
             )
@@ -143,6 +140,11 @@ def main(argv: list[str] | None = None) -> int:
     analyze = commands.add_parser("analyze", help="Analyze a JSON file using the real agent")
     web = commands.add_parser("web", help="Serve the local Web interface")
     worker = commands.add_parser("worker", help="Serve the trusted-project MATLAB worker")
+    cleanup = commands.add_parser(
+        "cleanup-legacy", help="List legacy conversation records; delete v1 only with --apply",
+    )
+    cleanup.add_argument("--project-root", type=Path, required=True)
+    cleanup.add_argument("--apply", action="store_true")
     directory = commands.add_parser(
         "directory-task",
         help="Use the unified requirements-driven Web agent and saved conversations",
@@ -151,11 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     directory.add_argument("--timeout", type=int, default=360)
     actions = directory.add_subparsers(dest="action", required=True)
     propose = actions.add_parser(
-        "propose", help="Describe requirements; no scenario is needed and execution needs consent",
-    )
-    propose.add_argument(
-        "--scenario", choices=("auto", "d1", "d2"),
-        help="Legacy resource aliases: d1=Worker project, d2=Agent data; auto selects neither",
+        "propose", help="Describe requirements; execution needs consent",
     )
     propose.add_argument(
         "--project-root", help="Resource directory on its registered host, not an uploaded path",
@@ -163,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     propose.add_argument("--output-root", help="Agent-visible delivery directory")
     propose.add_argument("--conversation", help="Continue an existing conversation")
     propose.add_argument(
-        "--location", help="Explicit registered resource location or legacy host alias",
+        "--location", help="Explicit registered resource location",
     )
     request_form = propose.add_mutually_exclusive_group(required=True)
     request_form.add_argument("--request", help="Compatible single-message request")
@@ -201,6 +199,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "directory-task":
             return directory_task(args)
+        if args.command == "cleanup-legacy":
+            from .verification.legacy_cleanup import cleanup_legacy_records
+
+            report = cleanup_legacy_records(
+                args.project_root.absolute() / "runs" / "verification", apply=args.apply,
+            )
+            print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+            return 0
         root = args.project_root.resolve()
         load_dotenv(root / ".env", override=False)
         if args.command == "doctor":

@@ -1,4 +1,5 @@
 import logging
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -8,15 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from ..jobs import BusyError, JobManager
+from ..background import BackgroundRunner, BusyError
 from ..runtime.evidence import verify_evidence
-from ..runtime.intents import Scenario
-from ..runtime.observations import OutputArtifact
-from .artifacts import verify_artifact
-from .compat import LegacyRuntimeAdapter
-from .contracts import AgentTask, Conversation, ConversationMessage, PendingDecision
+from .contracts import Conversation, ConversationMessage, PendingDecision
 from .coordinator import EngineeringRuntime
-from .runtime import VerificationRuntime
 from .store import now
 from .views import ConversationView, to_conversation_view
 
@@ -31,7 +27,6 @@ class MessageRequest(BaseModel):
     project_root: str | None = Field(default=None, max_length=4096)
     output_root: str | None = Field(default=None, max_length=4096)
     location: str | None = Field(default=None, min_length=1, max_length=128)
-    scenario: Scenario | None = None
 
     @field_validator("message", "analysis_request", "evaluation_criteria")
     @classmethod
@@ -76,13 +71,10 @@ class ConfirmationRequest(BaseModel):
 
 
 class ConversationManager:
-    def __init__(
-        self, runtime: EngineeringRuntime | VerificationRuntime, jobs: JobManager,
-    ):
-        self.runtime = (
-            LegacyRuntimeAdapter(runtime) if isinstance(runtime, VerificationRuntime) else runtime
-        )
+    def __init__(self, runtime: EngineeringRuntime, jobs: BackgroundRunner):
+        self.runtime = runtime
         self.jobs = jobs
+        self.lock = threading.Lock()
 
     def _fail(self, conversation_id: str, error: Exception) -> None:
         logger.exception("Conversation %s failed", conversation_id)
@@ -115,14 +107,14 @@ class ConversationManager:
             # Background failures must be visible in the durable record and the server log.
             self._fail(conversation_id, exc)
         finally:
-            self.jobs.slot.release()
-
-    def _dispatch(self, record: Conversation, operation: Callable[[], Conversation]) -> None:
-        self.jobs.pool.submit(self._run, record.id, operation)
+            self.lock.release()
 
     def _schedule(self, record: Conversation, operation: Callable[[], Conversation]) -> None:
         try:
-            self._dispatch(record, operation)
+            self.jobs.submit(lambda: self._run(record.id, operation))
+        except BusyError as exc:
+            self._fail(record.id, exc)
+            raise
         except RuntimeError as exc:
             self._fail(record.id, exc)
             raise HTTPException(
@@ -130,7 +122,7 @@ class ConversationManager:
             ) from exc
 
     def submit(self, conversation_id: str | None, request: MessageRequest) -> Conversation:
-        if not self.jobs.slot.acquire(blocking=False):
+        if not self.lock.acquire(blocking=False):
             raise BusyError("Another task is running; wait for it to finish")
         dispatched = False
         try:
@@ -140,7 +132,6 @@ class ConversationManager:
                 request.project_root,
                 output_root=request.output_root,
                 location=request.location,
-                scenario=request.scenario,
             )
             if record.status == "planning":
                 self._schedule(record, lambda: self.runtime.continue_submission(record.id))
@@ -148,15 +139,15 @@ class ConversationManager:
             return record
         finally:
             if not dispatched:
-                self.jobs.slot.release()
+                self.lock.release()
 
     def decide(
         self,
         conversation_id: str,
-        action: Literal["confirm", "resume", "retry", "replan"],
+        action: Literal["confirm", "resume", "retry"],
         request: ConfirmationRequest | None = None,
     ) -> Conversation:
-        if not self.jobs.slot.acquire(blocking=False):
+        if not self.lock.acquire(blocking=False):
             raise BusyError("Another task is running; wait for it to finish")
         dispatched = False
         try:
@@ -176,11 +167,11 @@ class ConversationManager:
             return record
         finally:
             if not dispatched:
-                self.jobs.slot.release()
+                self.lock.release()
 
 
 def verification_router(
-    runtime: EngineeringRuntime | VerificationRuntime, jobs: JobManager,
+    runtime: EngineeringRuntime, jobs: BackgroundRunner,
     authorize: Callable[[Request], None],
 ) -> APIRouter:
     router = APIRouter(prefix="/api/conversations", dependencies=[Depends(authorize)])
@@ -212,8 +203,6 @@ def verification_router(
                     "updated_at": record.updated_at,
                     "title": (
                         record.task.baseline.title
-                        if isinstance(record.task, AgentTask)
-                        else record.task.proposal.title
                         if record.task
                         else record.messages[0].content[:100]
                         if record.messages
@@ -229,10 +218,6 @@ def verification_router(
         with request_errors():
             return manager.submit(None, request)
         raise AssertionError("Unreachable")
-
-    @router.get("/workflows")
-    def workflows() -> list[dict[str, object]]:
-        return manager.runtime.workflow_catalog()
 
     @router.get("/capabilities")
     def capabilities() -> list[dict[str, object]]:
@@ -274,12 +259,6 @@ def verification_router(
             return manager.decide(conversation_id, "retry", request)
         raise AssertionError("Unreachable")
 
-    @router.post("/{conversation_id}/replan", status_code=202)
-    def replan(conversation_id: str, request: ConfirmationRequest) -> Conversation:
-        with request_errors():
-            return manager.decide(conversation_id, "replan", request)
-        raise AssertionError("Unreachable")
-
     @router.get("/{conversation_id}/tasks/{task_id}/artifacts/{name:path}")
     def artifact(conversation_id: str, task_id: str, name: str) -> FileResponse:
         with request_errors():
@@ -294,11 +273,8 @@ def verification_router(
             directory = runtime.store.task_directory(conversation_id, task_id, task.output_root)
             if str(directory) != task.result_directory:
                 raise ValueError("Task result directory does not match its persisted identity")
-            if isinstance(item, OutputArtifact):
-                path = verify_evidence(directory, item)
-                return FileResponse(path, filename=Path(name).name)
-            path = verify_artifact(directory, item)
-            return FileResponse(path, media_type=item.media_type, filename=Path(name).name)
+            path = verify_evidence(directory, item)
+            return FileResponse(path, filename=Path(name).name)
         raise AssertionError("Unreachable")
 
     return router

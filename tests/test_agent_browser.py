@@ -33,7 +33,13 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
         page = browser.new_page(viewport={"width": width, "height": 900})
         page.set_default_timeout(10000)
         errors = []
+        requests = []
         page.on("pageerror", lambda error: errors.append(str(error)))
+        page.on(
+            "request",
+            lambda request: requests.append(request.post_data_json)
+            if request.method == "POST" and request.url.endswith("/api/conversations") else None,
+        )
         try:
             page.goto(url)
             if width <= 1100:
@@ -60,6 +66,7 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
             expect(page.locator("#evaluation")).to_contain_text("1.414")
             expect(page.locator("#evaluation")).not_to_contain_text("PASS")
             assert len(calls) == 1
+            assert requests == [{"message": "Analyze supplied synthetic arrays."}]
             assert runtime.store.recent()[0].task.schema_version == "2.0"
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             assert not errors

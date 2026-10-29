@@ -20,6 +20,34 @@ def write_record(directory, data):
     return path
 
 
+@pytest.mark.parametrize("apply", [False, True])
+def test_cleanup_cli_reports_all_classes_and_only_applies_to_v1(tmp_path, capsys, apply):
+    from flight_agent.cli import main
+
+    root = tmp_path / "runs" / "verification"
+    root.mkdir(parents=True)
+    v1 = write_record(root / ("a" * 32), {"task": {"scenario": "d1"}})
+    v2 = write_record(root / ("b" * 32), {"schema_version": "2.0", "task": None})
+    unknown = write_record(root / ("c" * 32), {"task": None})
+    before = {path: path.read_bytes() for path in (v1, v2, unknown)}
+    args = ["cleanup-legacy", "--project-root", str(tmp_path)]
+    if apply:
+        args.append("--apply")
+
+    assert main(args) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report == {
+        "v1": ["a" * 32], "v2": ["b" * 32], "unknown": ["c" * 32],
+        "deleted": ["a" * 32] if apply else [],
+    }
+    assert v1.exists() is not apply
+    if not apply:
+        assert v1.read_bytes() == before[v1]
+    assert v2.read_bytes() == before[v2]
+    assert unknown.read_bytes() == before[unknown]
+
+
 @pytest.mark.parametrize(
     "data,expected",
     [

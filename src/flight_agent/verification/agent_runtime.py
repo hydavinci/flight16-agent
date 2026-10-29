@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from pydantic import JsonValue
 
-from ..jobs import BusyError
+from ..background import BusyError
 from ..runtime.agent_contracts import (
     AgentBaseline,
     AgentNode,

@@ -132,7 +132,7 @@ function controls() {
   for (const id of ["send", "project-root", "output-root", "resource-location", "message", "evaluation-criteria", "trusted", "resume"]) {
     $(id).disabled = busy;
   }
-  for (const id of ["confirm", "retry", "replan"]) {
+  for (const id of ["confirm", "retry"]) {
     $(id).disabled = busy || !$("trusted").checked;
   }
   for (const target of ["project", "output"]) {
@@ -439,26 +439,20 @@ function renderTask(view) {
   const decision = current.pending_decision;
   const available = !active() && decision;
   const confirm = available && decision.kind === "confirm_baseline";
-  const replan = available && decision.kind === "confirm_replan";
-  const retry = available && (decision.kind === "retry"
-    || (replan && view.confirmation.recovery_action === "retry"));
-  const resume = available && (decision.kind === "resume"
-    || (replan && view.confirmation.recovery_action === "resume"));
-  if (replan && view.confirmation.recovery_proposal) {
-    $("baseline").append(details("恢复建议（尚未采纳或执行）", view.confirmation.recovery_proposal));
-  }
-  $("decision-controls").hidden = !(confirm || retry || resume || replan);
+  const retry = available && decision.kind === "retry";
+  const resume = available && decision.kind === "resume";
+  $("decision-controls").hidden = !(confirm || retry || resume);
   const needsDecision = String(!$("decision-controls").hidden);
   if (changedBaseline || $("baseline-details").dataset.decision !== needsDecision) {
     $("baseline-details").open = needsDecision === "true";
     $("baseline-details").dataset.decision = needsDecision;
   }
   $("decision-message").textContent = decision?.message || "";
-  for (const [id, show] of [["confirm", confirm], ["retry", retry], ["resume", resume], ["replan", replan]]) {
+  for (const [id, show] of [["confirm", confirm], ["retry", retry], ["resume", resume]]) {
     $(id).hidden = !show;
   }
-  $("trust-label").hidden = !(confirm || retry || replan);
-  $("trust-warning").hidden = !(confirm || retry || replan);
+  $("trust-label").hidden = !(confirm || retry);
+  $("trust-warning").hidden = !(confirm || retry);
   $("stage").textContent = `当前阶段：${view.stage === "completed" ? "已交付" : view.stage}${
     view.execution_status ? ` / 执行：${view.execution_status}` : ""}`;
   $("nodes").replaceChildren(...view.nodes.map((node) => element(
@@ -777,7 +771,7 @@ $("directory-picker").addEventListener("cancel", (event) => {
   closeDirectoryPicker();
 });
 $("trusted").addEventListener("change", controls);
-for (const action of ["confirm", "resume", "retry", "replan"]) $(action).addEventListener("click", () => decide(action));
+for (const action of ["confirm", "resume", "retry"]) $(action).addEventListener("click", () => decide(action));
 $("new-conversation").addEventListener("click", () => {
   clearConversation();
   localStorage.removeItem("verification-conversation");

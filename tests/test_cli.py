@@ -121,3 +121,75 @@ def test_web_native_directory_picker_is_explicit(project, monkeypatch, enabled):
     assert cli_module().main(args) == 0
     assert calls[0] == (project, {"native_directory_picker": enabled})
     assert calls[1] == (app, {"host": "127.0.0.1", "port": 8000, "workers": 1})
+
+
+def test_directory_task_rejects_scenario_alias(monkeypatch, capsys):
+    module = cli_module()
+    monkeypatch.setattr(
+        module, "directory_task", lambda _: pytest.fail("Legacy input reached execution")
+    )
+    with pytest.raises(SystemExit) as exc:
+        module.main(["directory-task", "propose", "--request", "Analyze.", "--scenario", "d1"])
+    assert exc.value.code == 2
+    assert "unrecognized arguments: --scenario d1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_directory_task_sends_only_generic_request_fields(tmp_path, monkeypatch, capsys, structured):
+    from fastapi.testclient import TestClient
+
+    from tests.agent_helpers import make_agent_web
+
+    module = cli_module()
+    app, runtime, calls, _ = make_agent_web(
+        tmp_path, [{"action": "answer", "text": "No execution."}]
+    )
+    client = TestClient(app, base_url="http://127.0.0.1")
+    monkeypatch.setattr(module.httpx, "Client", lambda **kwargs: client)
+    form = ["--analysis-request", "Explain RMSE.", "--criteria", "No acceptance decision."] \
+        if structured else ["--request", "Explain RMSE."]
+    assert module.main(["directory-task", "propose", *form]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["status"] == "completed"
+    assert record["resource_location"] is None
+    assert runtime.store.get(record["id"]).task is None
+    assert not calls
+
+
+@pytest.mark.parametrize("location_count", [0, 1, 2])
+def test_directory_task_leaves_location_selection_to_registered_server_resources(
+    tmp_path, monkeypatch, capsys, location_count,
+):
+    from fastapi.testclient import TestClient
+
+    from flight_agent.runtime.resources import ResourceReference
+    from flight_agent.verification.resources import ResourceAdapter
+    from tests.agent_helpers import make_agent_web
+
+    module = cli_module()
+    app, runtime, calls, _ = make_agent_web(
+        tmp_path, [{"action": "answer", "text": "No execution."}]
+    )
+    for index in range(location_count):
+        runtime.resources.register(ResourceAdapter(
+            name=f"registered-{index}", kind="data", location=f"host-{index}",
+            inspect=lambda locator, i=index: ResourceReference(
+                id="inputs", kind="data", location=f"host-{i}",
+                locator=locator, fingerprint="a" * 64,
+            ),
+            verify=lambda _: None,
+            browse=lambda _: pytest.fail("CLI proposal must not browse resources"),
+        ))
+    client = TestClient(app, base_url="http://127.0.0.1")
+    monkeypatch.setattr(module.httpx, "Client", lambda **kwargs: client)
+
+    assert module.main([
+        "directory-task", "propose", "--project-root", str(tmp_path),
+        "--analysis-request", "Explain the registered inputs.",
+    ]) == 0
+
+    record = json.loads(capsys.readouterr().out)
+    assert record["project_root"] == str(tmp_path)
+    assert record["resource_location"] == ("registered-0" if location_count == 1 else None)
+    assert record["status"] == ("completed" if location_count == 1 else "waiting_for_user")
+    assert not calls
