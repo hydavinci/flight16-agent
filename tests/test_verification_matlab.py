@@ -223,9 +223,8 @@ def test_real_directory_agent_delivers_and_reuses_simulink_evidence(
     from flight_agent.verification.runtime import VerificationRuntime
     from flight_agent.web import create_web_app
     from flight_agent.worker import create_worker_app
-    from tests.helpers import ScriptedModel, serve_app, tool_message
+    from tests.helpers import HEADERS, TOKEN, ScriptedModel, serve_app, tool_message
     from tests.test_verification_runtime import explanation, proposal
-    from tests.test_worker import HEADERS, TOKEN
 
     monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
     monkeypatch.delenv("MATLAB_ALLOW_TRUSTED_UPLOADS", raising=False)

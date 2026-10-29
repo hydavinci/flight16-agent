@@ -166,46 +166,6 @@ def test_admission_stays_locked_until_background_slot_is_released(tmp_path, monk
             release_slot.set()
 
 
-def test_generic_and_workbench_execution_still_share_one_slot(tmp_path, monkeypatch):
-    from flight_agent import web
-    from flight_agent.upload_models import UploadRequest
-
-    managers = []
-    original = web.JobManager
-
-    def capture(store):
-        manager = original(store)
-        managers.append(manager)
-        return manager
-
-    monkeypatch.setattr(web, "JobManager", capture)
-    app, runtime, calls, _ = make_agent_web(
-        tmp_path, [{"action": "answer", "text": "No execution."}]
-    )
-    entered, release = threading.Event(), threading.Event()
-
-    def blocked(job_id):
-        entered.set()
-        assert release.wait(5)
-
-    with TestClient(app, base_url="http://127.0.0.1") as client:
-        try:
-            managers[0].submit(
-                UploadRequest(
-                    filename="test.m", source="% Not executed", kind="script",
-                    parameters={}, trusted=True,
-                ),
-                blocked,
-            )
-            assert entered.wait(5)
-            response = client.post(API, headers=auth(client), json={"message": "Explain RMSE."})
-            assert response.status_code == 409
-            assert all(record.status == "failed" for record in runtime.store.recent())
-            assert not calls
-        finally:
-            release.set()
-
-
 @pytest.mark.parametrize("requested", ["agent", "worker", "d1", "d2"])
 def test_unregistered_location_alias_is_rejected_before_creating_a_record(tmp_path, requested):
     from flight_agent.verification.resources import ResourceAdapter

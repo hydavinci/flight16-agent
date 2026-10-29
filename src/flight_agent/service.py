@@ -5,11 +5,10 @@ from typing import Annotated
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .jobs import JobStore
-from .upload_models import MAX_BODY
+MAX_BODY = 2_000_000
 
 
 def install_validation_handler(app: FastAPI) -> None:
@@ -72,21 +71,6 @@ def bearer_guard(token: str) -> Callable[[str | None], None]:
             raise HTTPException(status_code=401, detail="Invalid worker authorization")
 
     return authorize
-
-
-def artifact_response(store: JobStore, job_id: str, name: str) -> FileResponse:
-    try:
-        record = store.get(job_id)
-        if name not in record.figures or record.status != "completed":
-            raise KeyError(name)
-        path = store.directory(job_id) / name
-        if not path.is_file() or path.is_symlink() or path.parent != store.directory(job_id):
-            raise KeyError(name)
-        return FileResponse(
-            path, media_type="image/png", headers={"X-Content-Type-Options": "nosniff"}
-        )
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail="Unknown artifact") from exc
 
 
 def safe_log(directory: Path) -> str:

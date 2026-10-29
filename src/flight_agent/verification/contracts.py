@@ -4,7 +4,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import Field, JsonValue, field_validator, model_validator
 
-from ..models import Contract, FiniteNumber, Nonempty
+from ..models import Contract, FiniteNumber, Nonempty, finite_json
 from ..runtime.agent_contracts import (
     AgentBaseline,
     AgentNode,
@@ -20,7 +20,6 @@ from ..runtime.observations import MetricValue as MetricValue
 from ..runtime.requirements import CapabilityGap
 from ..runtime.tasks import PlanNode as PlanNode
 from ..runtime.tasks import plan_ancestors as plan_ancestors
-from ..upload_models import finite_json
 
 AnalysisKind = Literal["step_response", "stability_margins"]
 EvaluationStatus = Literal["pass", "fail", "undetermined"]

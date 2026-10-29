@@ -7,10 +7,8 @@ from playwright.sync_api import expect, sync_playwright
 from flight_agent.directories import NativeDirectoryError
 from flight_agent.verification.backend import RemoteSimulinkBackend
 from flight_agent.verification.views import to_conversation_view
-from tests.helpers import serve_app, tool_message
+from tests.helpers import TOKEN, serve_app, tool_message, web_module, worker
 from tests.test_verification_runtime import explanation, proposal, runtime_fixture
-from tests.test_web import web_module
-from tests.test_worker import TOKEN, worker
 from tests.verification_helpers import project_tree, verification_module
 
 pytestmark = pytest.mark.skipif(

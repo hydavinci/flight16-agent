@@ -9,14 +9,14 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from openai import APIError
 from pydantic import JsonValue
 
-from ..jobs import BusyError
+from ..background import BusyError
+from ..json_io import write_json
 from ..runtime.capabilities import Capability, CapabilityDefinition, Input, Output
 from ..runtime.contracts import AnalysisRun, EvidenceFile, fingerprint
 from ..runtime.evidence import load_run, persist_run, receipt_name
 from ..runtime.intents import Scenario, WorkflowRequest
 from ..runtime.loop import LoopDecision, run_loop
 from ..runtime.workflows import DirectoryInputs, Workflow, WorkflowRegistry
-from ..session import _write_json
 from .artifacts import describe_artifact, verify_artifact
 from .backend import AnalysisBackend, RemoteSimulinkBackend
 from .contracts import (
@@ -909,7 +909,7 @@ class VerificationRuntime:
             raise ValueError("Numerical result does not match the confirmed request")
         for artifact in result.artifacts:
             verify_artifact(run_directory, artifact)
-        _write_json(run_directory / "analysis.json", result.model_dump())
+        write_json(run_directory / "analysis.json", result.model_dump())
         paths = [*result.artifacts, describe_artifact(run_directory, "analysis.json")]
         if (run_directory / "matlab.log").is_file():
             paths.append(describe_artifact(run_directory, "matlab.log"))

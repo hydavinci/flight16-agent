@@ -5,8 +5,6 @@ import sys
 
 import pytest
 
-from tests.helpers import ScriptedModel, successful_responses
-
 
 def cli_module():
     try:
@@ -21,6 +19,35 @@ def clear_model_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
+def test_cli_has_no_analyze_command(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli_module().main(["analyze", "--help"])
+    assert exc.value.code == 2
+    assert "invalid choice: 'analyze'" in capsys.readouterr().err
+
+
+def test_doctor_needs_no_demo_assets(tmp_path, monkeypatch, capsys):
+    module = cli_module()
+    monkeypatch.setenv("LLM_PROVIDER", "openai-compatible")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("LLM_BASE_URL", "http://127.0.0.1:9/v1")
+    monkeypatch.setenv("LLM_API_KEY", "do-not-print-secret")
+    monkeypatch.setenv("MATLAB_WORKER_URL", "http://127.0.0.1:9001")
+    monkeypatch.setattr(module, "engine_available", lambda: True)
+    monkeypatch.setattr(
+        subprocess, "Popen", lambda *args, **kwargs: pytest.fail("Doctor started a process"),
+    )
+    monkeypatch.setattr(
+        module.httpx, "Client", lambda *args, **kwargs: pytest.fail("Doctor contacted a service"),
+    )
+
+    assert module.main(["doctor", "--project-root", str(tmp_path)]) == 0
+    output = capsys.readouterr()
+    assert "MATLAB_WORKER_URL: configured" in output.out
+    assert "do-not-print-secret" not in output.out + output.err
+    assert "Demo assets" not in output.out
+
+
 def test_doctor_never_contacts_model_or_exposes_key(project, monkeypatch, capsys):
     module = cli_module()
     monkeypatch.setenv("LLM_API_KEY", "do-not-print-secret")
@@ -31,38 +58,8 @@ def test_doctor_never_contacts_model_or_exposes_key(project, monkeypatch, capsys
     assert "do-not-print-secret" not in output.out + output.err
 
 
-def test_missing_model_configuration_is_explicit(project, parameter_data, clear_model_env, capsys):
-    (project / "input.json").write_text(json.dumps(parameter_data))
-    code = cli_module().main(["analyze", "input.json", "--project-root", str(project)])
-    assert code == 1
-    assert "LLM_" in capsys.readouterr().err
-
-
-def test_cli_rejects_bad_input_before_model_call(project, parameter_data, capsys):
-    parameter_data["mass_kg"] = -5
-    (project / "input.json").write_text(json.dumps(parameter_data))
-    code = cli_module().main(["analyze", "input.json", "--project-root", str(project)])
-    assert code == 1
-    assert "mass_kg" in capsys.readouterr().err
-    assert not (project / "runs").exists()
-
-
-def test_cli_end_to_end_with_test_engine(project, parameter_data, fake_engine, monkeypatch, capsys):
-    module = cli_module()
-    (project / "input.json").write_text(json.dumps(parameter_data))
-    monkeypatch.setattr(
-        module, "create_model", lambda: ScriptedModel(responses=successful_responses())
-    )
-    code = module.main(["analyze", "input.json", "--project-root", str(project)])
-    assert code == 0
-    report = next((project / "runs").glob("*/report.md"))
-    assert str(report) in capsys.readouterr().out
-    assert "判定状态：`pass`" in report.read_text()
-    assert "MATLAB" in report.read_text()
-
-
 def test_dotenv_is_loaded_from_explicit_project_root(
-    project, clear_model_env, monkeypatch, parameter_data, capsys
+    project, clear_model_env, monkeypatch, capsys
 ):
     module = cli_module()
     (project / ".env").write_text("LLM_MODEL=test-model\nLLM_BASE_URL=http://127.0.0.1:9/v1\n")

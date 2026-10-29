@@ -8,7 +8,7 @@ from typing import Generic, Literal, TypeVar
 
 from pydantic import JsonValue
 
-from ..models import Contract, Nonempty
+from ..models import Contract, Nonempty, finite_json
 from ..runtime.capabilities import Capability, CapabilityRegistry
 from ..runtime.contracts import (
     AnalysisSpec,
@@ -18,7 +18,6 @@ from ..runtime.contracts import (
     ExecutionScope,
     fingerprint,
 )
-from ..upload_models import finite_json
 from .artifacts import verify_artifact
 from .contracts import (
     AnalysisKind,

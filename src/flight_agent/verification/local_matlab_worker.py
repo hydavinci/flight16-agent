@@ -4,10 +4,10 @@ import os
 import sys
 from pathlib import Path
 
+from ..json_io import write_json
 from ..runtime.contracts import fingerprint
 from ..runtime.evidence import verify_evidence
 from ..runtime.observations import OutputArtifact
-from ..session import _write_json
 from .artifacts import describe_artifact
 from .local_matlab import (
     MAX_REQUEST_BYTES,
@@ -150,7 +150,7 @@ def _child(directory: Path) -> None:
                 "input_provenance": "canonical_request",
             }
         )
-        _write_json(directory / "metadata.json", metadata.model_dump(mode="json"))
+        write_json(directory / "metadata.json", metadata.model_dump(mode="json"))
         artifacts = []
         for name in [*output.artifact_paths, "metadata.json"]:
             item = describe_artifact(directory, name)
@@ -209,7 +209,7 @@ def _child(directory: Path) -> None:
                 diagnostics=[f"Engine cleanup uncertain: {exc}"[:6000]],
                 details={"engine_closed": False},
             )
-    _write_json(directory / "receipt.json", result.model_dump(mode="json"))
+    write_json(directory / "receipt.json", result.model_dump(mode="json"))
 
 
 def main() -> int:

@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flight_agent import directories, web
-from tests.test_worker import TOKEN
+from tests.helpers import TOKEN
 
 
 def native_client(project: Path, *, enabled: bool = True) -> TestClient:

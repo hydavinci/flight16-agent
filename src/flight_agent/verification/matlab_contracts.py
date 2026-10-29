@@ -5,10 +5,9 @@ from typing import Annotated, Literal, Self
 
 from pydantic import ConfigDict, Field, JsonValue, ValidationInfo, field_validator, model_validator
 
-from ..models import Contract, FiniteNumber, Nonempty
+from ..models import MAX_RESULT, Contract, FiniteNumber, Nonempty, finite_json
 from ..runtime.contracts import Digest, RunId
 from ..runtime.observations import MetricValue, OutputArtifact
-from ..upload_models import MAX_RESULT, finite_json
 from .contracts import FileDigest, SteadyStatePolicy, matlab_identifier, relative_path
 from .intake import safe_directory
 

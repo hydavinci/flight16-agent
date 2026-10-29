@@ -6,7 +6,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..json_io import write_json
-from ..upload_models import JOB_ID
+from ..models import JOB_ID
 from .contracts import (
     AnalysisRunRequest,
     Conversation,

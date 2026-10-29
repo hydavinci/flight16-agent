@@ -3,25 +3,13 @@ import threading
 import time
 from contextlib import contextmanager
 
+import pytest
 import uvicorn
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 
-from flight_agent.models import AnalysisResult
-
-
-class SampleRunner:
-    log = "test runner"
-
-    def __init__(self, result_data):
-        self.result_data = result_data
-        self.calls = 0
-
-    def run(self, parameters):
-        self.calls += 1
-        if self.calls > 1:
-            raise AssertionError("Duplicate analysis is a bug")
-        return AnalysisResult.model_validate(self.result_data)
+TOKEN = "test-worker-token-with-at-least-32-characters"
+HEADERS = {"Authorization": "Bearer " + TOKEN}
 
 
 class ScriptedModel(FakeMessagesListChatModel):
@@ -36,13 +24,34 @@ def tool_message(name, args=None, call_id=None):
     )
 
 
-def successful_responses():
-    return [
-        tool_message("run_matlab_analysis"),
-        tool_message("check_requirements"),
-        tool_message("search_knowledge", {"query": "演示判据 升力系数"}),
-        AIMessage(content="仅软件演示，程序判定通过。依据：[KB:demo.md]。"),
-    ]
+def web_module():
+    from flight_agent import web
+
+    return web
+
+
+def worker():
+    from flight_agent import worker
+
+    return worker
+
+
+def headers(client):
+    bootstrap = client.get("/api/bootstrap")
+    assert bootstrap.status_code == 200
+    return {"X-Flight-Token": bootstrap.json()["token"]}
+
+
+def wait_job(client, job_id, headers=HEADERS, prefix="/verification/runs"):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        response = client.get(f"{prefix}/{job_id}", headers=headers)
+        assert response.status_code == 200, response.text
+        record = response.json()
+        if record["status"] not in ("queued", "running"):
+            return record
+        time.sleep(0.02)
+    pytest.fail("Task did not reach a terminal state")
 
 
 @contextmanager

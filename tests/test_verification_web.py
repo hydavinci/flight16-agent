@@ -6,9 +6,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import tool_message
+from tests.helpers import headers, tool_message, web_module
 from tests.test_verification_runtime import explanation, proposal, runtime_fixture
-from tests.test_web import headers, web_module
 from tests.verification_helpers import verification_module
 
 API = "/api/conversations"

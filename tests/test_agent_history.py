@@ -174,7 +174,7 @@ def test_existing_authenticated_history_api_can_read_v2_and_download_checked_art
     from flight_agent.runtime.evidence import describe_evidence
     from flight_agent.runtime.observations import OutputArtifact
     from flight_agent.verification.runtime import VerificationRuntime
-    from tests.test_web import headers, web_module
+    from tests.helpers import headers, web_module
 
     runtime = VerificationRuntime(tmp_path / "state")
     record = runtime.store.create()

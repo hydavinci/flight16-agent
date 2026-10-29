@@ -1,11 +1,11 @@
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import FileResponse
 
+from ..background import BackgroundRunner, BusyError
 from ..directories import DirectoryListing, browse_directories
-from ..jobs import BusyError, JobManager
 from ..service import safe_log
 from .artifacts import verify_artifact
 from .contracts import AnalysisRunRequest, InspectProjectRequest, ProjectDescriptor, RunRecord
@@ -16,16 +16,10 @@ from .store import WorkerRunStore, request_digest
 logger = logging.getLogger(__name__)
 
 
-def project_routes(root: Path, manager: JobManager, enabled: bool) -> APIRouter:
+def project_routes(root: Path, runner: BackgroundRunner) -> APIRouter:
     store = WorkerRunStore(root / "runs" / "verification-worker")
 
-    def authorize_projects() -> None:
-        if not enabled:
-            raise HTTPException(
-                status_code=403, detail="Set MATLAB_ALLOW_TRUSTED_PROJECTS=1 on the worker"
-            )
-
-    router = APIRouter(prefix="/verification", dependencies=[Depends(authorize_projects)])
+    router = APIRouter(prefix="/verification")
 
     @router.get("/directories")
     def directories(path: str = Query(default="", max_length=4096)) -> DirectoryListing:
@@ -61,7 +55,7 @@ def project_routes(root: Path, manager: JobManager, enabled: bool) -> APIRouter:
             try:
                 store.update(run_id, log=safe_log(store.directory(run_id)))
             finally:
-                manager.slot.release()
+                runner.slot.release()
 
     @router.post("/runs", status_code=202)
     def submit(request: AnalysisRunRequest) -> RunRecord:
@@ -74,13 +68,13 @@ def project_routes(root: Path, manager: JobManager, enabled: bool) -> APIRouter:
                 if existing.request_sha256 != request_digest(request):
                     raise HTTPException(status_code=409, detail="Run ID has different input")
                 return existing
-            if not manager.slot.acquire(blocking=False):
+            if not runner.slot.acquire(blocking=False):
                 raise HTTPException(status_code=409, detail=str(BusyError("Worker is busy")))
             dispatched = False
             try:
                 record = store.create(request)
                 try:
-                    manager.pool.submit(execute, record.id)
+                    runner.pool.submit(execute, record.id)
                 except RuntimeError as exc:
                     logger.exception("Unable to schedule verification run %s", record.id)
                     store.update(record.id, status="failed", stage="failed", error=str(exc)[:6000])
@@ -91,7 +85,7 @@ def project_routes(root: Path, manager: JobManager, enabled: bool) -> APIRouter:
                 return record
             finally:
                 if not dispatched:
-                    manager.slot.release()
+                    runner.slot.release()
 
     @router.get("/runs/{run_id}")
     def status(run_id: str) -> RunRecord:

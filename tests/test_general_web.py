@@ -2,11 +2,10 @@ import json
 
 from fastapi.testclient import TestClient
 
-from tests.helpers import tool_message
+from tests.helpers import headers, tool_message, web_module
 from tests.test_general_orchestration import register_mass, shell
 from tests.test_general_runtime import proposal
 from tests.test_verification_web import API, artifact_url, confirm, wait_conversation
-from tests.test_web import headers, web_module
 
 
 def test_workflow_catalog_is_authenticated_and_exposes_registered_strict_schema(project, tmp_path):

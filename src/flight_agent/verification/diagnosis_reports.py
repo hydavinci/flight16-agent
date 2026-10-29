@@ -2,8 +2,8 @@ from pathlib import Path
 
 from docx import Document
 
+from ..json_io import write_json
 from ..runtime.evidence import load_run
-from ..session import _write_json
 from .artifacts import describe_artifact, verify_artifact
 from .contracts import Artifact, ConversationMessage
 from .legacy_contracts import DiagnosisTask
@@ -159,7 +159,7 @@ def deliver_diagnosis_report(
         "hypothesis_revisions": revisions,
         "summary": summary.model_dump(mode="json") if summary else None,
     }
-    _write_json(
+    write_json(
         target / "diagnosis.json",
         {
             "task_id": task.id,
@@ -169,7 +169,7 @@ def deliver_diagnosis_report(
             "termination": task.termination.model_dump(mode="json"),
         },
     )
-    _write_json(
+    write_json(
         target / "execution_record.json",
         {
             **payload, **findings, "status": "completed",
@@ -181,7 +181,7 @@ def deliver_diagnosis_report(
         *(item for item in task.artifacts if not item.path.startswith(prefix + "/")),
         *(describe_artifact(directory, f"{prefix}/{name}") for name in names),
     ]
-    _write_json(
+    write_json(
         target / "artifact-index.json",
         {
             "task_id": task.id, "baseline_version": task.baseline.version,

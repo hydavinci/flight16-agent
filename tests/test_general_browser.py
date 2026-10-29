@@ -5,12 +5,11 @@ import pytest
 from fastapi.testclient import TestClient
 from playwright.sync_api import expect, sync_playwright
 
-from tests.helpers import tool_message
+from tests.helpers import tool_message, web_module
 from tests.test_general_orchestration import register_mass, shell
 from tests.test_general_runtime import proposal
 from tests.test_verification_runtime import confirm, runtime_fixture
 from tests.test_verification_runtime import proposal as verification_proposal
-from tests.test_web import web_module
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_BROWSER_TESTS") != "1",

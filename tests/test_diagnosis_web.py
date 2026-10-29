@@ -4,9 +4,9 @@ from fastapi.testclient import TestClient
 
 from flight_agent.verification.backend import RemoteSimulinkBackend
 from flight_agent.web import create_web_app
+from tests.helpers import headers
 from tests.test_diagnosis_runtime import runtime_fixture
 from tests.test_verification_web import API, artifact_url, confirm, wait_conversation
-from tests.test_web import headers
 
 
 def test_d2_api_confirmation_reports_and_history_share_d1_routes(project, tmp_path):

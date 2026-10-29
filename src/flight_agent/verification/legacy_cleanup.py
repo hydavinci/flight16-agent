@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from ..upload_models import JOB_ID
+from ..models import JOB_ID
 from .intake import safe_directory
 
 RecordKind = Literal["v1", "v2", "unknown"]

@@ -8,7 +8,7 @@ import httpx
 
 from ..directories import DirectoryListing
 from ..json_io import write_json
-from ..remote import RemoteError, RemoteWorker
+from ..remote import RemoteClient, RemoteError
 from .artifacts import MAX_ARTIFACT_BYTES, verify_artifact
 from .contracts import AnalysisResult, AnalysisRunRequest, ProjectDescriptor, RunRecord
 from .store import request_digest
@@ -27,7 +27,7 @@ class AnalysisBackend(Protocol):
     ) -> AnalysisResult: ...
 
 
-class RemoteSimulinkBackend(RemoteWorker):
+class RemoteSimulinkBackend(RemoteClient):
     def browse(self, path: str = "") -> DirectoryListing:
         client = self.client or httpx.Client(trust_env=False)
         try:

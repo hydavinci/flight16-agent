@@ -6,10 +6,9 @@ from docx import Document
 from docx.shared import Inches
 from pydantic import JsonValue, field_validator
 
-from ..models import Contract, Nonempty
+from ..json_io import write_json
+from ..models import Contract, Nonempty, finite_json
 from ..runtime.contracts import fingerprint
-from ..session import _write_json
-from ..upload_models import finite_json
 from .artifacts import describe_artifact, verify_artifact
 from .contracts import (
     AnalysisKind,
@@ -208,7 +207,7 @@ def deliver_report(request: ReportRequest, directory: Path) -> list[Artifact]:
     if not reused:
         for name, kinds in coverage.items():
             _write_report(request, directory, name, kinds)
-    _write_json(
+    write_json(
         target / "evaluation.json",
         {
             "task_id": request.task_id,
@@ -217,14 +216,14 @@ def deliver_report(request: ReportRequest, directory: Path) -> list[Artifact]:
             "evaluation": request.evaluation.model_dump(),
         },
     )
-    _write_json(target / "execution_record.json", request.execution_record)
+    write_json(target / "execution_record.json", request.execution_record)
     names = [*coverage, f"{prefix}/evaluation.json", f"{prefix}/execution_record.json"]
     artifacts = [
         *request.result.artifacts,
         *request.derived_artifacts,
         *(describe_artifact(directory, name) for name in names),
     ]
-    _write_json(
+    write_json(
         target / "artifact-index.json",
         {
             "task_id": request.task_id,
@@ -248,14 +247,14 @@ def finalize_execution_record(
     index_name = f"{prefix}/artifact-index.json"
     index_artifact = next(item for item in artifacts if item.path == index_name)
     index = json.loads(verify_artifact(directory, index_artifact).read_text("utf-8"))
-    _write_json(directory / execution_name, request.execution_record)
+    write_json(directory / execution_name, request.execution_record)
     updated = [
         describe_artifact(directory, execution_name) if item.path == execution_name else item
         for item in artifacts
         if item.path != index_name
     ]
     index["artifacts"] = [item.model_dump() for item in updated]
-    _write_json(directory / index_name, index)
+    write_json(directory / index_name, index)
     updated.append(describe_artifact(directory, index_name))
     for item in updated:
         verify_artifact(directory, item)

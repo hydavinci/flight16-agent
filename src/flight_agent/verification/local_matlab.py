@@ -11,12 +11,12 @@ from typing import IO, Literal, TypeVar
 
 from pydantic import BaseModel
 
+from ..json_io import write_json
 from ..matlab import _stop_worker
 from ..runtime.capability_metadata import Availability
 from ..runtime.contracts import fingerprint
 from ..runtime.evidence import publish_evidence, verify_evidence
 from ..runtime.observations import OutputArtifact
-from ..session import _write_json
 from .artifacts import MAX_ARTIFACT_BYTES, describe_artifact
 from .intake import safe_directory
 from .matlab import MAX_LOG_BYTES, MAX_RESULT_BYTES
@@ -512,8 +512,8 @@ class LocalMatlabBackend:
         state = LocalMatlabCheckpoint(
             id=request.id, request_sha256=digest, status="running", interpreter=self.interpreter
         )
-        _write_json(directory / "request.json", request.model_dump(mode="json"))
-        _write_json(directory / "state.json", state.model_dump(mode="json"))
+        write_json(directory / "request.json", request.model_dump(mode="json"))
+        write_json(directory / "state.json", state.model_dump(mode="json"))
         status: Literal["failed", "unknown", "interrupted"] = "failed"
         try:
             if isinstance(request.inputs, (ProjectExecutionInput, LinearizeInput)):
@@ -556,7 +556,7 @@ class LocalMatlabBackend:
                     publish_evidence(directory / "project", name, source.read_bytes())
                 _linear_model_source(request, directory)
             execution = _execution_request(request, directory)
-            _write_json(directory / "execution.json", execution.model_dump(mode="json"))
+            write_json(directory / "execution.json", execution.model_dump(mode="json"))
             _output_bounds(directory)
             process = None
             cleanup_error = None
@@ -565,7 +565,7 @@ class LocalMatlabBackend:
                 try:
                     process = self._spawn(str(directory), cwd=directory, log=log)
                     state = state.model_copy(update={"pid": process.pid})
-                    _write_json(directory / "state.json", state.model_dump(mode="json"))
+                    write_json(directory / "state.json", state.model_dump(mode="json"))
                     deadline = time.monotonic() + request.timeout_seconds
                     while process.poll() is None:
                         if time.monotonic() >= deadline:
@@ -593,7 +593,7 @@ class LocalMatlabBackend:
             if process is None or process.returncode != 0:
                 raise ValueError("Worker exited without a verified terminal receipt")
             state = state.model_copy(update={"worker_exit_confirmed": True})
-            _write_json(directory / "state.json", state.model_dump(mode="json"))
+            write_json(directory / "state.json", state.model_dump(mode="json"))
             result = self._receipt(request, directory)
             if request.project is not None and (
                 discover_matlab_project(request.project.root) != request.project
@@ -648,7 +648,7 @@ class LocalMatlabBackend:
         *,
         receipt: bool = False,
     ) -> LocalMatlabResult:
-        _write_json(directory / "result.json", result.model_dump(mode="json"))
+        write_json(directory / "result.json", result.model_dump(mode="json"))
         state = state.model_copy(
             update={
                 "status": result.execution_status,
@@ -656,7 +656,7 @@ class LocalMatlabBackend:
                 "receipt_sha256": file_digest(directory / "receipt.json") if receipt else None,
             }
         )
-        _write_json(directory / "state.json", state.model_dump(mode="json"))
+        write_json(directory / "state.json", state.model_dump(mode="json"))
         return result
 
     def _resume(self, request: LocalMatlabRequest, directory: Path) -> LocalMatlabResult:
@@ -737,4 +737,4 @@ def _normalize_series(request: LocalMatlabRequest, directory: Path) -> None:
         data[role]["time"] = [value * factor for value in item.time]
         data[role]["time_unit"] = "s"
     series = MatlabSeriesPair.model_validate(data)
-    _write_json(directory / "series.json", series.model_dump(mode="json"))
+    write_json(directory / "series.json", series.model_dump(mode="json"))

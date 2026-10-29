@@ -7,12 +7,12 @@ from uuid import uuid4
 
 from pydantic import JsonValue
 
+from ..json_io import write_json
 from ..runtime.capabilities import CapabilityRegistry
 from ..runtime.contracts import AnalysisRun, AnalysisSpec, ExecutionScope, fingerprint
 from ..runtime.evidence import load_run, persist_run, receipt_name
 from ..runtime.loop import LoopDecision, run_loop
 from ..runtime.tasks import GeneralBaseline, GeneralProposal, PlanNode
-from ..session import _write_json
 from .artifacts import describe_artifact, verify_artifact
 from .contracts import (
     Conversation,
@@ -315,7 +315,7 @@ class GeneralRuntime:
             )
             scope.authorize("write_delivery")
             task.stage = "completed"
-            _write_json(directory / "execution_record.json", task.model_dump(mode="json"))
+            write_json(directory / "execution_record.json", task.model_dump(mode="json"))
             task.artifacts = [
                 item for item in task.artifacts if item.path != "execution_record.json"
             ] + [describe_artifact(directory, "execution_record.json")]
