@@ -4,10 +4,10 @@ from .contracts import (
     METRICS,
     AnalysisResult,
     Evaluation,
-    EvaluationBaseline,
     EvaluationStatus,
     MetricCheck,
 )
+from .legacy_contracts import EvaluationBaseline
 
 
 def _aggregate(statuses: list[EvaluationStatus]) -> EvaluationStatus:

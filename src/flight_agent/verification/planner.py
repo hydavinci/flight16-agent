@@ -8,12 +8,9 @@ from ..runtime.tasks import GeneralProposal
 from .contracts import (
     AgentTask,
     Conversation,
-    DiagnosisTask,
-    EvidenceExplanation,
-    PlanProposal,
     ProjectDescriptor,
-    VerificationTask,
 )
+from .legacy_contracts import DiagnosisTask, EvidenceExplanation, PlanProposal, VerificationTask
 from .diagnosis_contracts import DiagnosisProposal, DiagnosisReview
 from .diagnostic_data import DiagnosticProject
 from .structured_planner import StructuredPlanner, redact_text

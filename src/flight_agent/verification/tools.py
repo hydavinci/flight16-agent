@@ -25,12 +25,11 @@ from .contracts import (
     AnalysisResult,
     Conversation,
     Evaluation,
-    EvaluationBaseline,
     Identifier,
     PlanNode,
-    VerificationTask,
     plan_ancestors,
 )
+from .legacy_contracts import EvaluationBaseline, VerificationTask
 
 ToolInput = TypeVar("ToolInput", bound=Contract)
 ToolOutput = TypeVar("ToolOutput", bound=Contract)

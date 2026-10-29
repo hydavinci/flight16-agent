@@ -5,6 +5,7 @@ from zipfile import ZipFile
 import pytest
 from PIL import Image
 
+from flight_agent.verification.legacy_contracts import EvaluationBaseline
 from tests.verification_helpers import (
     baseline_data,
     margin_result_data,
@@ -40,7 +41,7 @@ def report_input(tmp_path, both=True, version=1, grouping="combined"):
         artifacts.describe_artifact(directory, name).model_dump() for name in names
     ]
     result = contracts.AnalysisResult.model_validate(data)
-    baseline = contracts.EvaluationBaseline.model_validate(
+    baseline = EvaluationBaseline.model_validate(
         {**baseline_data(kinds), "project_fingerprint": project.fingerprint, "version": version}
     )
     evaluation = verification_module("evaluation").evaluate(baseline, result)

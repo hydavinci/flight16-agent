@@ -15,6 +15,7 @@ from .contracts import (
     RunRecord,
 )
 from .intake import safe_directory
+from .legacy_cleanup import classify_record, normalize_v2_record
 
 
 def now() -> str:
@@ -143,9 +144,17 @@ class ConversationStore:
             path = self.directory(conversation_id) / "conversation.json"
             if path.is_symlink() or not path.is_file():
                 raise KeyError("Unknown conversation")
-            if path.stat().st_size > 8_000_000:
+            with path.open("rb") as stream:
+                content = stream.read(8_000_001)
+            if len(content) > 8_000_000:
                 raise ValueError("Conversation record exceeds 8 MB")
-            record = Conversation.model_validate_json(path.read_text("utf-8"))
+            data = json.loads(content)
+            kind = classify_record(data)
+            if kind == "v1":
+                raise ValueError("Legacy conversation is unsupported; run cleanup-legacy")
+            if kind == "unknown":
+                raise ValueError("Conversation schema is unknown")
+            record = Conversation.model_validate(normalize_v2_record(data))
             if record.id != conversation_id:
                 raise ValueError("Conversation identity mismatch")
             return record

@@ -21,7 +21,6 @@ from .contracts import (
     ConversationMessage,
     ConversationStatus,
     PendingDecision,
-    Task,
     ToolCall,
 )
 
@@ -93,7 +92,7 @@ class EvaluationView(Contract):
 class TaskView(Contract):
     """Read-only display, including archived logs larger than execution payload strings."""
     id: str
-    schema_version: Literal["1.0", "2.0"]
+    schema_version: Literal["2.0"]
     title: str
     baseline_version: int
     confirmation: ConfirmationView
@@ -177,19 +176,14 @@ def to_task_view(task: AgentTask) -> TaskView:
 
 
 def to_conversation_view(record: Conversation) -> ConversationView:
-    from .compat import to_legacy_view
-
-    def project(task: Task) -> TaskView:
-        return to_task_view(task) if isinstance(task, AgentTask) else to_legacy_view(task)
-
     return ConversationView(
         id=record.id,
         status=record.status,
         project_root=record.project_root,
         resource_location=record.resource_location,
         output_root=record.output_root,
-        task=project(record.task) if record.task is not None else None,
-        archived_tasks=[project(task) for task in record.archived_tasks],
+        task=to_task_view(record.task) if record.task is not None else None,
+        archived_tasks=[to_task_view(task) for task in record.archived_tasks],
         messages=record.messages,
         pending_decision=record.pending_decision,
         error=record.error,

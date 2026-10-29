@@ -207,7 +207,6 @@ def verification_router(
                 {
                     "id": record.id,
                     "status": record.status,
-                    "scenario": record.scenario,
                     "project_root": record.project_root,
                     "output_root": record.output_root,
                     "updated_at": record.updated_at,

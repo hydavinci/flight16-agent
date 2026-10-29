@@ -45,7 +45,6 @@ from ..runtime.observations import (
 )
 from ..runtime.requirements import CapabilityGap
 from ..runtime.resources import ResourceReference, bounded_json
-from .compat import has_unresolved_call
 from .contracts import (
     AgentExecutionNode,
     AgentTask,
@@ -61,6 +60,10 @@ from .store import ConversationStore, now
 
 logger = logging.getLogger(__name__)
 MAX_CHECKPOINT_BYTES = 4_000_000
+
+
+def has_unresolved_call(task: AgentTask) -> bool:
+    return any(call.status in ("running", "interrupted") for call in task.calls)
 
 
 class ExecutionUncertain(RuntimeError):
@@ -434,8 +437,6 @@ class AgentExecutor:
             conversation.task = task
             conversation.output_root = output_root
             conversation.turn_origin = None
-            conversation.active_workflow = None
-            conversation.workflow_agenda = []
             conversation.status = "waiting_for_user"
             conversation.error = None
             conversation.pending_decision = PendingDecision(

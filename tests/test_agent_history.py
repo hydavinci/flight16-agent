@@ -28,33 +28,32 @@ def agent_task(directory, **changes):
     )
 
 
-def test_v2_and_all_legacy_task_kinds_round_trip_without_rewriting_old_json(tmp_path):
-    from tests.test_diagnosis_runtime import runtime_fixture as diagnosis_fixture
-    from tests.test_general_runtime import proposal as general_proposal
-    from tests.test_general_runtime import setup
-    from tests.test_verification_runtime import proposal, runtime_fixture
-
-    verification, _, _, root = runtime_fixture(tmp_path / "v1", [proposal()])
-    old_verification = verification.submit(None, "Verify.", str(root)).task
-    diagnosis, _, _, root = diagnosis_fixture(tmp_path / "diagnosis")
-    old_diagnosis = diagnosis.submit(None, "Diagnose.", str(root), scenario="d2").task
-    general, _, conversation, _ = setup(tmp_path / "general")
-    old_general = general.propose(conversation, general_proposal(), workflow="mass_summary").task
-    originals = [old_verification, old_diagnosis, old_general]
-    expected = [task.model_dump(mode="json") for task in originals]
-    store = ConversationStore(tmp_path / "mixed")
+def test_existing_v2_envelope_normalizes_without_rewriting_persisted_history(tmp_path):
+    store = ConversationStore(tmp_path / "state")
     record = store.create()
     record.task = agent_task(store.directory(record.id))
-    record.archived_tasks = originals
+    record.archived_tasks = [record.task.model_copy(deep=True)]
+    expected = record.task.model_dump(mode="json")
     store.save(record)
+    path = store.directory(record.id) / "conversation.json"
+    data = json.loads(path.read_text())
+    data.pop("schema_version", None)
+    data.update(scenario="auto", goal="", active_workflow=None, workflow_agenda=[])
+    path.write_text(json.dumps(data))
+    before = path.read_bytes()
+
     reloaded = ConversationStore(store.root).get(record.id)
+
+    assert reloaded.schema_version == "2.0"
     assert isinstance(reloaded.task, contracts.AgentTask)
     assert reloaded.task.schema_version == "2.0"
-    assert [task.model_dump(mode="json") for task in reloaded.archived_tasks] == expected
-    assert all("schema_version" not in task for task in expected)
-    compat = importlib.import_module("flight_agent.verification.compat")
-    assert not compat.is_legacy_task(reloaded.task)
-    assert all(compat.is_legacy_task(task) for task in reloaded.archived_tasks)
+    assert reloaded.task.model_dump(mode="json") == expected
+    assert reloaded.archived_tasks[0].model_dump(mode="json") == expected
+    assert path.read_bytes() == before
+    store.save(reloaded)
+    persisted = json.loads(path.read_text())
+    assert persisted["schema_version"] == "2.0"
+    assert not {"scenario", "goal", "active_workflow", "workflow_agenda"} & persisted.keys()
 
 
 def test_restart_preserves_v2_confirmation_call_identity_inputs_and_unknown_state(tmp_path):
@@ -89,8 +88,8 @@ def test_restart_preserves_v2_confirmation_call_identity_inputs_and_unknown_stat
     assert saved.task.calls[0].status == "interrupted"
     assert saved.task.calls[0].inputs == baseline_task.calls[0].inputs
     assert saved.task.nodes[0].status == "interrupted"
-    compat = importlib.import_module("flight_agent.verification.compat")
-    assert compat.has_unresolved_call(saved.task)
+    runtime = importlib.import_module("flight_agent.verification.agent_runtime")
+    assert runtime.has_unresolved_call(saved.task)
     assert ConversationStore(store.root).get(record.id) == saved
 
 
@@ -123,8 +122,8 @@ def test_unresolved_detection_never_confuses_failure_with_unknown_execution(
             started_at=now(),
         )
     )
-    compat = importlib.import_module("flight_agent.verification.compat")
-    assert compat.has_unresolved_call(task) is unresolved
+    runtime = importlib.import_module("flight_agent.verification.agent_runtime")
+    assert runtime.has_unresolved_call(task) is unresolved
 
 
 def test_v2_checkpoint_references_cannot_traverse_outside_task(tmp_path):
@@ -221,10 +220,23 @@ def test_legacy_worker_terminal_failure_is_not_confused_with_unknown_call(
 ):
     from flight_agent.verification.compat import has_unresolved_call
     from flight_agent.verification.store import request_digest
-    from tests.test_verification_runtime import proposal, runtime_fixture
+    from flight_agent.verification.legacy_contracts import EvaluationBaseline, VerificationTask
+    from flight_agent.verification.projects import ProjectInspector
+    from tests.test_verification_runtime import proposal
+    from tests.verification_helpers import baseline_data, project_tree
 
-    runtime, _, _, root = runtime_fixture(tmp_path, [proposal()])
-    task = runtime.submit(None, "Verify.", str(root)).task
+    root = project_tree(tmp_path / "source")
+    project = ProjectInspector().inspect(str(root))
+    task = VerificationTask(
+        id="a" * 32,
+        project=project,
+        baseline=EvaluationBaseline.model_validate(
+            {**baseline_data(), "project_fingerprint": project.fingerprint}
+        ),
+        proposal=proposal(),
+        nodes=proposal()["nodes"],
+        result_directory=str(tmp_path),
+    )
     request = contracts.AnalysisRunRequest(
         id="1" * 32,
         project_root=str(root),

@@ -7,7 +7,8 @@ from docx import Document
 
 from flight_agent.runtime.evidence import load_run
 from flight_agent.verification.artifacts import verify_artifact
-from flight_agent.verification.contracts import Artifact, DiagnosisTask, ExecutionNode
+from flight_agent.verification.contracts import Artifact
+from flight_agent.verification.legacy_contracts import DiagnosisTask, ExecutionNode
 from flight_agent.verification.diagnosis_contracts import (
     DiagnosisProposal,
     DiagnosisReview,

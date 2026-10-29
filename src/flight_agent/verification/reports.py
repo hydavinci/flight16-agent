@@ -16,10 +16,10 @@ from .contracts import (
     AnalysisResult,
     Artifact,
     Evaluation,
-    EvaluationBaseline,
     Identifier,
     ProjectDescriptor,
 )
+from .legacy_contracts import EvaluationBaseline
 from .evaluation import evaluate
 
 REPORT_FORMAT_VERSION = "1"

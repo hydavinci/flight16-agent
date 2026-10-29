@@ -18,11 +18,10 @@ from .contracts import (
     Conversation,
     ConversationMessage,
     Decision,
-    ExecutionNode,
-    GeneralTask,
     PendingDecision,
     ToolCall,
 )
+from .legacy_contracts import ExecutionNode, GeneralTask
 from .intake import validate_output_root
 from .store import ConversationStore, now
 

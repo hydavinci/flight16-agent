@@ -9,10 +9,9 @@ from .contracts import (
     Conversation,
     ConversationMessage,
     Decision,
-    DiagnosisTask,
-    ExecutionNode,
     PendingDecision,
 )
+from .legacy_contracts import DiagnosisTask, ExecutionNode
 from .diagnosis_contracts import DiagnosisBaseline, HypothesisAssessment
 from .diagnosis_reports import deliver_diagnosis_report
 from .diagnostic_data import (

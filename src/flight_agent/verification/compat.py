@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import TypeAdapter
 
 from ..runtime.intents import Scenario
-from .contracts import AgentTask, Conversation, DiagnosisTask, GeneralTask, Task, VerificationTask
+from .contracts import AgentTask, Conversation
+from .legacy_contracts import DiagnosisTask, GeneralTask, LegacyTask, VerificationTask
 from .resources import ResourceLocation
 
 if TYPE_CHECKING:
@@ -17,11 +18,11 @@ if TYPE_CHECKING:
 Action = Literal["confirm", "resume", "retry", "replan"]
 
 
-def is_legacy_task(task: Task) -> bool:
+def is_legacy_task(task: LegacyTask | AgentTask) -> bool:
     return not isinstance(task, AgentTask)
 
 
-def has_unresolved_call(task: Task) -> bool:
+def has_unresolved_call(task: LegacyTask | AgentTask) -> bool:
     if isinstance(task, VerificationTask):
         request = task.pending_request
         if request is None:
@@ -180,7 +181,7 @@ class LegacyRuntimeAdapter:
         return self.runtime.workflows.catalog()
 
 
-def to_legacy_view(task: Task) -> "TaskView":
+def to_legacy_view(task: LegacyTask | AgentTask) -> "TaskView":
     from ..runtime.observations import Finding, Observation, ResultTable
     from ..runtime.resources import ResourceReference
     from .views import (

@@ -29,26 +29,28 @@ from .contracts import (
     ConversationMessage,
     ConversationState,
     Decision,
-    DiagnosisTask,
     Evaluation,
-    EvaluationBaseline,
-    ExecutionNode,
-    GeneralTask,
-    LegacyTask,
     PendingDecision,
     PlanNode,
-    PlanProposal,
-    PlanVersion,
     ProjectDescriptor,
     RunRecord,
     Task,
     ToolCall,
-    VerificationTask,
 )
 from .diagnosis import DiagnosisRuntime
 from .evaluation import evaluate
 from .general import GeneralContext, GeneralRuntime
 from .intake import parse_directories, safe_directory, validate_output_root
+from .legacy_contracts import (
+    DiagnosisTask,
+    EvaluationBaseline,
+    ExecutionNode,
+    GeneralTask,
+    LegacyTask,
+    PlanProposal,
+    PlanVersion,
+    VerificationTask,
+)
 from .planner import VerificationPlanner
 from .reports import ReportRequest, deliver_report, finalize_execution_record
 from .store import ConversationStore, now

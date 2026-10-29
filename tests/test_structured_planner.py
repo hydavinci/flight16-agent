@@ -4,7 +4,8 @@ from types import SimpleNamespace
 import pytest
 from pydantic import Field
 
-from flight_agent.verification.contracts import Conversation, DiagnosisTask, VerificationTask
+from flight_agent.verification.contracts import Conversation
+from flight_agent.verification.legacy_contracts import DiagnosisTask, VerificationTask
 from flight_agent.verification.diagnosis_contracts import DiagnosisProposal
 from flight_agent.verification.structured_planner import StructuredPlanner, redact_text
 from tests.diagnosis_helpers import diagnosis_proposal

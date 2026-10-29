@@ -5,7 +5,8 @@ from docx import Document
 from ..runtime.evidence import load_run
 from ..session import _write_json
 from .artifacts import describe_artifact, verify_artifact
-from .contracts import Artifact, ConversationMessage, DiagnosisTask
+from .contracts import Artifact, ConversationMessage
+from .legacy_contracts import DiagnosisTask
 from .diagnosis_contracts import validate_assessments, validate_history
 from .diagnostic_data import DiagnosticOutput
 from .intake import safe_directory

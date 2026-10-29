@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flight_agent.config import ModelSettings, create_model
-from flight_agent.verification.contracts import PlanProposal
+from flight_agent.verification.legacy_contracts import PlanProposal
 from flight_agent.verification.diagnostic_planner import DiagnosticReviewer
 from flight_agent.verification.planner import VerificationPlanner
 from flight_agent.web import create_web_app

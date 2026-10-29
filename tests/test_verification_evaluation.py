@@ -1,5 +1,6 @@
 import pytest
 
+from flight_agent.verification.legacy_contracts import EvaluationBaseline
 from tests.verification_helpers import (
     baseline_data,
     margin_result_data,
@@ -11,7 +12,7 @@ from tests.verification_helpers import (
 def assess(baseline, result):
     contracts = verification_module("contracts")
     return verification_module("evaluation").evaluate(
-        contracts.EvaluationBaseline.model_validate(baseline),
+        EvaluationBaseline.model_validate(baseline),
         contracts.AnalysisResult.model_validate(result),
     )
 
@@ -133,16 +134,14 @@ def test_analysis_context_must_match_baseline(field, value):
     ],
 )
 def test_baseline_rejects_invalid_criteria(change):
-    contracts = verification_module("contracts")
     data = baseline_data()
     data["criteria"][1].update(change)
     with pytest.raises(ValueError):
-        contracts.EvaluationBaseline.model_validate(data)
+        EvaluationBaseline.model_validate(data)
 
 
 def test_duplicate_criteria_are_rejected():
-    contracts = verification_module("contracts")
     data = baseline_data()
     data["criteria"].append(data["criteria"][0])
     with pytest.raises(ValueError, match="unique|Duplicate"):
-        contracts.EvaluationBaseline.model_validate(data)
+        EvaluationBaseline.model_validate(data)
