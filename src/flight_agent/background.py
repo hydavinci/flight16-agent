@@ -1,6 +1,6 @@
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 
 
 class BusyError(ValueError):
@@ -17,11 +17,11 @@ class BackgroundRunner:
         )
         self.slot = threading.BoundedSemaphore(max_workers)
 
-    def submit(self, operation: Callable[[], None]) -> None:
+    def submit(self, operation: Callable[[], None]) -> Future[None]:
         if not self.slot.acquire(blocking=False):
             raise BusyError("Another task is running; wait for it to finish")
         try:
-            self.pool.submit(self._run, operation)
+            return self.pool.submit(self._run, operation)
         except RuntimeError:
             self.slot.release()
             raise

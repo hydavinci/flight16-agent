@@ -106,12 +106,11 @@ class ConversationManager:
         except Exception as exc:
             # Background failures must be visible in the durable record and the server log.
             self._fail(conversation_id, exc)
-        finally:
-            self.lock.release()
 
     def _schedule(self, record: Conversation, operation: Callable[[], Conversation]) -> None:
         try:
-            self.jobs.submit(lambda: self._run(record.id, operation))
+            future = self.jobs.submit(lambda: self._run(record.id, operation))
+            future.add_done_callback(lambda _: self.lock.release())
         except BusyError as exc:
             self._fail(record.id, exc)
             raise

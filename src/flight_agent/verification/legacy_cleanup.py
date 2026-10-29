@@ -88,7 +88,7 @@ def cleanup_legacy_records(root: Path, *, apply: bool) -> CleanupReport:
                     if any(
                         isinstance(source, str)
                         and source
-                        and Path(source).resolve().is_relative_to(candidate)
+                        and Path(source).resolve(strict=True).is_relative_to(candidate)
                         for source in sources
                     ):
                         continue

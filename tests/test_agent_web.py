@@ -131,6 +131,41 @@ def test_scheduler_failure_is_durable_and_does_not_leak_the_slot(tmp_path, monke
         assert not calls
 
 
+def test_admission_stays_locked_until_background_slot_is_released(tmp_path, monkeypatch):
+    from flight_agent.background import BackgroundRunner
+
+    operation_done, release_slot = threading.Event(), threading.Event()
+
+    def delayed_release(self, operation):
+        try:
+            operation()
+        finally:
+            operation_done.set()
+            assert release_slot.wait(5)
+            self.slot.release()
+
+    monkeypatch.setattr(BackgroundRunner, "_run", delayed_release)
+    app, runtime, _, _ = make_agent_web(
+        tmp_path, [{"action": "answer", "text": "No execution."}]
+    )
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        try:
+            headers = auth(client)
+            assert client.post(
+                API, headers=headers, json={"message": "Explain RMSE."}
+            ).status_code == 202
+            assert operation_done.wait(5)
+
+            response = client.post(
+                API, headers=headers, json={"message": "Explain overshoot."}
+            )
+
+            assert response.status_code == 409
+            assert len(runtime.store.recent()) == 1
+        finally:
+            release_slot.set()
+
+
 def test_generic_and_workbench_execution_still_share_one_slot(tmp_path, monkeypatch):
     from flight_agent import web
     from flight_agent.upload_models import UploadRequest
