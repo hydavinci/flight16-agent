@@ -109,6 +109,97 @@ def test_cleanup_deletes_only_positive_v1_records(tmp_path, apply):
         assert v1.read_bytes() == before[v1]
 
 
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize("source_location", ["top_level", "current_task", "archived_task"])
+@pytest.mark.parametrize("source_path", ["candidate", "descendant", "symlink_alias"])
+def test_cleanup_preserves_recorded_source_project_inside_candidate(
+    tmp_path, apply, source_location, source_path
+):
+    root = tmp_path / "state"
+    root.mkdir()
+    candidate = root / ("a" * 32)
+    record = write_record(candidate, {})
+    source = candidate if source_path == "candidate" else candidate / "source"
+    source.mkdir(exist_ok=True)
+    sentinel = source / "model.slx"
+    sentinel.write_bytes(b"source project must survive")
+    recorded_source = source
+    if source_path == "symlink_alias":
+        recorded_source = tmp_path / "source-alias"
+        recorded_source.symlink_to(source, target_is_directory=True)
+    data = {
+        "project_root": str(tmp_path / "external-source"),
+        "task": {"scenario": "d1", "project": {"root": str(tmp_path / "external-source")}},
+    }
+    if source_location == "top_level":
+        data["project_root"] = str(recorded_source)
+    elif source_location == "current_task":
+        data["task"]["project"]["root"] = str(recorded_source)
+    else:
+        data["archived_tasks"] = [
+            None,
+            {"scenario": "d2", "project": {"root": str(recorded_source)}},
+        ]
+    record.write_text(json.dumps(data), encoding="utf-8")
+    before = record.read_bytes()
+
+    report = cleanup_module().cleanup_legacy_records(root, apply=apply)
+
+    assert sentinel.is_file()
+    assert sentinel.read_bytes() == b"source project must survive"
+    assert record.read_bytes() == before
+    assert report.v1 == [candidate.name]
+    assert report.deleted == []
+    assert report.unknown == []
+
+
+def test_cleanup_with_external_source_project_still_deletes_only_conversation(tmp_path):
+    root = tmp_path / "state"
+    root.mkdir()
+    source = tmp_path / "external-source"
+    source.mkdir()
+    sentinel = source / "model.slx"
+    sentinel.write_bytes(b"external source must survive")
+    record = write_record(
+        root / ("a" * 32),
+        {
+            "project_root": str(source),
+            "task": {"scenario": "d1", "project": {"root": str(source)}},
+            "archived_tasks": [{"scenario": "d2", "project": {"root": str(source)}}],
+        },
+    )
+
+    report = cleanup_module().cleanup_legacy_records(root, apply=True)
+
+    assert sentinel.read_bytes() == b"external source must survive"
+    assert not record.parent.exists()
+    assert report.v1 == [record.parent.name]
+    assert report.deleted == [record.parent.name]
+
+
+@pytest.mark.parametrize("source_path", ["invalid_path", "symlink_loop"])
+def test_cleanup_refuses_deletion_when_recorded_source_cannot_be_resolved(tmp_path, source_path):
+    root = tmp_path / "state"
+    root.mkdir()
+    source = tmp_path / "bad\0root"
+    if source_path == "symlink_loop":
+        source = tmp_path / "source-loop"
+        source.symlink_to(source)
+    record = write_record(
+        root / ("a" * 32),
+        {"project_root": str(source), "task": {"scenario": "d1"}},
+    )
+    sentinel = record.parent / "model.slx"
+    sentinel.write_bytes(b"unverified source must survive")
+
+    report = cleanup_module().cleanup_legacy_records(root, apply=True)
+
+    assert sentinel.is_file()
+    assert sentinel.read_bytes() == b"unverified source must survive"
+    assert report.v1 == [record.parent.name]
+    assert report.deleted == []
+
+
 @pytest.mark.parametrize(
     "payload", [b"{", b"\xff", b" " * 8_000_001], ids=["invalid-json", "invalid-utf8", "oversized"]
 )

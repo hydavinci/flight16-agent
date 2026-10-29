@@ -64,7 +64,8 @@ def cleanup_legacy_records(root: Path, *, apply: bool) -> CleanupReport:
         try:
             with path.open("rb") as stream:
                 content = stream.read(8_000_001)
-            kind = classify_record(json.loads(content)) if len(content) <= 8_000_000 else "unknown"
+            data = json.loads(content) if len(content) <= 8_000_000 else None
+            kind = classify_record(data)
         except (OSError, ValueError):
             kind = "unknown"
         if kind == "v2":
@@ -74,6 +75,25 @@ def cleanup_legacy_records(root: Path, *, apply: bool) -> CleanupReport:
         else:
             report.v1.append(candidate.name)
             if apply:
+                sources = [data.get("project_root")]
+                tasks = [
+                    data.get("task"),
+                    *(data.get("archived_tasks", [])
+                      if isinstance(data.get("archived_tasks"), list) else []),
+                ]
+                for task in tasks:
+                    if isinstance(task, dict) and isinstance(task.get("project"), dict):
+                        sources.append(task["project"].get("root"))
+                try:
+                    if any(
+                        isinstance(source, str)
+                        and source
+                        and Path(source).resolve().is_relative_to(candidate)
+                        for source in sources
+                    ):
+                        continue
+                except (OSError, ValueError, RuntimeError):
+                    continue
                 if candidate.is_symlink() or not candidate.resolve().is_relative_to(root):
                     report.unknown.append(candidate.name)
                     continue
