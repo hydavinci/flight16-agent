@@ -55,13 +55,19 @@ class Engine:
         assert nargout == 0 and Path(path) == self.support
 
     def which(self, name, *, nargout):
-        assert nargout == 1 and name in {"flight_agent_run_project", "flight_agent_local_stepinfo"}
+        assert nargout == 1 and name in {
+            "flight_agent_run_project", "flight_agent_local_stepinfo",
+            "flight_agent_local_linearize", "flight_agent_local_allmargin",
+        }
         if mode() == "helper_shadow":
             return "/another/flight_agent_run_project.m"
         return str(self.support / (name + ".m"))
 
     def feval(self, name, request_path, *, nargout):
         assert nargout == 0
+        if name in {"flight_agent_local_linearize", "flight_agent_local_allmargin"}:
+            self.frequency(name, request_path)
+            return
         if name == "flight_agent_local_stepinfo":
             self.stepinfo(request_path)
             return
@@ -282,3 +288,123 @@ class Engine:
         increment(Path("engine-quits.txt"))
         if mode() == "quit_error":
             raise EngineError("Engine cleanup failed")
+
+    def frequency(self, name, request_path):
+        execution = json.loads(Path(request_path).read_text())
+        canonical = json.loads(Path("request.json").read_text())
+        assert execution["inputs"] == canonical["inputs"]
+        operation = canonical["operation"]
+        assert name == f"flight_agent_local_{operation}"
+        inputs = execution["inputs"]
+        if mode() == "startup_error":
+            raise EngineError("license unavailable")
+        if mode() == "missing_receipt":
+            os._exit(0)
+        paths = ["raw.mat", "runtime-metadata.json", "linear-model.mat"]
+        metrics = {}
+        valid = True
+        if operation == "linearize":
+            assert (Path(execution["snapshot_root"]) / inputs["model"]).is_file()
+            actual_point = (
+                13 if mode() == "default_point_mismatch" else inputs["conditions"]["point_index"]
+            )
+            provenance = {
+                "id": execution["id"],
+                "request_sha256": execution["request_sha256"],
+                "model": inputs["model"],
+                "initializer": inputs["initializer"]["path"] if inputs["initializer"] else "",
+                "preparations": [item["entry"]["path"] for item in inputs["preparations"]],
+                "operating_point": {
+                    key: inputs["operating_point"][key] for key in ("mode", "path")
+                },
+                "feedback_sign": inputs["feedback_sign"],
+                "workspace_assertions": [
+                    {"path": item["path"], "condition": item["condition"], "actual": actual_point}
+                    for item in inputs["workspace_assertions"]
+                ],
+                "linearization_points": [
+                    {"block": "plant/in", "port": 1, "type": "openinput", "active": "on"},
+                    {"block": "plant/out", "port": 1, "type": "openoutput", "active": "on"},
+                ],
+                "siso": True,
+                "sample_time": 0.015,
+            }
+            if mode() == "inactive_points":
+                provenance["linearization_points"][0]["active"] = "off"
+            if mode() == "wrong_feedback":
+                provenance["feedback_sign"] *= -1
+            Path("linear-model.mat").write_bytes(
+                b"MATLAB 5.0 MAT-file, test-only linear model " + json.dumps(provenance).encode()
+            )
+            details = {"mode": operation, "linearization": provenance}
+        else:
+            assert canonical["input_evidence"][0] == inputs["linear_model"]
+            assert execution["linear_model_path"] == str(
+                Path.cwd() / "project" / "linear-model.mat"
+            )
+            Path("linear-model.mat").write_bytes(Path(execution["linear_model_path"]).read_bytes())
+            Path("producer-metadata.json").write_bytes(
+                (Path(execution["snapshot_root"]) / "producer-metadata.json").read_bytes()
+            )
+            paths.extend(["producer-metadata.json", "bode.png"])
+            Image.new("RGB", (8, 8), "white").save("bode.png")
+            metrics = {
+                "gain_margin": {"value": 6.0, "unit": "dB"},
+                "phase_margin": {"value": None, "special": "positive_infinity", "unit": "deg"},
+            }
+            details = {
+                "mode": operation, "closed_loop_stable": True, "frequency_unit": "rad/s",
+                "margin_fallback": False,
+                "gain_crossings": [
+                    {"margin": {"value": 12.0, "unit": "dB"},
+                     "frequency": {"value": 1.0, "unit": "rad/s"}},
+                    {"margin": {"value": 6.0, "unit": "dB"},
+                     "frequency": {"value": 2.0, "unit": "rad/s"}},
+                ],
+                "phase_crossings": [{
+                    "margin": metrics["phase_margin"].copy(),
+                    "frequency": {"value": None, "unit": "rad/s", "valid": False,
+                                  "special": "undefined", "reason": "No crossover"},
+                }],
+            }
+            if mode() == "negative_phase":
+                metrics["phase_margin"] = {"value": -5.0, "unit": "deg"}
+                details["phase_crossings"] = [
+                    {"margin": {"value": -5.0, "unit": "deg"},
+                     "frequency": {"value": 2.0, "unit": "rad/s"}},
+                    {"margin": {"value": 30.0, "unit": "deg"},
+                     "frequency": {"value": 4.0, "unit": "rad/s"}},
+                ]
+                details["closed_loop_stable"] = False
+            valid = mode() not in {"invalid_margin", "non_siso"}
+            if not valid:
+                metrics = {}
+            if mode() == "wrong_margin_unit":
+                metrics["gain_margin"]["unit"] = "deg"
+            if mode() == "nan_margin":
+                metrics["gain_margin"]["value"] = None
+            if mode() == "inconsistent_crossing":
+                metrics["gain_margin"]["value"] = 20.0
+            if mode() == "wrong_nominal_stability":
+                details["closed_loop_stable"] = -1
+            if mode() == "missing_plot":
+                Path("bode.png").unlink()
+            if mode() == "changed_linear_source":
+                artifact = canonical["inputs"]["linear_model"]
+                (Path.cwd().parent / artifact["path"]).write_bytes(b"changed")
+        Path("raw.mat").write_bytes(b"MATLAB 5.0 MAT-file, test-only frequency result")
+        runtime = {
+            "id": execution["id"], "request_sha256": execution["request_sha256"],
+            "snapshot_root": execution["snapshot_root"], "working_directory": str(Path.cwd()),
+            "matlab_version": "test-only-engine", "matlab_release": "test-only",
+            "products": [{"Name": "test-only", "Version": "test-only"}], "settings": {},
+        }
+        Path("runtime-metadata.json").write_text(json.dumps(runtime))
+        bridge = {
+            "id": execution["id"], "request_sha256": execution["request_sha256"],
+            "artifact_paths": paths, "output_evidence": True, "details": details,
+            "diagnostics": [] if valid else ["Unsupported or invalid test-only loop"],
+        }
+        if operation == "allmargin":
+            bridge.update(valid=valid, metrics=metrics)
+        Path("bridge.json").write_text(json.dumps(bridge))

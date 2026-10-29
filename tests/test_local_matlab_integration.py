@@ -298,3 +298,96 @@ def test_actual_bad_project_data_never_passes(
             assert payload["unmet_requirements"]
             assert damage == "multistep" or "steady" in json.dumps(payload).lower()
     print(f"ACTUAL invalid {damage}: status={done['status']}, no passing evaluation")
+
+
+@pytest.mark.parametrize("script_preparation", [False, True])
+def test_actual_linearize_preparation_workspace_visibility(
+    tmp_path, actual_backend, script_preparation,
+):
+    """Parent-owned real check: base -> script, reserved names, and last initializer wins."""
+    import matlab.engine
+
+    from flight_agent.verification.matlab_contracts import LocalMatlabRequest
+
+    root = tmp_path / "workspace-project"
+    root.mkdir()
+    (root / "choose_point.m").write_text(
+        "function choose_point(value)\n"
+        "assignin('base','point_index',value);\n"
+        "assignin('base','fa_request',-999);\nend\n"
+    )
+    (root / "prepare_script.m").write_text(
+        "prep_seen = point_index;\nassert(prep_seen == 7);\n"
+        "assert(isstruct(fa_request));\npoint_index = 8;\n"
+    )
+    initializer = (
+        "initializer_seen = point_index;\nassert(initializer_seen == 7);\n"
+        "assert(isstruct(fa_request));\npoint_index = 9;\n"
+        if not script_preparation else
+        "function initialize()\n"
+        "initializer_seen = evalin('base','point_index');\n"
+        "assert(initializer_seen == 8);\n"
+        "assignin('base','initializer_seen',initializer_seen);\n"
+        "assignin('base','point_index',9);\nend\n"
+    )
+    (root / "initialize.m").write_text(initializer)
+    (root / "README.md").write_text(
+        "Model: workspace_loop.slx\nInitializer: initialize.m\n"
+        "Preparation: choose_point(7).\n"
+        "Operating point: initialized current selected operating point.\n"
+        "feedback_sign = 1.\n"
+    )
+    engine = matlab.engine.start_matlab()
+    try:
+        engine.workspace["fixture_file"] = str(root / "workspace_loop.slx")
+        engine.eval(
+            "m='workspace_loop'; new_system(m); "
+            "add_block('simulink/Sources/In1',[m '/Input']); "
+            "add_block('simulink/Math Operations/Gain',[m '/Gain'],'Gain','point_index'); "
+            "add_block('simulink/Sinks/Out1',[m '/Output']); "
+            "add_line(m,'Input/1','Gain/1'); add_line(m,'Gain/1','Output/1'); "
+            "io(1)=linio([m '/Input'],1,'openinput'); "
+            "io(2)=linio([m '/Gain'],1,'openoutput'); setlinio(m,io); "
+            "save_system(m,fixture_file); close_system(m,0);",
+            nargout=0,
+        )
+    finally:
+        engine.quit()
+    project = discover_matlab_project(str(root))
+    entries = {item.path: item.model_dump(mode="json") for item in project.entries}
+    source = {"reference": "README.md", "quote": "Preparation: choose_point(7)."}
+    preparations = [{
+        "entry": {**entries["choose_point.m"], "arguments": [7]}, "source": source,
+    }]
+    conditions = {"point_index": 9, "initializer_seen": 8 if script_preparation else 7}
+    if script_preparation:
+        preparations.append({"entry": entries["prepare_script.m"], "source": source})
+        conditions["prep_seen"] = 7
+    request = LocalMatlabRequest.model_validate({
+        "id": "c" * 32, "operation": "linearize", "project": project.model_dump(mode="json"),
+        "inputs": {
+            "model": "workspace_loop.slx", "initializer": entries["initialize.m"],
+            "preparations": preparations,
+            "operating_point": {
+                "mode": "initialized", "source": {
+                    "reference": "README.md",
+                    "quote": "Operating point: initialized current selected operating point.",
+                },
+            },
+            "feedback_sign": 1,
+            "feedback_source": {"reference": "README.md", "quote": "feedback_sign = 1."},
+            "conditions": conditions,
+            "workspace_assertions": [
+                {"path": [name], "condition": name, "source": source} for name in conditions
+            ],
+        },
+    })
+    directory = tmp_path / "linearize"
+    result = actual_backend.execute(request, directory)
+    assert result.valid and result.execution_status == "completed", result.diagnostics
+    assert result.details["linearization"]["workspace_assertions"] == [
+        {"path": [name], "condition": name, "actual": value}
+        for name, value in conditions.items()
+    ]
+    assert discover_matlab_project(str(root)) == project
+    assert actual_backend.execute(request, directory, resume=True) == result

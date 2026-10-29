@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self
 
@@ -163,23 +164,132 @@ class StepinfoInput(_MatlabContract):
         return value
 
 
+class LocalSelectionSource(_MatlabContract):
+    reference: Nonempty
+    quote: Annotated[str, Field(min_length=1, max_length=20_000)]
+
+
+class OperatingPointSelection(_MatlabContract):
+    mode: Literal["initialized", "workspace"]
+    path: Annotated[list[str], Field(max_length=32)] = []
+    source: LocalSelectionSource
+
+    @model_validator(mode="after")
+    def explicit_selection(self) -> Self:
+        if bool(self.path) != (self.mode == "workspace"):
+            raise ValueError("Only workspace operating points require an explicit field path")
+        for name in self.path:
+            matlab_identifier(name)
+        return self
+
+
+class MatlabPreparation(_MatlabContract):
+    entry: MatlabEntry
+    source: LocalSelectionSource
+    argument_conditions: Annotated[list[Nonempty], Field(max_length=100)] = []
+
+
+class WorkspaceAssertion(_MatlabContract):
+    path: Annotated[list[str], Field(min_length=1, max_length=32)]
+    condition: Nonempty
+    source: LocalSelectionSource
+
+    @field_validator("path")
+    @classmethod
+    def explicit_fields(cls, value: list[str]) -> list[str]:
+        for name in value:
+            matlab_identifier(name)
+        return value
+
+
+class LinearizeInput(_MatlabContract):
+    model: Nonempty
+    initializer: MatlabEntry | None = None
+    project_file: str | None = None
+    working_directory: str | None = None
+    preparations: Annotated[list[MatlabPreparation], Field(max_length=10)] = []
+    operating_point: OperatingPointSelection
+    feedback_sign: Literal[-1, 1]
+    feedback_source: LocalSelectionSource
+    workspace_assertions: Annotated[list[WorkspaceAssertion], Field(max_length=20)] = []
+    conditions: dict[str, JsonValue] = {}
+    condition_sources: Annotated[
+        dict[str, LocalSelectionSource], Field(max_length=100)
+    ] = {}
+
+    def project_execution(self) -> ProjectExecutionInput:
+        return ProjectExecutionInput(
+            mode="simulink", model=self.model, initializer=self.initializer,
+            project_file=self.project_file, working_directory=self.working_directory,
+            conditions=self.conditions,
+        )
+
+    @model_validator(mode="after")
+    def explicit_execution(self) -> Self:
+        self.project_execution()
+        if not set(self.condition_sources) <= self.conditions.keys():
+            raise ValueError("Condition sources must refer to actual declared conditions")
+        if not self.conditions.keys() <= {
+            assertion.condition for assertion in self.workspace_assertions
+        }:
+            raise ValueError("Every claimed linearization condition requires a workspace assertion")
+        for assertion in self.workspace_assertions:
+            matlab_identifier(assertion.condition)
+            if assertion.condition not in self.conditions:
+                raise ValueError("Workspace assertion requires its exact declared condition")
+        for preparation in self.preparations:
+            names = preparation.argument_conditions
+            if names and (
+                len(names) != len(preparation.entry.arguments)
+                or any(name not in self.conditions for name in names)
+                or [self.conditions[name] for name in names] != preparation.entry.arguments
+            ):
+                raise ValueError("Preparation arguments differ from their declared conditions")
+        return self
+
+
+class AllmarginInput(_MatlabContract):
+    linear_model: OutputArtifact
+    conditions: dict[str, JsonValue] = {}
+
+    @field_validator("conditions")
+    @classmethod
+    def finite_conditions(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        _bounded_json(value)
+        return value
+
+
+LocalMatlabInput = ProjectExecutionInput | StepinfoInput | LinearizeInput | AllmarginInput
+
+
 class LocalMatlabRequest(_MatlabContract):
     id: RunId
-    operation: Literal["execute_project", "stepinfo"]
-    inputs: ProjectExecutionInput | StepinfoInput
+    operation: Literal["execute_project", "stepinfo", "linearize", "allmargin"]
+    inputs: LocalMatlabInput
     project: MatlabProjectDescriptor | None = None
     input_evidence: Annotated[list[OutputArtifact], Field(max_length=200)] = []
     timeout_seconds: Annotated[int, Field(ge=1, le=1800)] = 300
 
     @model_validator(mode="after")
     def matched_operation(self) -> Self:
+        if self.operation == "allmargin":
+            if not isinstance(self.inputs, AllmarginInput) or self.project is not None:
+                raise ValueError("allmargin requires AllmarginInput without a project")
+            return self
         if self.operation == "stepinfo":
             if not isinstance(self.inputs, StepinfoInput) or self.project is not None:
                 raise ValueError("stepinfo requires StepinfoInput")
             return self
-        if not isinstance(self.inputs, ProjectExecutionInput) or self.project is None:
+        if self.operation == "linearize":
+            if not isinstance(self.inputs, LinearizeInput) or self.project is None:
+                raise ValueError("linearize requires LinearizeInput and a project")
+            inputs = self.inputs.project_execution()
+            entries = [item.entry for item in self.inputs.preparations]
+        elif isinstance(self.inputs, ProjectExecutionInput) and self.project is not None:
+            inputs = self.inputs
+            entries = []
+        else:
             raise ValueError("execute_project requires ProjectExecutionInput and a project")
-        inputs = self.inputs
         if inputs.model is not None and inputs.model not in self.project.models:
             raise ValueError("Model must be an inventoried candidate")
         if (
@@ -187,7 +297,7 @@ class LocalMatlabRequest(_MatlabContract):
             and inputs.project_file not in self.project.project_files
         ):
             raise ValueError("Project file must be an inventoried candidate")
-        for entry in (inputs.entry, inputs.initializer):
+        for entry in (*entries, inputs.entry, inputs.initializer):
             if entry is not None and not any(
                 (entry.path, entry.kind, entry.signature) == (item.path, item.kind, item.signature)
                 for item in self.project.entries
@@ -259,6 +369,34 @@ class LocalMatlabStepinfoExecution(_MatlabContract):
     series_path: Nonempty
 
 
+class MatlabPreparedCall(_MatlabContract):
+    nargin: Annotated[int, Field(ge=-101, le=100)]
+    nargout: Annotated[int, Field(ge=0, le=100)]
+    arguments: list[str]
+
+
+class LocalMatlabLinearizeExecution(_MatlabContract):
+    id: RunId
+    request_sha256: Digest
+    snapshot_root: Nonempty
+    output_directory: Nonempty
+    inputs: LinearizeInput
+    project_paths: list[str]
+    initializer: MatlabPreparedCall
+    preparations: list[MatlabPreparedCall]
+
+
+class LocalMatlabAllmarginExecution(_MatlabContract):
+    id: RunId
+    request_sha256: Digest
+    snapshot_root: Nonempty
+    output_directory: Nonempty
+    inputs: AllmarginInput
+    linear_model_path: Nonempty
+    producer_id: RunId
+    producer_request_sha256: Digest
+
+
 class MatlabRuntimeMetadata(_MatlabContract):
     id: RunId
     request_sha256: Digest
@@ -278,7 +416,7 @@ class MatlabRuntimeMetadata(_MatlabContract):
 
 
 class MatlabExecutionMetadata(MatlabRuntimeMetadata):
-    inputs: ProjectExecutionInput | StepinfoInput
+    inputs: LocalMatlabInput
     input_evidence: list[OutputArtifact] = []
     conditions: dict[str, JsonValue]
     input_provenance: Literal["canonical_request"]
@@ -337,4 +475,80 @@ class MatlabStepinfoOutput(MatlabProjectOutput):
                     raise ValueError("stepinfo metrics cannot be negative")
         elif not self.diagnostics or any(metric.valid for metric in self.metrics.values()):
             raise ValueError("Invalid stepinfo requires diagnostics and no valid metrics")
+        return self
+
+
+class LinearizationPoint(_MatlabContract):
+    block: Nonempty
+    port: Annotated[int, Field(ge=1)]
+    type: Literal["openinput", "openoutput"]
+    active: Literal["on"]
+
+
+class MatlabLinearizeOutput(MatlabProjectOutput):
+    @model_validator(mode="after")
+    def actual_linearization(self) -> Self:
+        details = self.details.get("linearization")
+        if not isinstance(details, dict):
+            raise ValueError("Missing runtime linearization provenance")
+        points = details.get("linearization_points")
+        if not isinstance(points, list) or len(points) != 2:
+            raise ValueError("Only the existing active SISO preset points are supported")
+        selected = [LinearizationPoint.model_validate(point) for point in points]
+        if sorted(point.type for point in selected) != ["openinput", "openoutput"]:
+            raise ValueError("Only the existing active SISO preset points are supported")
+        return self
+
+
+class MarginCrossing(_MatlabContract):
+    margin: MetricValue
+    frequency: MetricValue
+
+    @model_validator(mode="after")
+    def frequency_units(self) -> Self:
+        if self.frequency.unit != "rad/s" or (
+            self.frequency.value is not None and self.frequency.value < 0
+        ):
+            raise ValueError("Crossing frequency must be nonnegative rad/s")
+        if not self.frequency.valid and (
+            self.margin.special is None or self.frequency.special != "undefined"
+        ):
+            raise ValueError("Only an unbounded margin may lack a crossover frequency")
+        return self
+
+
+class MatlabAllmarginOutput(MatlabProjectOutput):
+    valid: bool
+    metrics: dict[Literal["gain_margin", "phase_margin"], MetricValue]
+
+    @model_validator(mode="after")
+    def measured_metrics(self) -> Self:
+        if not self.valid:
+            if not self.diagnostics or any(metric.valid for metric in self.metrics.values()):
+                raise ValueError("Invalid allmargin requires diagnostics and no valid metrics")
+            return self
+        if (
+            set(self.metrics) != {"gain_margin", "phase_margin"}
+            or type(self.details.get("closed_loop_stable")) is not bool
+            or self.details.get("frequency_unit") != "rad/s"
+        ):
+            raise ValueError("Valid allmargin requires both margins and nominal stability")
+        for name, metric in self.metrics.items():
+            unit, field = (
+                ("dB", "gain_crossings") if name == "gain_margin" else ("deg", "phase_crossings")
+            )
+            values = self.details.get(field)
+            if not isinstance(values, list) or not values:
+                raise ValueError("Valid allmargin requires every crossing")
+            crossings = [MarginCrossing.model_validate(value) for value in values]
+            margins = [metric, *(item.margin for item in crossings)]
+            if any(not item.valid or item.unit != unit for item in margins):
+                raise ValueError("allmargin requires valid metrics in the declared units")
+            numbers = [
+                item.value if item.value is not None else
+                math.inf if item.special == "positive_infinity" else -math.inf
+                for item in margins
+            ]
+            if numbers[0] != min(numbers[1:]):
+                raise ValueError("Margin metric differs from the least retained crossing")
         return self

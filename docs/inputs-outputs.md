@@ -100,6 +100,62 @@ prepared-project/
 完整模型见 [matlab_contracts.py](../src/flight_agent/verification/matlab_contracts.py)。
 Worker 准备契约见 [D1 参考](d1-agent.md)，离线清单与数据格式见 [D2 参考](d2-agent.md)。
 
+### 本机线性化与裕度
+
+`LinearizeInput` 的必填项是 `model`、`operating_point`、`feedback_sign`、
+`feedback_source`。以下是字段契约，不是工程默认值：
+
+| 字段 | 契约 |
+|---|---|
+| `model` | 已发现的 `.slx/.mdl` 相对路径 |
+| `initializer` | 已发现 `MatlabEntry` 或 null，文档指定时必须保留 |
+| `project_file`、`working_directory` | 已有工程文件/目录或 null |
+| `preparations` | 最多 10 项 `{entry, source, argument_conditions: []}`，先于初始化执行 |
+| `operating_point` | `{mode: "initialized" 或 "workspace", path: [], source}`；workspace 必须非空字段路径 |
+| `feedback_sign`、`feedback_source` | 明确 `1` 或 `-1` 及原文来源，无默认符号 |
+| `workspace_assertions` | 最多 20 项 `{path: ["变量", "字段"], condition: "条件键", source}` |
+| `conditions`、`condition_sources` | 有来源的 JSON 条件，以及可选 `{条件键: source}` 原文映射 |
+
+`source` 是 `{reference, quote}`：reference 为当前工程 `documentation` /
+`workspace_sources` 的 `path`、归属设置的 `location`，或已授权用户消息的 reference；
+quote 必须是其原文片段。`workspace_sources` 仅静态保留向 base 写入变量的已有 `.m`
+源码片段，每文件至多 16000 字符，截断时有说明，不代表执行或有效值。
+`MatlabEntry` 沿用 `path/kind/arguments/signature/evidence`。准备调用的 JSON 参数须有明确
+原始调用来源，或逐项 `argument_conditions` 与已来源化的条件值相等；使用准备入口时
+必须提供初始化后的实际工作区断言；每个声明的 conditions 键都必须有对应断言，
+不能仅给默认工作点贴标签。工作区字段只支持标识符与结构体字段，不支持表达式。
+
+`matlab_linearize` 的输出 `details.linear_model` 为
+`{id:"linear_model", node_id, path:"calls/<call_id>/published/linear-model.mat", sha256, size}`。
+`details.linearization.workspace_assertions` 是数组，
+每项 `{path, condition, actual}`；actual 必须等于 `conditions[condition]`。
+同层保留 `model/initializer/preparations/operating_point/feedback_sign/linearization_points/siso/sample_time`，
+以及生产请求 `id/request_sha256`；MAT 自带同一 provenance，元数据保留 canonical 输入。
+
+`AllmarginInput` 只有 `{linear_model: OutputArtifact, conditions: {}}`；
+draft 中不手填工件，而写：
+
+```json
+{
+  "id": "margins",
+  "tool": "matlab_allmargin",
+  "tool_version": "1",
+  "depends_on": ["linearize"],
+  "bindings": {
+    "linear_model": {"node_id": "linearize", "path": ["details", "linear_model"]}
+  },
+  "inputs": {"conditions": {}}
+}
+```
+
+工况必须与生产者和判据完全一致。实际执行还自动验证同一生产者发布的 `metadata.json`。
+有效观测为 `gain_margin`（dB）、`phase_margin`（deg），各取全部交越中的最小裕度；
+`value:null` 的正/负无穷通过 `special:"positive_infinity"/"negative_infinity"` 明确保留。
+输出 details 保留 `gain_crossings/phase_crossings`（每项 `{margin:MetricValue, frequency:MetricValue}`）、
+`frequency_unit:"rad/s"`、`closed_loop_stable`、`margin_fallback`、`valid`。
+无交越时可保留无穷裕度及 undefined 频率；未定义裕度不能形成有效观测。
+无效结果保留诊断和可用证据。名义不稳定、负裕度不会被改写为有效性失败或正数。
+
 ## 判据与确认
 
 每条判据必须绑定生产节点、指标、比较符、有限数值阈值、单位、工况和原文来源。

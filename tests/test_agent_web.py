@@ -203,6 +203,49 @@ def test_output_binding_correction_still_requires_confirmation_before_execution(
         assert len(runtime.store.recent()) == 1
 
 
+def test_external_analysis_output_permission_is_proposed_before_confirmed_write(tmp_path):
+    broken = draft_data()
+    corrected = draft_data()
+    corrected["allowed_effects"].append("write_delivery")
+    app, _, calls, _ = make_agent_web(tmp_path, [
+        {"action": "plan", "text": "Analyze only.", "plan": broken},
+        {"action": "plan", "text": "Confirm external evidence storage.", "plan": corrected},
+    ])
+    root = tmp_path / "external"
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = auth(client)
+        identifier = post_message(client, headers, output_root=str(root))
+        record = pending(client, identifier, headers)
+        task = record["task"]
+        assert record["error"] is None
+        assert "write_delivery" in task["baseline"]["allowed_effects"]
+        assert not task["baseline"]["confirmed"]
+        assert task["calls"] == []
+        assert not calls
+        assert not root.exists()
+        endpoint = f"{API}/{identifier}/confirm"
+        assert client.post(
+            endpoint, headers=headers, json={"version": 2, "trusted": True}
+        ).status_code == 409
+        assert client.post(
+            endpoint, headers=headers, json={"version": 1, "trusted": False}
+        ).status_code == 422
+        assert not root.exists()
+        assert not calls
+        assert client.post(
+            endpoint, headers=headers, json={"version": 1, "trusted": True}
+        ).status_code == 202
+        done = wait_for_conversation(
+            client, identifier, headers, lambda item: item["status"] == "completed"
+        )
+        assert len(calls) == 1
+        assert (root / f"flight-agent-{task['id']}").is_dir()
+        assert done["task"]["baseline"]["requirements"]["delivery_formats"] == []
+        assert [node["tool"] for node in done["task"]["nodes"]] == ["offline_rmse"]
+        assert done["task"]["result"]["evaluation"] is None
+        assert done["task"]["result"]["observations"][0]["value"] == pytest.approx(2**0.5)
+
+
 def test_generic_api_confirmation_uses_v2_and_rejects_stale_or_untrusted_actions(tmp_path):
     app, _, calls, _ = make_agent_web(
         tmp_path,

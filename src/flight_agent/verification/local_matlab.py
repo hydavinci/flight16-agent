@@ -21,13 +21,20 @@ from .artifacts import MAX_ARTIFACT_BYTES, describe_artifact
 from .intake import safe_directory
 from .matlab import MAX_LOG_BYTES, MAX_RESULT_BYTES
 from .matlab_contracts import (
+    AllmarginInput,
+    LinearizeInput,
+    LocalMatlabAllmarginExecution,
     LocalMatlabCheckpoint,
     LocalMatlabExecution,
+    LocalMatlabLinearizeExecution,
     LocalMatlabRequest,
     LocalMatlabResult,
     LocalMatlabStepinfoExecution,
+    MatlabAllmarginOutput,
     MatlabEntry,
     MatlabExecutionMetadata,
+    MatlabLinearizeOutput,
+    MatlabPreparedCall,
     MatlabProjectDescriptor,
     MatlabSeriesPair,
     MatlabStepinfoOutput,
@@ -66,7 +73,8 @@ def _read_model(path: Path, model: type[T], limit: int = MAX_RESULT_BYTES) -> T:
 
 
 def _signature(
-    entry: MatlabEntry, project: MatlabProjectDescriptor | None = None
+    entry: MatlabEntry, project: MatlabProjectDescriptor | None = None, *,
+    allow_varargin: bool = False,
 ) -> tuple[int, int]:
     if entry.kind == "script":
         return 0, 0
@@ -82,6 +90,7 @@ def _signature(
         raise ValueError(f"Unsupported existing function signature: {entry.path}")
     names = re.findall(identifier, match["inputs"] or "")
     returned = re.findall(identifier, match["outputs"] or "")
+    variadic = allow_varargin and bool(names) and names[-1] == "varargin"
     defaults = project.settings.get("function_defaults", []) if project else []
     defaulted = isinstance(defaults, list) and any(
         isinstance(record, dict)
@@ -92,24 +101,39 @@ def _signature(
         for record in defaults
     )
     if (
-        "varargin" in names
+        ("varargin" in names and not variadic)
         or "varargout" in returned
         or len(set(names)) != len(names)
         or len(set(returned)) != len(returned)
         or max(len(names), len(returned)) > 100
-        or len(entry.arguments) > len(names)
-        or (len(names) != len(entry.arguments) and not defaulted)
+        or (not variadic and len(entry.arguments) > len(names))
+        or (not variadic and len(names) != len(entry.arguments) and not defaulted)
+        or (variadic and len(entry.arguments) < len(names) - 1)
         or any(
             part.startswith(("+", "@")) or part == "private" for part in Path(entry.path).parts[:-1]
         )
     ):
         raise ValueError(f"Unsupported existing function signature/arguments: {entry.path}")
-    return len(names), len(returned)
+    return -len(names) if variadic else len(names), len(returned)
 
 
 def _execution_request(
     request: LocalMatlabRequest, directory: Path
-) -> LocalMatlabExecution | LocalMatlabStepinfoExecution:
+) -> (
+    LocalMatlabExecution | LocalMatlabStepinfoExecution |
+    LocalMatlabLinearizeExecution | LocalMatlabAllmarginExecution
+):
+    if isinstance(request.inputs, AllmarginInput):
+        metadata = _read_model(
+            directory / "project" / "producer-metadata.json", MatlabExecutionMetadata
+        )
+        return LocalMatlabAllmarginExecution(
+            id=request.id, request_sha256=fingerprint(request.model_dump(mode="json")),
+            snapshot_root=str(directory / "project"), output_directory=str(directory),
+            inputs=request.inputs,
+            linear_model_path=str(directory / "project" / "linear-model.mat"),
+            producer_id=metadata.id, producer_request_sha256=metadata.request_sha256,
+        )
     if isinstance(request.inputs, StepinfoInput):
         return LocalMatlabStepinfoExecution(
             id=request.id,
@@ -119,8 +143,31 @@ def _execution_request(
             inputs=request.inputs,
             series_path=str(directory / "project" / "series.json"),
         )
-    assert isinstance(request.inputs, ProjectExecutionInput) and request.project is not None
+    assert isinstance(request.inputs, (ProjectExecutionInput, LinearizeInput))
+    assert request.project is not None
     snapshot = directory / "project"
+    if isinstance(request.inputs, LinearizeInput):
+        def prepared(entry: MatlabEntry | None) -> MatlabPreparedCall:
+            nargin, nargout = (
+                _signature(entry, request.project, allow_varargin=True) if entry else (0, 0)
+            )
+            return MatlabPreparedCall(
+                nargin=nargin, nargout=nargout,
+                arguments=[json.dumps(value, ensure_ascii=False, allow_nan=False)
+                           for value in entry.arguments] if entry else [],
+            )
+        return LocalMatlabLinearizeExecution(
+            id=request.id, request_sha256=fingerprint(request.model_dump(mode="json")),
+            snapshot_root=str(snapshot), output_directory=str(directory), inputs=request.inputs,
+            project_paths=sorted(
+                {
+                    str(snapshot),
+                    *(str((snapshot / item.path).parent) for item in request.project.files),
+                }
+            ),
+            initializer=prepared(request.inputs.initializer),
+            preparations=[prepared(item.entry) for item in request.inputs.preparations],
+        )
     entry, initializer = request.inputs.entry, request.inputs.initializer
     entry_nargin, entry_nargout = _signature(entry, request.project) if entry else (0, 0)
     initializer_nargin, initializer_nargout = (
@@ -162,6 +209,30 @@ def _stepinfo_source(request: LocalMatlabRequest, directory: Path) -> Path:
     if series.input.time_unit != "s" or series.response.time_unit != "s":
         raise ValueError("stepinfo requires actual normalized time units in seconds")
     return path
+
+
+def _linear_model_source(request: LocalMatlabRequest, directory: Path) -> tuple[Path, Path]:
+    assert isinstance(request.inputs, AllmarginInput)
+    if len(request.input_evidence) != 2 or request.input_evidence[0] != request.inputs.linear_model:
+        raise ValueError("allmargin requires exact linear model and producer metadata evidence")
+    model, metadata = request.input_evidence
+    match = re.fullmatch(r"calls/([a-f0-9]{32})/published/linear-model\.mat", model.path)
+    if (
+        not match or model.id != "linear_model" or model.node_id is None
+        or metadata.id != "metadata" or metadata.node_id != model.node_id
+        or metadata.path != f"calls/{match[1]}/published/metadata.json"
+    ):
+        raise ValueError("allmargin requires the published linearize producer evidence")
+    model_path = verify_evidence(directory.parent, model)
+    metadata_path = verify_evidence(directory.parent, metadata)
+    producer = _read_model(metadata_path, MatlabExecutionMetadata)
+    if (
+        producer.id != match[1] or not isinstance(producer.inputs, LinearizeInput)
+        or producer.conditions != request.inputs.conditions
+        or producer.inputs.conditions != request.inputs.conditions
+    ):
+        raise ValueError("Linear model producer identity/conditions differ")
+    return model_path, metadata_path
 
 
 def _output_bounds(directory: Path) -> None:
@@ -258,12 +329,78 @@ def _verify_result(request: LocalMatlabRequest, result: LocalMatlabResult, direc
             or result.diagnostics != measured.diagnostics
         ):
             raise ValueError("stepinfo metrics/settings differ from the confirmed evidence")
+    if isinstance(request.inputs, LinearizeInput):
+        measured_linear = _read_model(directory / "bridge.json", MatlabLinearizeOutput)
+        provenance = measured_linear.details["linearization"]
+        assert isinstance(provenance, dict)
+        expected_assertions = [
+            {"path": item.path, "condition": item.condition,
+             "actual": request.inputs.conditions[item.condition]}
+            for item in request.inputs.workspace_assertions
+        ]
+        if (
+            measured_linear.id != request.id
+            or measured_linear.request_sha256 != result.request_sha256
+            or provenance.get("id") != request.id
+            or provenance.get("request_sha256") != result.request_sha256
+            or provenance.get("model") != request.inputs.model
+            or provenance.get("operating_point") != {
+                "mode": request.inputs.operating_point.mode,
+                "path": request.inputs.operating_point.path,
+            }
+            or provenance.get("feedback_sign") != request.inputs.feedback_sign
+            or provenance.get("workspace_assertions") != expected_assertions
+            or provenance.get("preparations") != [
+                item.entry.path for item in request.inputs.preparations
+            ]
+            or provenance.get("initializer") != (
+                request.inputs.initializer.path if request.inputs.initializer else ""
+            )
+            or provenance.get("siso") is not True
+            or result.details.get("linearization") != provenance
+            or "linear-model.mat" not in paths
+            or not result.valid
+        ):
+            raise ValueError("Linearization selections differ from actual runtime provenance")
+    if isinstance(request.inputs, AllmarginInput):
+        if not {"linear-model.mat", "producer-metadata.json", "bode.png"} <= paths:
+            raise ValueError("Missing allmargin linear model/provenance/plot evidence")
+        for source, name in zip(
+            request.input_evidence, ("linear-model.mat", "producer-metadata.json"), strict=True
+        ):
+            for root in (directory, directory / "project"):
+                copied = describe_artifact(root, name)
+                if (copied.sha256, copied.size) != (source.sha256, source.size):
+                    raise ValueError("allmargin source differs from its input evidence")
+        measured_margin = _read_model(directory / "bridge.json", MatlabAllmarginOutput)
+        if (
+            measured_margin.id != request.id
+            or measured_margin.request_sha256 != result.request_sha256
+            or measured_margin.valid != result.valid
+            or measured_margin.details.get("mode") != "allmargin"
+            or result.details.get("metrics") != {
+                name: metric.model_dump(mode="json")
+                for name, metric in measured_margin.metrics.items()
+            }
+            or any(
+                result.details.get(key) != value for key, value in measured_margin.details.items()
+            )
+            or measured_margin.diagnostics != result.diagnostics
+        ):
+            raise ValueError("allmargin metrics differ from verified bridge evidence")
     if "series.json" in paths:
         expected = next(
             item.model_dump(mode="json") for item in result.artifacts if item.path == "series.json"
         )
         if result.details.get("series") != expected:
             raise ValueError("Series reference does not match its artifact")
+    if isinstance(request.inputs, LinearizeInput):
+        expected_model = next(
+            item.model_dump(mode="json")
+            for item in result.artifacts if item.path == "linear-model.mat"
+        )
+        if result.details.get("linear_model") != expected_model:
+            raise ValueError("Linear model reference does not match its artifact")
     if (
         isinstance(request.inputs, ProjectExecutionInput)
         and request.inputs.input_signal is not None
@@ -379,11 +516,18 @@ class LocalMatlabBackend:
         _write_json(directory / "state.json", state.model_dump(mode="json"))
         status: Literal["failed", "unknown", "interrupted"] = "failed"
         try:
-            if isinstance(request.inputs, ProjectExecutionInput):
+            if isinstance(request.inputs, (ProjectExecutionInput, LinearizeInput)):
                 assert request.project is not None
-                for entry in (request.inputs.entry, request.inputs.initializer):
+                entries = (
+                    [item.entry for item in request.inputs.preparations]
+                    if isinstance(request.inputs, LinearizeInput) else [request.inputs.entry]
+                )
+                for entry in (*entries, request.inputs.initializer):
                     if entry is not None:
-                        _signature(entry, request.project)
+                        _signature(
+                            entry, request.project,
+                            allow_varargin=isinstance(request.inputs, LinearizeInput),
+                        )
                         if entry.kind == "script" and any(
                             item.path == Path(entry.path).with_suffix(".p").as_posix()
                             for item in request.project.files
@@ -391,17 +535,26 @@ class LocalMatlabBackend:
                             raise ValueError(
                                 f"Unsupported selected script with same-stem P-file: {entry.path}"
                             )
-            else:
+            elif isinstance(request.inputs, StepinfoInput):
                 _stepinfo_source(request, directory)
+            else:
+                _linear_model_source(request, directory)
             available = self.availability()
             if available.state != "available":
                 raise ValueError(available.reason)
             if request.project is not None:
                 snapshot_matlab_project(request.project, directory / "project")
-            else:
+            elif isinstance(request.inputs, StepinfoInput):
                 source = _stepinfo_source(request, directory)
                 publish_evidence(directory / "project", "series.json", source.read_bytes())
                 _stepinfo_source(request, directory)
+            else:
+                for source, name in zip(
+                    _linear_model_source(request, directory),
+                    ("linear-model.mat", "producer-metadata.json"), strict=True,
+                ):
+                    publish_evidence(directory / "project", name, source.read_bytes())
+                _linear_model_source(request, directory)
             execution = _execution_request(request, directory)
             _write_json(directory / "execution.json", execution.model_dump(mode="json"))
             _output_bounds(directory)
@@ -448,6 +601,8 @@ class LocalMatlabBackend:
                 raise ValueError("Source project changed during execution; review required")
             if isinstance(request.inputs, StepinfoInput):
                 _stepinfo_source(request, directory)
+            if isinstance(request.inputs, AllmarginInput):
+                _linear_model_source(request, directory)
             return self._finish(directory, state, result, receipt=True)
         except (OSError, ValueError) as exc:
             result = LocalMatlabResult(

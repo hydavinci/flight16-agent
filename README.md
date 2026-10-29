@@ -29,14 +29,14 @@ Python 负责授权、证据校验、判据比较与报告生成。
 
 | 使用方式 | 已支持 | 运行位置 |
 |---|---|---|
-| 本机工程 | 已有 `.m` 入口、Simulink 模型、独立 `stepinfo` | Agent/Web 主机 |
+| 本机工程 | 已有入口/模型、`stepinfo`、线性化与 `allmargin` | Agent/Web 主机 |
 | Worker 工程 | 已准备工程的阶跃响应、开环稳定裕度 | MATLAB Worker |
 | 离线诊断 | 已登记 JSON 数据的只读分析 | Agent/Web 主机 |
 
 本机工程无需启动 Worker。知识问答不要求工程目录，也不触发 MATLAB 计算。
 大模型可使用 OpenAI 兼容 API，目录工作流也支持本机 Copilot CLI。
 
-**当前边界：**本机尚未注册线性化与 `allmargin` 裕度工具；
+**当前边界：**本机线性化只使用有来源的工作点与已有激活 SISO 分析点；
 Worker 资源与本机资源不能直接互换。Agent 只调用已注册能力，不执行任意生成的 MATLAB 命令，
 也不会自动修改模型、补建激励或编译依赖。
 
