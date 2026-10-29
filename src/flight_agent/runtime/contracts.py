@@ -3,7 +3,7 @@ import json
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, JsonValue, field_validator, model_validator
+from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from ..models import Contract, Nonempty
 
@@ -14,6 +14,24 @@ Version = Annotated[str, Field(min_length=1, max_length=100)]
 Effect = Literal[
     "read_only", "execute_project", "write_delivery", "write_candidate", "adopt_candidate"
 ]
+
+
+class MutableRecord(Contract):
+    model_config = ConfigDict(extra="forbid", frozen=False, validate_assignment=True)
+
+
+class ToolCall(MutableRecord):
+    id: RunId
+    node_id: str
+    tool: Name
+    tool_version: Version | None = None
+    baseline_version: int
+    status: Literal["pending", "running", "completed", "failed", "interrupted"] = "running"
+    started_at: str
+    finished_at: str | None = None
+    inputs: dict[str, JsonValue] = {}
+    output: dict[str, JsonValue] = {}
+    error: str | None = None
 
 
 def fingerprint(value: object) -> str:

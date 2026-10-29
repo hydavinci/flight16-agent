@@ -6,8 +6,8 @@ from docx import Document
 from playwright.sync_api import expect, sync_playwright
 
 from flight_agent.runtime.capabilities import CapabilityRegistry
+from flight_agent.verification.diagnostic_planner import DiagnosticReviewer
 from flight_agent.verification.local_matlab import LocalMatlabBackend
-from flight_agent.verification.planner import VerificationPlanner
 from flight_agent.verification.plugins import register_builtin_plugins
 from tests.agent_helpers import delivery_draft, make_agent_web
 from tests.helpers import serve_app, tool_message
@@ -28,7 +28,7 @@ def local_web(tmp_path, monkeypatch):
     app, runtime, calls, _ = make_agent_web(tmp_path, [])
     register_builtin_plugins(
         CapabilityRegistry(agent_mode=True), runtime.resources,
-        backend=None, planner=VerificationPlanner(),
+        backend=None, diagnostic_reviewer=DiagnosticReviewer(),
     )
     return app, runtime, calls
 

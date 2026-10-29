@@ -2,7 +2,7 @@ import re
 from pathlib import PurePosixPath
 from typing import Annotated, Literal, Self
 
-from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import Field, JsonValue, field_validator, model_validator
 
 from ..models import Contract, FiniteNumber, Nonempty
 from ..runtime.agent_contracts import (
@@ -13,6 +13,8 @@ from ..runtime.agent_contracts import (
     InvocationSpec,
 )
 from ..runtime.contracts import AnalysisRun, AnalysisSpec, Name, Version
+from ..runtime.contracts import MutableRecord as MutableRecord
+from ..runtime.contracts import ToolCall as ToolCall
 from ..runtime.intents import WorkflowRequest
 from ..runtime.observations import CapabilityOutcome, OutputArtifact, TaskResult
 from ..runtime.observations import MetricValue as MetricValue
@@ -360,30 +362,12 @@ class EvidenceExplanation(Contract):
     evidence: Annotated[list[str], Field(min_length=1, max_length=4)]
 
 
-class MutableRecord(Contract):
-    model_config = ConfigDict(extra="forbid", frozen=False, validate_assignment=True)
-
-
 class ExecutionNode(MutableRecord):
     id: NodeIdentifier
     tool: ToolName
     depends_on: list[str] = []
     inputs: dict[str, JsonValue] = {}
     status: NodeStatus = "pending"
-    error: str | None = None
-
-
-class ToolCall(MutableRecord):
-    id: Identifier
-    node_id: str
-    tool: ToolName
-    tool_version: Version | None = None
-    baseline_version: int
-    status: NodeStatus = "running"
-    started_at: str
-    finished_at: str | None = None
-    inputs: dict[str, JsonValue] = {}
-    output: dict[str, JsonValue] = {}
     error: str | None = None
 
 

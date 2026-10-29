@@ -11,7 +11,12 @@ from ...runtime.contracts import Name, Version
 from ...runtime.observations import CapabilityOutcome, Finding, OutputArtifact, ResultTable
 from ...runtime.resources import AgentContract, ResourceReference
 from ..agent_runtime import AgentContext, ExecutionUncertain
-from ..diagnosis_contracts import DiagnosisBaseline, DiagnosisProposal, HypothesisAssessment
+from ..diagnosis_contracts import (
+    DiagnosisBaseline,
+    DiagnosisProposal,
+    DiagnosticRunState,
+    HypothesisAssessment,
+)
 from ..diagnostic_data import (
     DiagnosticManifest,
     DiagnosticProject,
@@ -19,7 +24,7 @@ from ..diagnostic_data import (
     inspect_diagnostic_project,
 )
 from ..diagnostic_engine import DiagnosticEngine
-from ..planner import VerificationPlanner
+from ..diagnostic_planner import DiagnosticReviewer
 
 
 class DiagnosisInput(AgentContract):
@@ -71,7 +76,7 @@ def _validate_plan(plan: AgentPlan, node: AgentNode) -> None:
 
 
 def diagnostic_capability(
-    planner: VerificationPlanner,
+    planner: DiagnosticReviewer,
 ) -> Capability[AgentContext, DiagnosisInput, CapabilityOutcome]:
     def execute(
         context: AgentContext,
@@ -79,8 +84,6 @@ def diagnostic_capability(
         *,
         resume: bool,
     ) -> CapabilityOutcome:
-        from ..contracts import DiagnosisTask
-
         context.scope.authorize("read_only")
         resource = context.resource("diagnostic_data")
         if resource not in context.scope.resources:
@@ -91,7 +94,7 @@ def diagnostic_capability(
         if resume:
             if saved is None or "task" not in saved:
                 raise ExecutionUncertain("Original diagnostic checkpoint is missing")
-            original = DiagnosisTask.model_validate(saved["task"])
+            original = DiagnosticRunState.model_validate(saved["task"])
             project = original.project
             if (
                 project.root != resource.locator
@@ -119,7 +122,7 @@ def diagnostic_capability(
             budget=inputs.proposal.budget,
             confirmed=True,
         )
-        plan = engine._plan(
+        plan = engine.plan(
             baseline,
             project,
             inputs.proposal.analyses,
@@ -127,14 +130,13 @@ def diagnostic_capability(
             1,
             [],
         )
-        task = DiagnosisTask(
+        task = DiagnosticRunState(
             id=context.call_id,
             project=project,
             baseline=baseline,
-            proposal=inputs.proposal,
             result_directory=str(directory),
             plan_revisions=[plan],
-            nodes=engine._nodes(plan),
+            nodes=engine.nodes(plan),
             assessments=[
                 HypothesisAssessment(
                     hypothesis_id=item.id,
@@ -151,9 +153,7 @@ def diagnostic_capability(
                     "id",
                     "project",
                     "baseline",
-                    "proposal",
                     "result_directory",
-                    "output_root",
                 )
             ) or original.plan_revisions[:1] != [plan]:
                 raise ValueError("Diagnostic checkpoint differs from its confirmed invocation")
@@ -161,7 +161,7 @@ def diagnostic_capability(
             if task.termination and task.termination.reason == "unknown_execution":
                 task.termination = None
 
-        def checkpoint(current: DiagnosisTask) -> None:
+        def checkpoint(current: DiagnosticRunState) -> None:
             context.save_checkpoint({"task": current.model_dump(mode="json")})
 
         checkpoint(task)

@@ -34,6 +34,7 @@ from .verification.agent_runtime import AgentContext, AgentExecutor
 from .verification.backend import AnalysisBackend, RemoteSimulinkBackend
 from .verification.compat import resolve_location
 from .verification.coordinator import EngineeringRuntime
+from .verification.diagnostic_planner import DiagnosticReviewer
 from .verification.local_matlab import LocalMatlabBackend
 from .verification.planner import VerificationPlanner
 from .verification.plugins import register_builtin_plugins
@@ -93,7 +94,8 @@ def create_web_app(
             backend = legacy.backend
         tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
         register_builtin_plugins(
-            tools, resources, backend=backend, planner=legacy.planner, local_backend=local_backend,
+            tools, resources, backend=backend,
+            diagnostic_reviewer=DiagnosticReviewer(), local_backend=local_backend,
         )
         if verification_runtime is None:
             engineering_runtime = EngineeringRuntime(

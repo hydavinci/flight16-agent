@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from flight_agent.config import ModelSettings, create_model
 from flight_agent.verification.contracts import PlanProposal
+from flight_agent.verification.diagnostic_planner import DiagnosticReviewer
 from flight_agent.verification.planner import VerificationPlanner
 from flight_agent.web import create_web_app
 from tests.test_verification_runtime import proposal, runtime_fixture
@@ -102,7 +103,7 @@ def test_copilot_losslessly_shares_catalog_schemas_and_reduces_request_size(
 
     tools = CapabilityRegistry(agent_mode=True)
     register_builtin_plugins(
-        tools, ResourceRegistry(), backend=None, planner=VerificationPlanner()
+        tools, ResourceRegistry(), backend=None, diagnostic_reviewer=DiagnosticReviewer()
     )
     context = {
         "request": "Overshoot <=10%; settling time <=3 s; 5% band.",

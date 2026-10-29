@@ -5,18 +5,25 @@ from uuid import uuid4
 
 from ..runtime.budget import BudgetAccount, BudgetExhausted
 from ..runtime.capabilities import CapabilityRegistry
-from ..runtime.contracts import AnalysisRun, AnalysisSpec, EvidenceFile, ExecutionScope, fingerprint
-from ..runtime.evidence import load_run, persist_run, receipt_name
+from ..runtime.contracts import (
+    AnalysisRun,
+    AnalysisSpec,
+    EvidenceFile,
+    ExecutionScope,
+    ToolCall,
+    fingerprint,
+)
+from ..runtime.evidence import describe_evidence, load_run, persist_run, receipt_name
 from ..runtime.loop import LoopDecision, run_loop
-from .artifacts import describe_artifact
-from .contracts import Artifact, DiagnosisTask, ExecutionNode, ToolCall
 from .diagnosis_contracts import (
     DiagnosisBaseline,
     DiagnosisPlanRevision,
     DiagnosisReview,
     DiagnosisTermination,
     DiagnosticAnalysis,
+    DiagnosticExecutionNode,
     DiagnosticRound,
+    DiagnosticRunState,
     Hypothesis,
     PendingAnalysis,
     StopReason,
@@ -31,18 +38,18 @@ from .diagnostic_data import (
     inspect_diagnostic_project,
     snapshot_diagnostic_project,
 )
+from .diagnostic_planner import DiagnosticReviewer
 from .intake import safe_directory, validate_output_root
-from .planner import VerificationPlanner
 from .store import now
 
-Checkpoint = Callable[[DiagnosisTask], None]
+Checkpoint = Callable[[DiagnosticRunState], None]
 
 
 class DiagnosticEngine:
     def __init__(
         self,
         tools: CapabilityRegistry[DiagnosticContext],
-        planner: VerificationPlanner,
+        planner: DiagnosticReviewer,
         *,
         persist_receipt: Callable[[Path, AnalysisRun], Path] | None = None,
     ):
@@ -50,7 +57,7 @@ class DiagnosticEngine:
         self.planner = planner
         self._persist_receipt = persist_receipt
 
-    def _scope(self, task: DiagnosisTask) -> ExecutionScope:
+    def _scope(self, task: DiagnosticRunState) -> ExecutionScope:
         return ExecutionScope(
             baseline_version=task.baseline.version,
             confirmed=task.baseline.confirmed,
@@ -112,9 +119,30 @@ class DiagnosticEngine:
             ],
         )
 
-    def _nodes(self, plan: DiagnosisPlanRevision) -> list[ExecutionNode]:
+    def plan(
+        self,
+        baseline: DiagnosisBaseline,
+        project: DiagnosticProject,
+        analyses: list[DiagnosticAnalysis],
+        reason: str,
+        version: int,
+        evidence: list[str],
+        *,
+        hypotheses: list[Hypothesis] | None = None,
+    ) -> DiagnosisPlanRevision:
+        return self._plan(
+            baseline,
+            project,
+            analyses,
+            reason,
+            version,
+            evidence,
+            hypotheses=hypotheses,
+        )
+
+    def nodes(self, plan: DiagnosisPlanRevision) -> list[DiagnosticExecutionNode]:
         return [
-            ExecutionNode(
+            DiagnosticExecutionNode(
                 id=f"round-{plan.version}-{index + 1}",
                 tool=analysis.capability,
                 inputs=analysis.inputs,
@@ -124,7 +152,7 @@ class DiagnosticEngine:
 
     def _verify_plan(
         self,
-        task: DiagnosisTask,
+        task: DiagnosticRunState,
         plan: DiagnosisPlanRevision,
         *,
         hypotheses: list[Hypothesis] | None = None,
@@ -144,7 +172,7 @@ class DiagnosticEngine:
         if plan != expected:
             raise ValueError("Persisted diagnostic plan specifications do not match the baseline")
 
-    def _inputs(self, task: DiagnosisTask) -> None:
+    def _inputs(self, task: DiagnosticRunState) -> None:
         target = Path(task.result_directory) / "inputs"
         if task.input_snapshot is None:
             self._scope(task).authorize("write_delivery")
@@ -166,7 +194,7 @@ class DiagnosticEngine:
         self._merge_artifacts(
             task,
             [
-                describe_artifact(Path(task.result_directory), f"inputs/{item.path}")
+                describe_evidence(Path(task.result_directory), f"inputs/{item.path}")
                 for item in current.files
             ],
         )
@@ -184,7 +212,9 @@ class DiagnosticEngine:
             raise ValueError("Diagnostic output contains unregistered source fingerprints")
         return result
 
-    def _verified_run(self, task: DiagnosisTask, run_id: str, spec: AnalysisSpec) -> AnalysisRun:
+    def _verified_run(
+        self, task: DiagnosticRunState, run_id: str, spec: AnalysisSpec,
+    ) -> AnalysisRun:
         if not any(spec == saved for plan in task.plan_revisions for saved in plan.analysis_specs):
             raise ValueError("Diagnostic evidence is outside the persisted baseline plans")
         run = next((item for item in task.analysis_runs if item.id == run_id), None)
@@ -195,8 +225,8 @@ class DiagnosticEngine:
 
     def _accept(
         self,
-        task: DiagnosisTask,
-        node: ExecutionNode,
+        task: DiagnosticRunState,
+        node: DiagnosticExecutionNode,
         call: ToolCall,
         run: AnalysisRun,
         source: str,
@@ -209,7 +239,7 @@ class DiagnosticEngine:
         if previous is None:
             task.analysis_runs.append(run)
         self._merge_artifacts(
-            task, [describe_artifact(Path(task.result_directory), receipt_name(run.id))]
+            task, [describe_evidence(Path(task.result_directory), receipt_name(run.id))]
         )
         call.output = {"analysis_run_id": run.id, "source": source}
         call.status = "completed"
@@ -223,10 +253,10 @@ class DiagnosticEngine:
 
     def _execute(
         self,
-        task: DiagnosisTask,
+        task: DiagnosticRunState,
         plan: DiagnosisPlanRevision,
         index: int,
-        node: ExecutionNode,
+        node: DiagnosticExecutionNode,
         *,
         checkpoint: Checkpoint,
         budget: BudgetAccount | None,
@@ -288,7 +318,6 @@ class DiagnosticEngine:
         )
         task.calls.append(call)
         node.status = "running"
-        task.stage = spec.capability
         if cached is not None:
             return self._accept(
                 task, node, call, self._verified_run(task, cached.id, spec), "cache", checkpoint
@@ -326,12 +355,12 @@ class DiagnosticEngine:
         (self._persist_receipt or persist_run)(directory, run)
         return self._accept(task, node, call, run, "execution", checkpoint)
 
-    def _review(self, task: DiagnosisTask, review: DiagnosisReview) -> list[Hypothesis]:
+    def _review(self, task: DiagnosticRunState, review: DiagnosisReview) -> list[Hypothesis]:
         if review.summary is None:
             raise ValueError("A new diagnosis review requires an explicit structured summary")
         return validate_review(task.current_hypotheses, review, task.analysis_runs)
 
-    def _stop(self, task: DiagnosisTask, reason: StopReason, detail: str) -> None:
+    def _stop(self, task: DiagnosticRunState, reason: StopReason, detail: str) -> None:
         unknowns = [
             *(item.reason for item in task.assessments if item.status == "unknown"),
             *(task.rounds[-1].review.unknowns if task.rounds else []),
@@ -354,7 +383,7 @@ class DiagnosticEngine:
 
     def _budget(
         self,
-        task: DiagnosisTask,
+        task: DiagnosticRunState,
         *,
         for_dispatch: bool = False,
         budget: BudgetAccount | None = None,
@@ -390,11 +419,11 @@ class DiagnosticEngine:
 
     def run(
         self,
-        task: DiagnosisTask,
+        task: DiagnosticRunState,
         *,
         checkpoint: Checkpoint,
         budget: BudgetAccount | None = None,
-    ) -> DiagnosisTask:
+    ) -> DiagnosticRunState:
         self._scope(task).authorize("read_only")
         validate_output_root(task.result_directory, task.project.root)
         safe_directory(Path(task.result_directory))
@@ -422,12 +451,12 @@ class DiagnosticEngine:
                 analyses=prior.analyses if prior else None,
             )
         expected = [
-            node.model_dump(include={"id", "tool", "inputs", "depends_on"})
+            node.model_dump(include={"id", "tool", "inputs"})
             for plan in task.plan_revisions
-            for node in self._nodes(plan)
+            for node in self.nodes(plan)
         ]
         actual = [
-            node.model_dump(include={"id", "tool", "inputs", "depends_on"}) for node in task.nodes
+            node.model_dump(include={"id", "tool", "inputs"}) for node in task.nodes
         ]
         if actual != expected:
             raise ValueError("Persisted analysis nodes differ from their plan revisions")
@@ -449,7 +478,6 @@ class DiagnosticEngine:
             charge_key = f"diagnostic-{task.id}-{plan.version}"
             started = (
                 (budget is not None and charge_key in budget.state.round_charges)
-                or task.stage == phase
                 or any(call.node_id.startswith(f"{phase}-") for call in task.calls)
             )
             if not started:
@@ -457,7 +485,6 @@ class DiagnosticEngine:
                     return
                 if budget is not None:
                     budget.charge_round(key=charge_key)
-                task.stage = phase
                 checkpoint(task)
             run_ids = []
             for index in range(len(plan.analyses)):
@@ -470,7 +497,6 @@ class DiagnosticEngine:
                 run_ids.append(run.id)
             if task.termination is not None or self._budget(task, for_review=True, budget=budget):
                 return
-            task.stage = "review_evidence"
             checkpoint(task)
             planner = self.planner
             if budget is not None:
@@ -548,7 +574,7 @@ class DiagnosticEngine:
                 )
             elif not self._budget(task, budget=budget) and next_plan is not None:
                 task.plan_revisions.append(next_plan)
-                task.nodes.extend(self._nodes(next_plan))
+                task.nodes.extend(self.nodes(next_plan))
 
         run_loop(
             decide=decide,
@@ -560,7 +586,7 @@ class DiagnosticEngine:
         checkpoint(task)
         return task
 
-    def _merge_artifacts(self, task: DiagnosisTask, artifacts: list[Artifact]) -> None:
+    def _merge_artifacts(self, task: DiagnosticRunState, artifacts: list[EvidenceFile]) -> None:
         merged = {item.path: item for item in task.artifacts}
         merged.update({item.path: item for item in artifacts})
         task.artifacts = list(merged.values())

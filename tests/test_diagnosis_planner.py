@@ -4,10 +4,9 @@ import pytest
 
 from flight_agent.verification.planner import VerificationPlanner
 from flight_agent.verification.runtime import VerificationRuntime
-from tests.diagnosis_helpers import AdaptivePlanner, EvolvingPlanner
 from tests.helpers import tool_message
 from tests.test_diagnosis_contracts import diagnosis_proposal
-from tests.test_diagnosis_runtime import confirm, propose, runtime_fixture
+from tests.test_diagnosis_runtime import propose, runtime_fixture
 from tests.test_verification_runtime import RecordingModel
 
 
@@ -94,60 +93,3 @@ def test_d2_recent_messages_and_pending_decision_are_bounded_and_redacted(tmp_pa
     assert str(root) not in encoded
     assert pending.task.result_directory not in encoded
     assert "fixture-secret" not in encoded
-
-
-def test_success_review_contains_real_run_ids_metrics_and_explicit_prior_unknowns(tmp_path):
-    runtime, _, _, root = runtime_fixture(tmp_path, AdaptivePlanner())
-    done = confirm(runtime, propose(runtime, root))
-    review = done.task.rounds[-1].review
-    model = RecordingModel(responses=[tool_message("review_diagnosis", review.model_dump())])
-    planner = VerificationPlanner(model)
-    returned = planner.review_diagnosis(done.task, tools=runtime.diagnosis.tools.catalog())
-    assert returned == review
-    context = json.loads(model.seen[0][-1])
-    assert [item["run_id"] for item in context["evidence"]] == [
-        run.id for run in done.task.analysis_runs
-    ]
-    assert context["evidence"][0]["output"]["metrics"]["mean_error"]["value"] == 1.0
-    assert context["baseline"]["budget"]["max_rounds"] == 6
-    assert str(root) not in model.seen[0][-1]
-    assert '"values"' not in model.seen[0][-1]
-
-
-def test_d2_review_context_includes_redacted_current_hypotheses_and_revision_history(tmp_path):
-    runtime, _, _, root = runtime_fixture(tmp_path)
-    done = confirm(runtime, propose(runtime, root))
-    task = done.task
-    review = EvolvingPlanner().review_diagnosis(
-        task.model_copy(update={"rounds": [], "analysis_runs": task.analysis_runs[:1]}),
-        tools=runtime.diagnosis.tools.catalog(),
-    )
-    revision = review.hypothesis_revision
-    revision = revision.model_copy(update={
-        "reason": f"Recorded offset in {root}; api_key=fixture-secret",
-        "hypotheses": [
-            revision.hypotheses[0].model_copy(update={
-                "statement": f"Offset in {root}; api_key=fixture-secret",
-            }),
-            *revision.hypotheses[1:],
-        ],
-    })
-    review = review.model_copy(update={"hypothesis_revision": revision})
-    task.rounds = [task.rounds[0].model_copy(update={"review": review})]
-    task.assessments = review.assessments
-    model = RecordingModel(responses=[tool_message("review_diagnosis", review.model_dump())])
-    returned = VerificationPlanner(model).review_diagnosis(
-        task, tools=runtime.diagnosis.tools.catalog()
-    )
-    assert returned.summary.responsibility == "undetermined"
-    encoded = model.seen[0][-1]
-    context = json.loads(encoded)
-    assert [item["id"] for item in context["current_hypotheses"]] == [
-        "bias", "transient", "alignment",
-    ]
-    assert context["current_hypotheses"][0]["priority"] == "high"
-    assert context["hypothesis_revisions"][0]["plan_version"] == 1
-    assert context["hypothesis_revisions"][0]["revision"]["evidence"][0]["run_id"] == (
-        task.analysis_runs[0].id
-    )
-    assert str(root) not in encoded and "fixture-secret" not in encoded

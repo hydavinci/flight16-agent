@@ -1,4 +1,5 @@
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -7,10 +8,15 @@ from flight_agent.runtime.agent_contracts import AgentPlan, BudgetState
 from flight_agent.runtime.budget import BudgetAccount
 from flight_agent.runtime.contracts import ResourceBudget
 from flight_agent.runtime.evidence import verify_evidence
-from flight_agent.verification.contracts import AgentTask, DiagnosisTask
+from flight_agent.verification.contracts import AgentTask
 from flight_agent.verification.diagnostic_data import diagnostic_capabilities
 from tests.agent_helpers import analysis_plan_data
-from tests.diagnosis_helpers import AdaptivePlanner, EvolvingPlanner, diagnostic_project
+from tests.diagnosis_helpers import (
+    AdaptivePlanner,
+    EvolvingPlanner,
+    diagnostic_project,
+    diagnostic_state,
+)
 from tests.test_agent_adapters import assembled
 from tests.test_diagnosis_contracts import diagnosis_proposal
 
@@ -53,6 +59,21 @@ def proposed_diagnosis(tmp_path, *, planner=None, budget=None):
     data = diagnosis_plan(resource, budget=budget)
     pending = runtime.propose(store.create(), AgentPlan.model_validate(data))
     return runtime, store, pending, data
+
+
+def test_diagnostic_checkpoint_uses_v2_internal_state(tmp_path):
+    runtime, store, pending, _ = proposed_diagnosis(tmp_path)
+    done = runtime.confirm(pending.id, 1, trusted=True)
+    checkpoint_path = next(iter(done.task.checkpoints.values()))
+    checkpoint = json.loads(
+        (Path(done.task.result_directory) / checkpoint_path).read_text("utf-8")
+    )
+    state = checkpoint["data"]["task"]
+    assert state["schema_version"] == "2.0"
+    assert "scenario" not in state
+    assert "proposal" not in state
+    assert "decisions" not in state
+    assert "output_root" not in state
 
 
 def test_generic_diagnosis_preserves_outer_task_and_two_evidence_rounds(tmp_path):
@@ -160,16 +181,7 @@ def test_internal_capability_version_change_is_rejected_before_execution(tmp_pat
 
 def test_same_engine_runs_without_a_conversation_or_legacy_delivery(tmp_path):
     module = importlib.import_module("flight_agent.verification.diagnostic_engine")
-    runtime, store, pending, _ = proposed_diagnosis(tmp_path)
-    from flight_agent.verification.diagnosis import DiagnosisRuntime
-
-    legacy = DiagnosisRuntime(store, AdaptivePlanner())
-    conversation = store.create()
-    conversation.project_root = pending.task.baseline.resources[0].locator
-    legacy.propose(conversation, "Investigate supplied records.")
-    task = conversation.task
-    assert isinstance(task, DiagnosisTask)
-    task.baseline = task.baseline.model_copy(update={"confirmed": True})
+    task = diagnostic_state(tmp_path)
     checkpoints = []
     account = BudgetAccount(ResourceBudget(), BudgetState(), lambda state: None)
     completed = module.DiagnosticEngine(diagnostic_capabilities(), AdaptivePlanner()).run(
@@ -182,6 +194,25 @@ def test_same_engine_runs_without_a_conversation_or_legacy_delivery(tmp_path):
     assert any(item["pending_analysis"] for item in checkpoints)
     assert account.state.calls == 4
     assert not list(Path(task.result_directory).glob("*.docx"))
+
+
+@pytest.mark.parametrize("fault", ["assessment", "drop", "citation", "scope", "attribution"])
+def test_diagnostic_engine_rejects_ungrounded_reviews_before_next_dispatch(tmp_path, fault):
+    module = importlib.import_module("flight_agent.verification.diagnostic_engine")
+    planner = (
+        AdaptivePlanner(invalid_citation=True)
+        if fault == "assessment"
+        else EvolvingPlanner(revision_fault=fault)
+    )
+    state = diagnostic_state(tmp_path)
+    with pytest.raises(ValueError):
+        module.DiagnosticEngine(diagnostic_capabilities(), planner).run(
+            state, checkpoint=lambda state: None,
+        )
+    assert state.dispatch_count == 1
+    assert len(state.analysis_runs) == len(state.plan_revisions) == 1
+    assert not state.rounds
+    assert state.current_hypotheses == state.baseline.hypotheses
 
 
 def test_recovery_does_not_charge_the_same_internal_round_twice(tmp_path, monkeypatch):

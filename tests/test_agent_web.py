@@ -456,7 +456,7 @@ def test_ambiguous_directory_is_clarified_without_guessing_a_resource_kind(tmp_p
         CapabilityRegistry(agent_mode=True),
         runtime.resources,
         backend=None,
-        planner=AdaptivePlanner(),
+        diagnostic_reviewer=AdaptivePlanner(),
     )
     with TestClient(app, base_url="http://127.0.0.1") as client:
         headers = auth(client)
@@ -478,7 +478,7 @@ def test_location_clarification_retains_the_directory_already_supplied(tmp_path)
         CapabilityRegistry(agent_mode=True),
         runtime.resources,
         backend=None,
-        planner=AdaptivePlanner(),
+        diagnostic_reviewer=AdaptivePlanner(),
     )
     record = runtime.queue_message(None, "Analyze.", str(tmp_path))
     assert record.status == "waiting_for_user"

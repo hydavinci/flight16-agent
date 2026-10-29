@@ -1,8 +1,19 @@
 import json
 from pathlib import Path
 
-from flight_agent.verification.diagnosis_contracts import DiagnosisProposal, DiagnosisReview
-from flight_agent.verification.planner import VerificationPlanner
+from flight_agent.verification.diagnosis_contracts import (
+    DiagnosisBaseline,
+    DiagnosisProposal,
+    DiagnosisReview,
+    DiagnosticRunState,
+    HypothesisAssessment,
+)
+from flight_agent.verification.diagnostic_data import (
+    diagnostic_capabilities,
+    inspect_diagnostic_project,
+)
+from flight_agent.verification.diagnostic_engine import DiagnosticEngine
+from flight_agent.verification.diagnostic_planner import DiagnosticReviewer
 from tests.test_diagnosis_contracts import diagnosis_proposal
 
 
@@ -37,16 +48,49 @@ def diagnostic_project(root: Path) -> Path:
     return root
 
 
-class AdaptivePlanner(VerificationPlanner):
-    def __init__(self, proposal=None, *, repeat=False, invalid_citation=False):
+def diagnostic_state(tmp_path: Path) -> DiagnosticRunState:
+    project = inspect_diagnostic_project(diagnostic_project(tmp_path / "data"))
+    proposal = DiagnosisProposal.model_validate(diagnosis_proposal())
+    tools = diagnostic_capabilities()
+    baseline = DiagnosisBaseline(
+        version=1,
+        project_fingerprint=project.fingerprint,
+        design=project.manifest.design,
+        objective=proposal.title,
+        hypotheses=proposal.hypotheses,
+        allowed_capabilities=proposal.allowed_capabilities,
+        capability_versions={
+            name: tools.definition(name).version for name in proposal.allowed_capabilities
+        },
+        budget=proposal.budget,
+        confirmed=True,
+    )
+    engine = DiagnosticEngine(tools, AdaptivePlanner())
+    plan = engine.plan(baseline, project, proposal.analyses, proposal.rationale, 1, [])
+    return DiagnosticRunState(
+        id="d" * 32,
+        project=project,
+        baseline=baseline,
+        result_directory=str(tmp_path / "results"),
+        plan_revisions=[plan],
+        nodes=engine.nodes(plan),
+        assessments=[
+            HypothesisAssessment(
+                hypothesis_id=item.id,
+                status="unknown",
+                reason="No confirmed analysis executed.",
+            )
+            for item in baseline.hypotheses
+        ],
+    )
+
+
+class AdaptivePlanner(DiagnosticReviewer):
+    def __init__(self, *, repeat=False, invalid_citation=False):
         super().__init__()
-        self.initial = proposal or diagnosis_proposal()
         self.repeat = repeat
         self.invalid_citation = invalid_citation
         self.seen = []
-
-    def propose_diagnosis(self, message, conversation, project, *, tools):
-        return DiagnosisProposal.model_validate(self.initial)
 
     def review_diagnosis(self, task, *, tools):
         self.seen.append([run.model_dump() for run in task.analysis_runs])

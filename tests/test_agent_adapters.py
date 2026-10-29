@@ -24,7 +24,7 @@ def assembled(tmp_path, backend=None, planner=None):
     tools = CapabilityRegistry(agent_mode=True)
     resources = ResourceRegistry()
     plugins().register_builtin_plugins(
-        tools, resources, backend=backend, planner=planner or AdaptivePlanner()
+        tools, resources, backend=backend, diagnostic_reviewer=planner or AdaptivePlanner()
     )
     store = ConversationStore(tmp_path / "state")
     return AgentExecutor(store, tools, resources), store
@@ -231,7 +231,7 @@ def test_resource_adapters_reject_duplicate_registration_and_unknown_names(tmp_p
     runtime, _ = assembled(tmp_path)
     with pytest.raises(ValueError, match="registered"):
         plugins().register_builtin_plugins(
-            runtime.tools, runtime.resources, backend=None, planner=AdaptivePlanner()
+            runtime.tools, runtime.resources, backend=None, diagnostic_reviewer=AdaptivePlanner()
         )
     with pytest.raises(ValueError, match="registered"):
         runtime.resources.inspect("model_generated_import", str(tmp_path))

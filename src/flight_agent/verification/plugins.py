@@ -11,9 +11,9 @@ from .adapters.simulink import simulink_capabilities
 from .agent_runtime import AgentContext
 from .backend import AnalysisBackend, RemoteSimulinkBackend
 from .diagnostic_data import inspect_diagnostic_project
+from .diagnostic_planner import DiagnosticReviewer
 from .local_matlab import LocalMatlabBackend
 from .matlab_projects import discover_matlab_project
-from .planner import VerificationPlanner
 from .resources import ResourceAdapter, ResourceRegistry
 
 
@@ -22,7 +22,7 @@ def register_builtin_plugins(
     resources: ResourceRegistry,
     *,
     backend: AnalysisBackend | None,
-    planner: VerificationPlanner,
+    diagnostic_reviewer: DiagnosticReviewer,
     local_backend: LocalMatlabBackend | None = None,
 ) -> None:
     def inspect_local_project(locator: str) -> ResourceReference:
@@ -134,4 +134,4 @@ def register_builtin_plugins(
         tools.register(local_capability)
     tools.register(scalar_evaluation_capability())
     tools.register(delivery_capability())
-    tools.register(diagnostic_capability(planner))
+    tools.register(diagnostic_capability(diagnostic_reviewer))
