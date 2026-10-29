@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from .session import _write_json
+from .json_io import write_json
 from .upload_models import JOB_ID, JobRecord, UploadRequest
 
 logger = logging.getLogger(__name__)
@@ -57,8 +57,8 @@ class JobStore:
                 created_at=datetime.now(UTC).isoformat(),
                 source_sha256=hashlib.sha256(request.source.encode("utf-8")).hexdigest(),
             )
-            _write_json(directory / "request.json", request.model_dump())
-            _write_json(directory / "status.json", record.model_dump())
+            write_json(directory / "request.json", request.model_dump())
+            write_json(directory / "status.json", record.model_dump())
             return record
 
     def get(self, job_id: str) -> JobRecord:
@@ -78,7 +78,7 @@ class JobStore:
             data = self.get(job_id).model_dump()
             data.update(changes)
             record = JobRecord.model_validate(data)
-            _write_json(self.directory(job_id) / "status.json", record.model_dump())
+            write_json(self.directory(job_id) / "status.json", record.model_dump())
             return record
 
     def recent(self) -> list[JobRecord]:

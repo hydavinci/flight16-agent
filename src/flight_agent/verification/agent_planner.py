@@ -22,7 +22,7 @@ from .matlab_contracts import (
     MatlabProjectDescriptor,
     ProjectExecutionInput,
 )
-from .planner import StructuredPlanner, _conversation_paths, redact_text
+from .structured_planner import StructuredPlanner, conversation_paths, redact_text
 
 MAX_CONTEXT_BYTES = 240_000
 _CREDENTIAL_KEY = re.compile(
@@ -1403,7 +1403,7 @@ class AgentPlanner(StructuredPlanner):
                 action="clarify", text="需求超过长度限制，请拆分后重新提交，避免丢失判据。"
             )
         sources = _authorized_sources(conversation, resources, sources)
-        paths = [*_conversation_paths(conversation), *(item.locator for item in resources.values())]
+        paths = [*conversation_paths(conversation), *(item.locator for item in resources.values())]
         result = None
         if isinstance(conversation.task, AgentTask):
             task = conversation.task

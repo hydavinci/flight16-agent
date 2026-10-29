@@ -7,8 +7,8 @@ from urllib.parse import quote, urlencode
 import httpx
 
 from ..directories import DirectoryListing
+from ..json_io import write_json
 from ..remote import RemoteError, RemoteWorker
-from ..session import _write_json
 from .artifacts import MAX_ARTIFACT_BYTES, verify_artifact
 from .contracts import AnalysisResult, AnalysisRunRequest, ProjectDescriptor, RunRecord
 from .store import request_digest
@@ -129,7 +129,7 @@ class RemoteSimulinkBackend(RemoteWorker):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
                 verify_artifact(directory, item)
-            _write_json(directory / "analysis.json", result.model_dump())
+            write_json(directory / "analysis.json", result.model_dump())
             return result
         except (httpx.HTTPError, OSError, ValueError, RemoteError) as exc:
             raise RemoteError(

@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from ..session import _write_json
+from ..json_io import write_json
 from ..upload_models import JOB_ID
 from .contracts import (
     AnalysisRunRequest,
@@ -59,8 +59,8 @@ class WorkerRunStore:
                 created_at=stamp,
                 updated_at=stamp,
             )
-            _write_json(directory / "request.json", request.model_dump())
-            _write_json(directory / "status.json", record.model_dump())
+            write_json(directory / "request.json", request.model_dump())
+            write_json(directory / "status.json", record.model_dump())
             return record
 
     def get(self, run_id: str) -> RunRecord:
@@ -82,7 +82,7 @@ class WorkerRunStore:
             data.update(changes)
             data["updated_at"] = now()
             record = RunRecord.model_validate(data)
-            _write_json(self.directory(run_id) / "status.json", record.model_dump())
+            write_json(self.directory(run_id) / "status.json", record.model_dump())
             return record
 
 
@@ -157,7 +157,7 @@ class ConversationStore:
             content = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
             if len(content.encode("utf-8")) > 8_000_000:
                 raise ValueError("Conversation exceeds 8 MB; existing state was not replaced")
-            _write_json(self.directory(record.id) / "conversation.json", data)
+            write_json(self.directory(record.id) / "conversation.json", data)
 
     def default_task_root(self, conversation_id: str) -> Path:
         return self.directory(conversation_id) / "tasks"

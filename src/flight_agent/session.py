@@ -1,11 +1,11 @@
 import hashlib
-import json
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
+from .json_io import write_json
 from .knowledge import KnowledgeBase
 from .matlab import MatlabError
 from .models import (
@@ -25,12 +25,7 @@ class AnalysisRunner(Protocol):
     def run(self, parameters: Parameters) -> AnalysisResult: ...
 
 
-def _write_json(path: Path, data: object) -> None:
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8"
-    )
-    temporary.replace(path)
+_write_json = write_json
 
 
 class AnalysisSession:
