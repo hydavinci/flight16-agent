@@ -1,3 +1,4 @@
+import errno
 import importlib
 import json
 import os
@@ -5,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -466,6 +468,49 @@ def test_worker_revalidates_execution_locators_before_engine_start(
     result = local_backend.execute(local_request, directory)
     assert not result.valid
     assert not (directory / "engine-starts.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+def test_cleanup_returns_output_and_explicit_failure_when_signals_are_denied(monkeypatch, caplog):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("partial result", "original engine error")
+
+    def deny_signal(group, sig):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(module.os, "killpg", deny_signal)
+    result = module._stop_worker(process)
+    assert result.stdout == "partial result"
+    assert result.stderr == "original engine error"
+    assert "cleanup incomplete" in result.error
+    assert "43210" in result.error
+    assert "Operation not permitted" in result.error
+    assert "43210" in caplog.text
+    process.communicate.assert_called_once_with(timeout=2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+def test_cleanup_reports_unterminated_worker_after_bounded_waits(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.side_effect = subprocess.TimeoutExpired(
+        "test-worker", 2, output=b"partial result", stderr=b"original engine error"
+    )
+
+    def deny_signal(group, sig):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(module.os, "killpg", deny_signal)
+    result = module._stop_worker(process)
+    assert result.stdout == "partial result"
+    assert result.stderr == "original engine error"
+    assert "43210" in result.error
+    assert "did not exit" in result.error
+    assert "Check" in result.error
+    assert process.communicate.call_args_list == [call(timeout=2), call(timeout=2)]
 
 
 def test_uncertain_owned_cleanup_is_durable_not_reconciled_to_success(
