@@ -951,11 +951,10 @@ def test_real_stepinfo_bridge_preserves_artifact_descriptor_and_legacy_default(
     assert real_local_backend.execute(request, directory, resume=True) == result
 
     # Check the unchanged historical five-argument default in the actual language.
-    import matlab.engine
+    matlab = importlib.import_module("matlab")
+    matlab_engine = importlib.import_module("matlab.engine")
 
-    import matlab
-
-    engine = matlab.engine.start_matlab()
+    engine = matlab_engine.start_matlab()
     try:
         engine.cd(
             str(Path(__file__).resolve().parents[1] / "src/flight_agent/matlab_support"), nargout=0
