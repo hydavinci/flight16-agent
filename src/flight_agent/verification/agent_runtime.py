@@ -519,6 +519,7 @@ class AgentExecutor:
             conversation.output_root = output_root
             conversation.turn_origin = None
             conversation.queued_action = None
+            conversation.queued_action_committed = False
             conversation.queue_origin = None
             conversation.status = "waiting_for_user"
             conversation.error = None
@@ -591,6 +592,7 @@ class AgentExecutor:
             )
             conversation.status = "queued"
             conversation.queued_action = "confirm"
+            conversation.queued_action_committed = True
             conversation.pending_decision = None
             conversation.error = None
             self.store.save(conversation)
@@ -641,6 +643,7 @@ class AgentExecutor:
             )
             conversation.status = "queued"
             conversation.queued_action = "resume"
+            conversation.queued_action_committed = True
             conversation.pending_decision = None
             conversation.error = None
             self.store.save(conversation)
@@ -687,6 +690,7 @@ class AgentExecutor:
             )
             conversation.status = "queued"
             conversation.queued_action = "retry"
+            conversation.queued_action_committed = True
             conversation.pending_decision = None
             conversation.error = None
             self.store.save(conversation)
@@ -1738,6 +1742,7 @@ class AgentExecutor:
         task.stage = task.result.execution_status
         conversation.status = "completed"
         conversation.queued_action = None
+        conversation.queued_action_committed = False
         conversation.queue_origin = None
         conversation.messages.append(
             ConversationMessage(
@@ -2010,6 +2015,7 @@ class AgentExecutor:
                     ),
                 )
                 conversation.queued_action = None
+                conversation.queued_action_committed = False
                 conversation.queue_origin = None
                 self.store.save(conversation)
                 return conversation

@@ -134,6 +134,7 @@ class ConversationManager:
             action = record.queued_action
             origin = record.queue_origin
             record.queued_action = None
+            record.queued_action_committed = False
             record.queue_origin = None
             restored = record.restore_turn_origin()
             if (
@@ -270,6 +271,7 @@ class ConversationManager:
                     error=record.error,
                 )
                 record.queued_action = action
+                record.queued_action_committed = False
                 record.status = "queued"
                 self.runtime.store.save(record)
                 return self._schedule(

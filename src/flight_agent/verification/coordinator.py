@@ -54,6 +54,7 @@ class EngineeringRuntime:
     def _wait(self, record: Conversation, text: str) -> Conversation:
         record.turn_origin = None
         record.queued_action = None
+        record.queued_action_committed = False
         record.queue_origin = None
         record.status = "waiting_for_user"
         record.error = None
@@ -133,6 +134,7 @@ class EngineeringRuntime:
                 record.resource_location = locations[0].id
             record.status = "queued"
             record.queued_action = "message"
+            record.queued_action_committed = False
             record.pending_decision = None
             record.error = None
             self.store.save(record)
@@ -203,6 +205,7 @@ class EngineeringRuntime:
                     current.pending_decision = None
                     current.turn_origin = None
                     current.queued_action = None
+                    current.queued_action_committed = False
                     current.queue_origin = None
                     self.store.save(current)
             raise
@@ -247,6 +250,7 @@ class EngineeringRuntime:
                 )
             record.turn_origin = None
             record.queued_action = None
+            record.queued_action_committed = False
             record.queue_origin = None
             self.store.save(record)
             return record
@@ -406,6 +410,7 @@ class EngineeringRuntime:
                 record.error = origin.error
                 record.queue_origin = None
                 record.queued_action = None
+                record.queued_action_committed = False
                 self.store.save(record)
                 queued, task_id = self._queue_decision(
                     conversation_id,

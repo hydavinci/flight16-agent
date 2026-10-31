@@ -12,8 +12,13 @@ from flight_agent.runtime.observations import (
     Observation,
     OutputArtifact,
 )
+from flight_agent.runtime.scheduling import ExecutionTurnScheduler, PlanningScheduler
 from flight_agent.verification.agent_runtime import AgentExecutor
 from flight_agent.verification.contracts import ConversationState
+from flight_agent.verification.routes import (
+    ConfirmationRequest,
+    ConversationManager,
+)
 from flight_agent.verification.store import ConversationStore
 from tests.agent_helpers import analysis_plan_data
 from tests.scheduling_helpers import make_runtime, propose_fake
@@ -139,6 +144,7 @@ def queue_committed_action(tmp_path, action):
     assert task_id == queued.task.id
     assert queued.status == "queued"
     assert queued.queued_action == action
+    assert queued.model_dump().get("queued_action_committed") is True
     return runtime, queued, calls
 
 
@@ -281,9 +287,15 @@ def test_committed_action_crash_recovers_without_rolling_back_task_state(
     first = first_store.get(queued.id)
 
     assert first.status == "interrupted"
-    assert first.pending_decision.kind == "resume"
+    expected = (
+        "retry"
+        if any(node.status == "failed" for node in first.task.nodes)
+        else "resume"
+    )
+    assert first.pending_decision.kind == expected
     assert first.queued_action is None
     assert first.queue_origin is None
+    assert first.model_dump().get("queued_action_committed") is False
     assert first.task.baseline.confirmed
     assert preserved_task_state(first) == task_state
     assert receipt_bytes(first) == receipts
@@ -297,6 +309,16 @@ def test_committed_action_crash_recovers_without_rolling_back_task_state(
     assert preserved_task_state(second) == task_state
     assert receipt_bytes(second) == receipts
     assert calls == []
+    if action == "resume":
+        retried = executor.retry(
+            second.id,
+            second.task.baseline.version,
+            trusted=True,
+        )
+        assert retried.status == "failed"
+        assert len(calls) == 1
+        assert retried.queued_action is None
+        assert retried.model_dump().get("queued_action_committed") is False
 
 
 def test_archived_running_call_recovers_under_real_queued_message_header(tmp_path):
@@ -337,7 +359,7 @@ def test_archived_running_call_recovers_under_real_queued_message_header(tmp_pat
     recovered = first.archived_tasks[-1]
 
     assert first.status == "interrupted"
-    assert first.pending_decision.kind == "clarify"
+    assert first.pending_decision.kind == "resume"
     assert first.queued_action is None
     assert first.queue_origin is None
     assert [call.id for call in recovered.calls] == [
@@ -360,3 +382,127 @@ def test_archived_running_call_recovers_under_real_queued_message_header(tmp_pat
     assert second == first
     assert receipt_bytes(second) == receipts
     assert calls == []
+
+
+def test_admission_only_retry_after_prior_retry_restores_exact_failed_origin(
+    tmp_path, monkeypatch
+):
+    runtime, queued, calls = queue_committed_action(tmp_path, "retry")
+    failed_again = runtime.executor._run(
+        queued.id,
+        "retry",
+        queued.task.id,
+    )
+    assert failed_again.status == "failed"
+    assert failed_again.pending_decision.kind == "retry"
+    assert failed_again.task.nodes[-1].status == "failed"
+    decisions = failed_again.task.decisions
+    messages = len(failed_again.messages)
+    calls.clear()
+    manager = ConversationManager(
+        runtime,
+        PlanningScheduler(1, 0),
+        ExecutionTurnScheduler(1),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_schedule",
+        lambda record, reservation, operation: record.model_copy(deep=True),
+    )
+    try:
+        admitted = manager.decide(
+            failed_again.id,
+            "retry",
+            ConfirmationRequest(
+                version=failed_again.task.baseline.version,
+                trusted=True,
+            ),
+        )
+    finally:
+        manager.close()
+    assert admitted.status == "queued"
+    assert admitted.queued_action == "retry"
+    assert admitted.model_dump().get("queued_action_committed") is False
+
+    first_store, executor = reopen(runtime)
+    first = first_store.get(admitted.id)
+
+    assert first.status == "failed"
+    assert first.pending_decision.kind == "retry"
+    assert first.task.nodes[-1].status == "failed"
+    assert first.task.decisions == decisions
+    assert len(first.messages) == messages + 1
+    assert first.model_dump().get("queued_action_committed") is False
+    assert calls == []
+
+    second = ConversationStore(first_store.root).get(admitted.id)
+    assert second == first
+    assert calls == []
+
+
+def test_committed_retry_failure_recovers_as_actionable_retry(tmp_path, monkeypatch):
+    calls = []
+    fail = {"enabled": True}
+
+    def operation(context, inputs):
+        terminal = "fail" if fail["enabled"] else None
+        return evidence_operation(calls, terminal)(context, inputs)
+
+    runtime = make_runtime(tmp_path, None, operation)
+    data = two_node_plan()
+    data["budget"]["max_rounds"] = 5
+    pending = propose_fake(runtime, data=data)
+    failed = runtime.executor.confirm(pending.id, 1, trusted=True)
+    assert failed.status == "failed"
+    queued, task_id = runtime._queue_decision(
+        failed.id,
+        "retry",
+        version=failed.task.baseline.version,
+        trusted=True,
+    )
+    assert task_id == queued.task.id
+    save = runtime.store.save
+
+    def crash_after_committed_failure(record):
+        save(record)
+        if (
+            record.queued_action == "retry"
+            and any(node.status == "failed" for node in record.task.nodes)
+        ):
+            raise KeyboardInterrupt("Crash before clearing committed retry")
+
+    monkeypatch.setattr(runtime.store, "save", crash_after_committed_failure)
+    with pytest.raises(KeyboardInterrupt):
+        runtime.executor._run(queued.id, "retry", task_id)
+    crashed = runtime.store.get(queued.id)
+    assert crashed.task.nodes[-1].status == "failed"
+    task_state = preserved_task_state(crashed)
+    receipts = receipt_bytes(crashed)
+    decisions = crashed.task.decisions
+    messages = len(crashed.messages)
+    calls.clear()
+    fail["enabled"] = False
+
+    first_store, executor = reopen(runtime)
+    first = first_store.get(queued.id)
+
+    assert first.status == "interrupted"
+    assert first.pending_decision.kind == "retry"
+    assert first.task.decisions == decisions
+    assert preserved_task_state(first) == task_state
+    assert receipt_bytes(first) == receipts
+    assert len(first.messages) == messages + 1
+    assert first.model_dump().get("queued_action_committed") is False
+    assert calls == []
+
+    second = ConversationStore(first_store.root).get(queued.id)
+    assert second == first
+    retried = executor.retry(
+        second.id,
+        second.task.baseline.version,
+        trusted=True,
+    )
+    assert retried.status == "completed"
+    assert len(calls) == 1
+    assert retried.queued_action is None
+    assert retried.model_dump().get("queued_action_committed") is False

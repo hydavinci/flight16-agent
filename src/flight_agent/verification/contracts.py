@@ -332,6 +332,7 @@ class Conversation(MutableRecord):
     error: str | None = None
     turn_origin: ConversationState | None = None
     queued_action: ScheduledAction | None = None
+    queued_action_committed: bool = False
     queue_origin: ConversationState | None = None
 
     def restore_turn_origin(self) -> bool:

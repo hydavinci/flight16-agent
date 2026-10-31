@@ -110,6 +110,7 @@ def encode(
                         "output_root_reset",
                         "turn_origin",
                         "queued_action",
+                        "queued_action_committed",
                         "queue_origin",
                     )
                 }
