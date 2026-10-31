@@ -9,6 +9,7 @@ from .capability_metadata import Availability, CapabilityMetadata, CapabilitySna
 from .contracts import Effect, ExecutionScope, Name, Version, finite_mapping
 from .observations import CapabilityOutcome, Finding, Observation, OutputArtifact, ResultTable
 from .resources import ResourceReference
+from .scheduling_contracts import SchedulingMetadata, validate_scheduling
 
 if TYPE_CHECKING:
     from .agent_contracts import AgentNode, AgentPlan, AgentScope
@@ -32,6 +33,7 @@ class Capability(Generic[CapabilityContext, Input, Output]):
     readiness: Callable[[tuple[ResourceReference, ...]], Availability] | None = None
     reconcile: Callable[[CapabilityContext, Input], Output | None] | None = None
     validate_plan: Callable[["AgentPlan", "AgentNode"], None] | None = None
+    scheduling: SchedulingMetadata | None = None
 
 
 class CapabilityDefinition(Contract):
@@ -51,6 +53,7 @@ class _Entry(Generic[Context]):
     readiness: Callable[[tuple[ResourceReference, ...]], Availability] | None
     reconcile: Callable[[Context, dict[str, JsonValue]], object] | None
     validate_plan: Callable[["AgentPlan", "AgentNode"], None] | None
+    scheduling: SchedulingMetadata | None
 
 
 def validate_output(model: type[BaseModel], value: object) -> dict[str, JsonValue]:
@@ -89,6 +92,11 @@ class CapabilityRegistry(Generic[Context]):
                 raise ValueError("Agent output_model must be exactly CapabilityOutcome")
             if capability.effect in ("write_candidate", "adopt_candidate"):
                 raise ValueError("Candidate effects are unsupported for agent capabilities")
+        scheduling = (
+            validate_scheduling(definition.effect, capability.scheduling)
+            if self._agent_mode or metadata is not None
+            else capability.scheduling
+        )
 
         def invoke(context: Context, inputs: dict[str, JsonValue]) -> object:
             validated = capability.input_model.model_validate(inputs)
@@ -109,6 +117,7 @@ class CapabilityRegistry(Generic[Context]):
             capability.readiness,
             reconcile if capability.reconcile is not None else None,
             capability.validate_plan,
+            scheduling,
         )
 
     def _entry(self, name: str) -> _Entry[Context]:
@@ -118,6 +127,10 @@ class CapabilityRegistry(Generic[Context]):
 
     def definition(self, name: str) -> CapabilityDefinition:
         return self._entry(name).definition
+
+    def scheduling(self, name: str) -> SchedulingMetadata:
+        entry = self._entry(name)
+        return validate_scheduling(entry.definition.effect, entry.scheduling)
 
     def validate_inputs(self, name: str, inputs: dict[str, JsonValue]) -> dict[str, JsonValue]:
         return validate_output(self._entry(name).input_model, inputs)

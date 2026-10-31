@@ -21,6 +21,7 @@ from ...runtime.observations import (
 )
 from ...runtime.requirements import CapabilityGap, TaskRequirements
 from ...runtime.resources import AgentContract
+from ...runtime.scheduling_contracts import SchedulingMetadata
 from ..intake import safe_directory
 from .evaluation import OutcomeContext
 
@@ -295,6 +296,7 @@ def delivery_capability() -> Capability[DeliveryContext, DeliveryInput, Capabili
         input_model=DeliveryInput,
         output_model=CapabilityOutcome,
         effect="write_delivery",
+        scheduling=SchedulingMetadata("read_only"),
         operation=_deliver,
         reconcile=_reconcile,
         validate_plan=_validate_plan,

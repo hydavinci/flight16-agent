@@ -11,6 +11,7 @@ from ...runtime.contracts import EvidenceFile, Name, Version
 from ...runtime.evidence import verify_evidence
 from ...runtime.observations import CapabilityOutcome, Finding, OutputArtifact, ResultTable
 from ...runtime.resources import AgentContract, ResourceReference
+from ...runtime.scheduling_contracts import SchedulingMetadata
 from ..agent_runtime import AgentContext, ExecutionUncertain
 from ..contracts import Artifact
 from ..diagnosis_contracts import (
@@ -284,6 +285,7 @@ def diagnostic_capability(
         input_model=DiagnosisInput,
         output_model=CapabilityOutcome,
         effect="read_only",
+        scheduling=SchedulingMetadata("read_only"),
         operation=lambda context, inputs: execute(context, inputs, resume=False),
         reconcile=lambda context, inputs: execute(context, inputs, resume=True),
         validate_plan=_validate_plan,

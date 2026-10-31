@@ -26,6 +26,7 @@ from flight_agent.runtime.contracts import fingerprint
 from flight_agent.runtime.loop import LoopDecision, run_loop
 from flight_agent.runtime.observations import CapabilityOutcome, Observation, ResultTable
 from flight_agent.runtime.resources import AgentContract, ResourceReference
+from flight_agent.runtime.scheduling_contracts import SchedulingMetadata
 from tests.agent_helpers import (
     analysis_plan_data,
     register_rmse,
@@ -236,7 +237,8 @@ def test_invocation_checks_resource_readiness_without_computation():
 @pytest.mark.parametrize("effect", ["execute_project", "write_delivery"])
 def test_effects_outside_confirmed_agent_scope_are_blocked(effect):
     registry = CapabilityRegistry(agent_mode=True)
-    registry.register(sink(effect=effect))
+    lane = "local_matlab" if effect == "execute_project" else "read_only"
+    registry.register(sink(effect=effect, scheduling=SchedulingMetadata(lane)))
     with pytest.raises(ValueError, match="permission"):
         registry.invoke("consume", {"observations": []}, context(), scope())
 

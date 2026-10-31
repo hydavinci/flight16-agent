@@ -14,6 +14,7 @@ from ...runtime.capability_metadata import (
 )
 from ...runtime.observations import CapabilityOutcome, Finding, Observation, OutputArtifact
 from ...runtime.resources import AgentContract, ResourceReference
+from ...runtime.scheduling_contracts import SchedulingMetadata
 from ..agent_runtime import (
     AgentContext,
     ExecutionUncertain,
@@ -308,6 +309,7 @@ def simulink_capabilities(
             input_model=SimulinkInput,
             output_model=CapabilityOutcome,
             effect="execute_project",
+            scheduling=SchedulingMetadata("remote_worker"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,

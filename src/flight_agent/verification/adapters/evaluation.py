@@ -17,6 +17,7 @@ from ...runtime.observations import (
 )
 from ...runtime.requirements import Criterion
 from ...runtime.resources import AgentContract
+from ...runtime.scheduling_contracts import SchedulingMetadata
 
 COMPARATORS: dict[str, Callable[[float, float], bool]] = {
     "<": operator.lt,
@@ -160,6 +161,7 @@ def scalar_evaluation_capability() -> Capability[
         input_model=ScalarEvaluationInput,
         output_model=CapabilityOutcome,
         effect="read_only",
+        scheduling=SchedulingMetadata("read_only"),
         operation=_evaluate,
         validate_plan=_validate_plan,
         metadata=CapabilityMetadata(

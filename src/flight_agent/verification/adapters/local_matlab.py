@@ -15,6 +15,7 @@ from ...runtime.contracts import fingerprint
 from ...runtime.evidence import describe_evidence, publish_evidence, verify_evidence
 from ...runtime.observations import CapabilityOutcome, Finding, Observation, OutputArtifact
 from ...runtime.resources import ResourceReference
+from ...runtime.scheduling_contracts import SchedulingMetadata
 from ..agent_runtime import AgentContext, ExecutionUncertain, ReconciledFailure
 from ..local_matlab import LocalMatlabBackend, _read_model, _verify_result
 from ..matlab_contracts import (
@@ -290,6 +291,7 @@ def local_matlab_capabilities(
             input_model=ProjectExecutionInput,
             output_model=CapabilityOutcome,
             effect="execute_project",
+            scheduling=SchedulingMetadata("local_matlab"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
@@ -313,6 +315,7 @@ def local_matlab_capabilities(
             input_model=StepinfoInput,
             output_model=CapabilityOutcome,
             effect="execute_project",
+            scheduling=SchedulingMetadata("local_matlab"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
@@ -345,6 +348,7 @@ def local_matlab_capabilities(
                 "Linearize a sourced existing model at its explicitly selected operating point."
             ),
             input_model=LinearizeInput, output_model=CapabilityOutcome, effect="execute_project",
+            scheduling=SchedulingMetadata("local_matlab"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
@@ -380,6 +384,7 @@ def local_matlab_capabilities(
             name="matlab_allmargin", version="1",
             description="Compute SISO loop margins from a verified dependency linear-model MAT.",
             input_model=AllmarginInput, output_model=CapabilityOutcome, effect="execute_project",
+            scheduling=SchedulingMetadata("local_matlab"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
