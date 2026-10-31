@@ -8,6 +8,31 @@ RESTART_MESSAGE = (
 )
 
 
+def _committed_action(record: Conversation, action: str | None) -> bool:
+    task = record.task
+    if task is None or not task.decisions:
+        return False
+    decision = task.decisions[-1]
+    if decision.baseline_version != task.baseline.version:
+        return False
+    if action == "confirm":
+        return (
+            task.baseline.confirmed
+            and task.baseline_sha256 is not None
+            and decision.action == "confirm_baseline"
+            and decision.trusted
+        )
+    if action == "resume":
+        return task.baseline.confirmed and decision.action == "resume"
+    if action == "retry":
+        return (
+            task.baseline.confirmed
+            and decision.action == "retry"
+            and decision.trusted
+        )
+    return False
+
+
 def recover_scheduling(record: Conversation) -> bool:
     tasks = [*record.archived_tasks, *([record.task] if record.task else [])]
     has_running = any(call.status == "running" for task in tasks for call in task.calls)
@@ -46,12 +71,14 @@ def recover_scheduling(record: Conversation) -> bool:
             task.stage = "interrupted"
     origin = record.queue_origin
     action = record.queued_action
+    committed_action = _committed_action(record, action)
     record.queued_action = None
     record.queue_origin = None
     restored = False
     if (
         not has_unknown
         and not has_queued_node
+        and not committed_action
         and action in ("confirm", "resume", "retry")
         and origin is not None
     ):

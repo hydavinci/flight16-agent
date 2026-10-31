@@ -1,9 +1,21 @@
+from pathlib import Path
+
 import pytest
 
-from flight_agent.runtime.observations import CapabilityOutcome
+from flight_agent.runtime.evidence import (
+    agent_receipt_name,
+    describe_evidence,
+    publish_evidence,
+)
+from flight_agent.runtime.observations import (
+    CapabilityOutcome,
+    Observation,
+    OutputArtifact,
+)
 from flight_agent.verification.agent_runtime import AgentExecutor
 from flight_agent.verification.contracts import ConversationState
 from flight_agent.verification.store import ConversationStore
+from tests.agent_helpers import analysis_plan_data
 from tests.scheduling_helpers import make_runtime, propose_fake
 
 
@@ -16,6 +28,118 @@ def reopen(runtime):
         scheduler=runtime.executor.scheduler,
     )
     return store, executor
+
+
+def evidence_operation(calls, terminal):
+    def operation(context, inputs):
+        calls.append(context.call_id)
+        context.save_checkpoint({"node": context.node_id, "terminal": True})
+        if context.node_id == "next":
+            if terminal == "interrupt":
+                raise KeyboardInterrupt("Crash after dispatch commit")
+            if terminal == "fail":
+                raise RuntimeError("Known invocation failure")
+        path = f"data/{context.node_id}.json"
+        publish_evidence(context.directory, path, b'{"value":1}')
+        return CapabilityOutcome(
+            observations=[
+                Observation(
+                    node_id=context.node_id,
+                    metric_id="rmse",
+                    label="RMSE",
+                    value=1.0,
+                    unit="m",
+                )
+            ],
+            artifacts=[
+                OutputArtifact(
+                    **describe_evidence(context.directory, path).model_dump(),
+                    id=f"raw-{context.node_id}",
+                    node_id=context.node_id,
+                )
+            ],
+        )
+
+    return operation
+
+
+def two_node_plan():
+    data = analysis_plan_data()
+    data["nodes"].append(
+        {
+            **data["nodes"][0],
+            "id": "next",
+            "depends_on": ["compute"],
+        }
+    )
+    return data
+
+
+def preserved_task_state(record):
+    tasks = [*record.archived_tasks, *([record.task] if record.task else [])]
+    return [
+        {
+            "baseline": task.baseline,
+            "nodes": task.nodes,
+            "calls": task.calls,
+            "decisions": task.decisions,
+            "analysis_runs": task.analysis_runs,
+            "pending_specs": task.pending_specs,
+            "checkpoints": task.checkpoints,
+            "checkpoint_sha256": task.checkpoint_sha256,
+            "artifacts": task.artifacts,
+            "budget_state": task.budget_state,
+        }
+        for task in tasks
+    ]
+
+
+def receipt_bytes(record):
+    tasks = [*record.archived_tasks, *([record.task] if record.task else [])]
+    return {
+        run.id: (
+            Path(task.result_directory) / agent_receipt_name(run.id)
+        ).read_bytes()
+        for task in tasks
+        for run in task.analysis_runs
+    }
+
+
+def queue_committed_action(tmp_path, action):
+    calls = []
+    terminal = None if action == "confirm" else "fail"
+    runtime = make_runtime(
+        tmp_path,
+        None,
+        evidence_operation(calls, terminal),
+    )
+    pending = propose_fake(
+        runtime,
+        data=two_node_plan() if action != "confirm" else analysis_plan_data(),
+    )
+    if action == "confirm":
+        completed = runtime.executor.confirm(pending.id, 1, trusted=True)
+        assert completed.status == "completed"
+        pending = propose_fake(runtime)
+    else:
+        failed = runtime.executor.confirm(pending.id, 1, trusted=True)
+        assert failed.status == "failed"
+        pending = failed
+    calls.clear()
+    kwargs = (
+        {"version": pending.task.baseline.version, "trusted": True}
+        if action in ("confirm", "retry")
+        else {"version": None, "trusted": False}
+    )
+    queued, task_id = runtime._queue_decision(
+        pending.id,
+        action,
+        **kwargs,
+    )
+    assert task_id == queued.task.id
+    assert queued.status == "queued"
+    assert queued.queued_action == action
+    return runtime, queued, calls
 
 
 def test_queued_message_restart_does_not_call_a_planner_or_lose_the_message(tmp_path):
@@ -142,3 +266,97 @@ def test_recovery_is_not_limited_to_recent_twenty_conversations(tmp_path):
     assert all(
         store.get(identifier).status == "interrupted" for identifier in identifiers
     )
+
+
+@pytest.mark.parametrize("action", ["confirm", "resume", "retry"])
+def test_committed_action_crash_recovers_without_rolling_back_task_state(
+    tmp_path, action
+):
+    runtime, queued, calls = queue_committed_action(tmp_path, action)
+    task_state = preserved_task_state(queued)
+    receipts = receipt_bytes(queued)
+    messages = len(queued.messages)
+
+    first_store, executor = reopen(runtime)
+    first = first_store.get(queued.id)
+
+    assert first.status == "interrupted"
+    assert first.pending_decision.kind == "resume"
+    assert first.queued_action is None
+    assert first.queue_origin is None
+    assert first.task.baseline.confirmed
+    assert preserved_task_state(first) == task_state
+    assert receipt_bytes(first) == receipts
+    assert len(first.messages) == messages + 1
+    assert calls == []
+
+    second_store = ConversationStore(first_store.root)
+    second = second_store.get(queued.id)
+
+    assert second == first
+    assert preserved_task_state(second) == task_state
+    assert receipt_bytes(second) == receipts
+    assert calls == []
+
+
+def test_archived_running_call_recovers_under_real_queued_message_header(tmp_path):
+    calls = []
+    runtime = make_runtime(
+        tmp_path,
+        None,
+        evidence_operation(calls, "interrupt"),
+    )
+    pending = propose_fake(runtime, data=two_node_plan())
+    with pytest.raises(KeyboardInterrupt):
+        runtime.executor.confirm(pending.id, 1, trusted=True)
+    record = runtime.store.get(pending.id)
+    running = record.task.calls[-1]
+    assert running.status == "running"
+    record.archived_tasks.append(record.task)
+    record.task = None
+    record.status = "waiting_for_user"
+    record.pending_decision = None
+    record.error = None
+    record.queued_action = None
+    record.queue_origin = None
+    runtime.store.save(record)
+    queued = runtime.queue_message(record.id, "Review the interrupted prior task.")
+    archived = queued.archived_tasks[-1]
+    calls_before = archived.calls
+    pending_specs = archived.pending_specs
+    receipts = receipt_bytes(queued)
+    checkpoints = archived.checkpoints
+    checkpoint_sha256 = archived.checkpoint_sha256
+    artifacts = archived.artifacts
+    budget = archived.budget_state
+    messages = len(queued.messages)
+    calls.clear()
+
+    first_store, executor = reopen(runtime)
+    first = first_store.get(queued.id)
+    recovered = first.archived_tasks[-1]
+
+    assert first.status == "interrupted"
+    assert first.pending_decision.kind == "clarify"
+    assert first.queued_action is None
+    assert first.queue_origin is None
+    assert [call.id for call in recovered.calls] == [
+        call.id for call in calls_before
+    ]
+    assert [call.status for call in recovered.calls] == [
+        "completed",
+        "interrupted",
+    ]
+    assert recovered.pending_specs == pending_specs
+    assert recovered.checkpoints == checkpoints
+    assert recovered.checkpoint_sha256 == checkpoint_sha256
+    assert recovered.artifacts == artifacts
+    assert recovered.budget_state == budget
+    assert receipt_bytes(first) == receipts
+    assert len(first.messages) == messages + 1
+    assert calls == []
+
+    second = ConversationStore(first_store.root).get(queued.id)
+    assert second == first
+    assert receipt_bytes(second) == receipts
+    assert calls == []
