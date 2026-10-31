@@ -334,9 +334,9 @@ Word 保留条件、有效性、判据原文与身份、单项/总体评价、�
 
 ```text
 runs/
-|-- verification/<conversation_id>/
-|   |-- conversation.json
-|   `-- tasks/<task_id>/
+|-- verification/
+|   |-- conversations.sqlite3
+|   `-- <conversation_id>/tasks/<task_id>/
 |       |-- agent/
 |       |-- calls/
 |       `-- delivery/
@@ -349,7 +349,7 @@ runs/
 /absolute/path/to/results/flight-agent-<task_id>/
 ```
 
-会话索引仍位于默认 `verification/<conversation_id>/conversation.json`。
+会话索引位于默认 `verification/conversations.sqlite3`。
 新任务获得新 ID/目录，旧交付不变。两种位置均由
 [ConversationStore](../src/flight_agent/verification/store.py) 核对路径与所有权。
 没有执行到的阶段不生成对应假结果文件。

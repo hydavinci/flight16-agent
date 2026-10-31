@@ -54,9 +54,10 @@ from .contracts import (
     PendingDecision,
     ToolCall,
 )
+from .conversation_repository import ConversationRepository
 from .intake import safe_directory, validate_output_root
 from .resources import ResourceRegistry
-from .store import ConversationStore, now
+from .store import now
 
 logger = logging.getLogger(__name__)
 MAX_CHECKPOINT_BYTES = 4_000_000
@@ -164,7 +165,7 @@ def persist_running_call(
     node: AgentExecutionNode,
     spec: InvocationSpec,
     *,
-    store: ConversationStore,
+    store: ConversationRepository,
 ) -> ToolCall:
     call = ToolCall(
         id=uuid4().hex,
@@ -235,7 +236,7 @@ def build_context(
     call: ToolCall,
     budget: BudgetAccount,
     *,
-    store: ConversationStore,
+    store: ConversationRepository,
 ) -> AgentContext:
     directory = store.task_directory(conversation.id, task.id, task.output_root)
     if str(directory) != task.result_directory:
@@ -337,7 +338,7 @@ def build_context(
 class AgentExecutor:
     def __init__(
         self,
-        store: ConversationStore,
+        store: ConversationRepository,
         tools: CapabilityRegistry[AgentContext],
         resources: ResourceRegistry,
     ):
@@ -675,17 +676,44 @@ class AgentExecutor:
         node: AgentExecutionNode,
         call: ToolCall,
         run: InvocationRun,
+        budget: BudgetAccount,
     ) -> None:
-        accept_verified_run(task, node, call, run)
-        receipt = OutputArtifact(
-            **describe_evidence(
-                self._directory(conversation, task), agent_receipt_name(run.id)
-            ).model_dump()
-        )
-        for artifact in [*run.artifacts, *run.output.artifacts, receipt]:
-            if artifact not in task.artifacts:
-                task.artifacts.append(artifact)
-        self.store.save(conversation)
+        exhausted: BudgetExhausted | None = None
+        previous = task.model_copy(deep=True)
+        previous_budget = budget.state.model_copy(deep=True)
+        previous_stamp = conversation.updated_at
+        try:
+            with self.store.transaction():
+                accept_verified_run(task, node, call, run)
+                receipt = OutputArtifact(
+                    **describe_evidence(
+                        self._directory(conversation, task), agent_receipt_name(run.id)
+                    ).model_dump()
+                )
+                for artifact in [*run.artifacts, *run.output.artifacts, receipt]:
+                    if artifact not in task.artifacts:
+                        task.artifacts.append(artifact)
+                try:
+                    self._progress(task, run, budget)
+                except BudgetExhausted as exc:
+                    exhausted = exc
+                self.store.save(conversation)
+        except BaseException:
+            original_node = next(item for item in previous.nodes if item.id == node.id)
+            original_call = next(item for item in previous.calls if item.id == call.id)
+            for name in AgentExecutionNode.model_fields:
+                setattr(node, name, getattr(original_node, name))
+            for name in ToolCall.model_fields:
+                setattr(call, name, getattr(original_call, name))
+            for name in AgentTask.model_fields:
+                setattr(task, name, getattr(previous, name))
+            task.nodes = [node if item.id == node.id else item for item in task.nodes]
+            task.calls = [call if item.id == call.id else item for item in task.calls]
+            budget.state = previous_budget
+            conversation.updated_at = previous_stamp
+            raise
+        if exhausted is not None:
+            raise exhausted
 
     def _recover(self, conversation: Conversation, task: AgentTask, budget: BudgetAccount) -> None:
         for call in task.calls:
@@ -715,7 +743,7 @@ class AgentExecutor:
                     _validate_outcome(task, node, output)
                     run = build_invocation_run(call, spec, output)
                     persist_agent_run(context.directory, run)
-                self._accept(conversation, task, node, call, run)
+                self._accept(conversation, task, node, call, run, budget)
             except ReconciledFailure as exc:
                 call.status = "failed"
                 call.error = str(exc)[:4000]
@@ -725,6 +753,8 @@ class AgentExecutor:
                     node.error = call.error
                 task.pending_specs.pop(call.id, None)
                 self.store.save(conversation)
+                raise
+            except BudgetExhausted:
                 raise
             except (OSError, ValueError, RuntimeError) as exc:
                 call.status = "interrupted"
@@ -736,7 +766,6 @@ class AgentExecutor:
                 raise ExecutionUncertain(
                     f"Original invocation state remains unknown: {exc}"
                 ) from exc
-            self._progress(task, run, budget)
 
     @staticmethod
     def _progress(task: AgentTask, run: InvocationRun, budget: BudgetAccount) -> None:
@@ -785,13 +814,15 @@ class AgentExecutor:
                 run = build_invocation_run(call, spec, output)
                 publishing = True
                 persist_agent_run(context.directory, run)
-            self._accept(conversation, task, node, call, run)
+            self._accept(conversation, task, node, call, run, budget)
         except ExecutionUncertain as exc:
             call.status = "interrupted"
             call.error = str(exc)[:4000]
             node.status = "interrupted"
             node.error = call.error
             self.store.save(conversation)
+            raise
+        except BudgetExhausted:
             raise
         except (OSError, ValueError, RuntimeError) as exc:
             if publishing:
@@ -814,7 +845,6 @@ class AgentExecutor:
             task.pending_specs.pop(call.id, None)
             self.store.save(conversation)
             raise
-        self._progress(task, run, budget)
 
     @staticmethod
     def _result(task: AgentTask, status: str) -> TaskResult:

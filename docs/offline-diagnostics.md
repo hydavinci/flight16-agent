@@ -261,8 +261,8 @@ insufficient evidence; completion is not a diagnosis-success verdict.
 
 ## Persistence, cache and recovery
 
-Conversations use the existing
-`runs/verification/<conversation-id>/conversation.json` store. Each task has a
+Conversations use the SQLite
+`runs/verification/conversations.sqlite3` store. Each task has a
 unique directory under that conversation, or under a user-selected Agent-host
 `output_root`. Source/output overlap, traversal and symlinks are rejected.
 The store rejects an oversized conversation before replacing its prior state.

@@ -1,5 +1,4 @@
 import importlib
-import json
 
 import pytest
 
@@ -28,38 +27,23 @@ def agent_task(directory, **changes):
     )
 
 
-def test_existing_v2_envelope_normalizes_without_rewriting_persisted_history(tmp_path):
+def test_sqlite_history_round_trips_current_and_archived_v2_tasks(tmp_path):
     store = ConversationStore(tmp_path / "state")
     record = store.create()
-    record.task = agent_task(store.directory(record.id))
-    record.archived_tasks = [record.task.model_copy(deep=True)]
-    expected = record.task.model_dump(mode="json")
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    archived_directory = store.task_directory(record.id, "b" * 32, create=True)
+    archived = agent_task(archived_directory).model_copy(update={"id": "b" * 32})
+    record.archived_tasks = [archived]
     store.save(record)
-    path = store.directory(record.id) / "conversation.json"
-    data = json.loads(path.read_text())
-    data.pop("schema_version", None)
-    data.update(scenario="auto", goal="", active_workflow=None, workflow_agenda=[])
-    path.write_text(json.dumps(data))
-    before = path.read_bytes()
-
-    reloaded = ConversationStore(store.root).get(record.id)
-
-    assert reloaded.schema_version == "2.0"
-    assert isinstance(reloaded.task, contracts.AgentTask)
-    assert reloaded.task.schema_version == "2.0"
-    assert reloaded.task.model_dump(mode="json") == expected
-    assert reloaded.archived_tasks[0].model_dump(mode="json") == expected
-    assert path.read_bytes() == before
-    store.save(reloaded)
-    persisted = json.loads(path.read_text())
-    assert persisted["schema_version"] == "2.0"
-    assert not {"scenario", "goal", "active_workflow", "workflow_agenda"} & persisted.keys()
+    assert ConversationStore(store.root).get(record.id) == record
+    assert not list(store.root.rglob("conversation.json"))
 
 
 def test_restart_preserves_v2_confirmation_call_identity_inputs_and_unknown_state(tmp_path):
     store = ConversationStore(tmp_path / "state")
     record = store.create()
-    baseline_task = agent_task(store.directory(record.id))
+    baseline_task = agent_task(store.task_directory(record.id, "a" * 32, create=True))
     data = baseline_task.baseline.model_dump(mode="json")
     data.update(confirmed=True, confirmed_at=now())
     baseline_task.baseline = AgentBaseline.model_validate(data)
@@ -134,7 +118,7 @@ def test_v2_checkpoint_references_cannot_traverse_outside_task(tmp_path):
 def test_oversized_v2_state_cannot_replace_last_readable_conversation(tmp_path):
     store = ConversationStore(tmp_path / "state")
     record = store.create()
-    record.task = agent_task(tmp_path)
+    record.task = agent_task(store.task_directory(record.id, "a" * 32, create=True))
     store.save(record)
     original = store.get(record.id)
     record.messages.append(
@@ -143,8 +127,8 @@ def test_oversized_v2_state_cannot_replace_last_readable_conversation(tmp_path):
     with pytest.raises(ValueError, match="8 MB|limit"):
         store.save(record)
     assert store.get(record.id) == original
-    raw = json.loads((store.directory(record.id) / "conversation.json").read_text())
-    assert raw["task"]["schema_version"] == "2.0"
+    assert store.get(record.id).task.schema_version == "2.0"
+    assert not list(store.root.rglob("conversation.json"))
 
 
 def test_existing_authenticated_history_api_can_read_v2_and_download_checked_artifacts(

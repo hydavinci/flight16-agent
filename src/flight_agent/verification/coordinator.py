@@ -14,9 +14,10 @@ from .contracts import (
     ConversationState,
     PendingDecision,
 )
+from .conversation_repository import ConversationRepository
 from .intake import parse_directories, validate_output_root
 from .resources import ResourceRegistry, resolve_location
-from .store import ConversationStore, now
+from .store import now
 
 Action = Literal["confirm", "resume", "retry"]
 
@@ -24,7 +25,7 @@ Action = Literal["confirm", "resume", "retry"]
 class EngineeringRuntime:
     def __init__(
         self,
-        store: ConversationStore,
+        store: ConversationRepository,
         planner: AgentPlanner,
         executor: AgentExecutor,
         resources: ResourceRegistry,

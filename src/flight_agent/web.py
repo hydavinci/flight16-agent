@@ -33,7 +33,7 @@ from .verification.local_matlab import LocalMatlabBackend
 from .verification.plugins import register_builtin_plugins
 from .verification.resources import ResourceLocation, ResourceRegistry, resolve_location
 from .verification.routes import verification_router
-from .verification.store import ConversationStore
+from .verification.sqlite_store import SQLiteConversationStore
 
 
 class DirectorySelectionRequest(BaseModel):
@@ -59,7 +59,7 @@ def create_web_app(
     except ValueError:
         backend = None
     if engineering_runtime is None:
-        conversations = ConversationStore(root / "runs" / "verification")
+        conversations = SQLiteConversationStore(root / "runs" / "verification")
         tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
         register_builtin_plugins(
             tools, resources, backend=backend,

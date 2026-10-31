@@ -310,10 +310,10 @@ def test_recovery_accounts_for_progress_when_crash_follows_receipt_acceptance(
     runtime, store, conversation, _ = setup(tmp_path, operation=operation)
     accept = runtime._accept
 
-    def crash(conversation, task, node, call, run):
-        accept(conversation, task, node, call, run)
+    def crash(conversation, task, node, call, run, budget):
+        accept(conversation, task, node, call, run, budget)
         if node.id == "next":
-            raise KeyboardInterrupt("Crash after receipt acceptance, before progress checkpoint")
+            raise KeyboardInterrupt("Crash after atomic receipt/progress acceptance")
 
     monkeypatch.setattr(runtime, "_accept", crash)
     data = analysis_plan_data()
@@ -322,7 +322,9 @@ def test_recovery_accounts_for_progress_when_crash_follows_receipt_acceptance(
     pending = propose(runtime, conversation, data)
     with pytest.raises(KeyboardInterrupt):
         confirm(runtime, pending)
-    assert store.get(pending.id).task.budget_state.no_progress == 1
+    saved = store.get(pending.id)
+    assert saved.task.budget_state.no_progress == 0
+    assert saved.task.analysis_runs[-1].id in saved.task.progress_calls
     recovered = restarted(runtime, store).resume(pending.id)
     assert recovered.status == "completed", recovered.error
     assert calls == ["compute", "next"]

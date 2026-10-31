@@ -124,8 +124,8 @@ client timeout or lost acknowledgement does not prove remote termination.
 Receipts, dependencies and artifact hashes are checked at execution, reuse,
 completion and recovery.
 
-Web state is stored in `runs/verification/<conversation_id>/conversation.json`;
-default task artifacts are under `tasks/<task_id>/`. A custom Agent-host output
+Web conversation state is stored in `runs/verification/conversations.sqlite3`;
+default task artifacts are under `<conversation_id>/tasks/<task_id>/`. A custom Agent-host output
 root gets `flight-agent-<task_id>/`; source/output overlap is rejected.
 Worker records and copies live under `runs/verification-worker/<run_id>/`.
 Use artifact manifests, not guessed filenames, for authenticated downloads.

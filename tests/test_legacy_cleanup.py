@@ -445,35 +445,18 @@ def test_cleanup_does_not_follow_nested_symlinks_or_external_output_root(tmp_pat
     assert sentinel.read_text() == "keep delivery"
 
 
-@pytest.mark.parametrize(
-    "data,message",
-    [
-        ({"task": {"scenario": "d1"}}, "Legacy conversation is unsupported; run cleanup-legacy"),
-        ({"task": None}, "Conversation schema is unknown"),
-    ],
-)
-def test_store_classifies_raw_records_without_deleting_them(tmp_path, data, message):
+@pytest.mark.parametrize("data", [
+    {"task": {"scenario": "d1"}},
+    {"task": None},
+    {"schema_version": "2.0", "task": {"scenario": "d1"}},
+])
+def test_sqlite_store_never_deserializes_or_deletes_raw_json_records(tmp_path, data):
+    raw = write_record(tmp_path / ("a" * 32), data)
+    before = raw.read_bytes()
     store = ConversationStore(tmp_path)
-    record = write_record(tmp_path / ("a" * 32), data)
-    before = record.read_bytes()
-
-    with pytest.raises(ValueError, match=message):
-        store.get(record.parent.name)
-    with pytest.raises(ValueError, match=message):
-        ConversationStore(tmp_path)
-
-    assert record.read_bytes() == before
-
-
-def test_store_rejects_v2_marker_with_legacy_task_instead_of_cleaning_it(tmp_path):
-    store = ConversationStore(tmp_path)
-    record = write_record(
-        tmp_path / ("a" * 32),
-        {"schema_version": "2.0", "task": {"scenario": "d1"}},
-    )
-    before = record.read_bytes()
-
-    with pytest.raises(ValueError):
-        store.get(record.parent.name)
-
-    assert record.read_bytes() == before
+    assert store.recent() == []
+    with pytest.raises(KeyError, match="Unknown conversation"):
+        store.get(raw.parent.name)
+    assert raw.read_bytes() == before
+    assert store.backup_path is not None
+    assert (store.backup_path / raw.relative_to(tmp_path)).read_bytes() == before

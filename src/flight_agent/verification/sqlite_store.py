@@ -327,11 +327,20 @@ class SQLiteConversationStore:
             ]
         }
         for task in tasks.values():
-            directory = self.task_directory(record.id, task.id, task.output_root)
+            if not JOB_ID.fullmatch(task.id):
+                raise ValueError("Invalid task ID")
+            directory = (
+                Path(task.output_root) / f"flight-agent-{task.id}"
+                if task.output_root
+                else self.default_task_root(record.id) / task.id
+            )
+            safe_directory(directory)
             if str(directory) != task.result_directory:
                 raise ValueError(
                     "Task result directory does not match its persisted identity"
                 )
+            if task.baseline.confirmed:
+                self.task_directory(record.id, task.id, task.output_root)
             previous_task = connection.execute(
                 "SELECT conversation_id, state_json FROM tasks WHERE id=?", (task.id,)
             ).fetchone()
