@@ -162,6 +162,9 @@ def prior_v2_checkpoint(store, record, proposal, *, fault=None, authenticate=Tru
         artifact.update(media_type="application/json", role="record")
     if fault:
         fault(payload)
+    if authenticate:
+        path = path.with_name("prior-v2-checkpoint.json")
+        task.checkpoints[call_id] = path.relative_to(task.result_directory).as_posix()
     write_json(path, payload)
     if authenticate:
         task.checkpoint_sha256[call_id] = hashlib.sha256(path.read_bytes()).hexdigest()

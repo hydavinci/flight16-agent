@@ -59,3 +59,32 @@ def test_backup_refuses_symlinks_without_reading_external_content(tmp_path):
         cutover.prepare_cutover(root, require_empty=False)
     assert (outside / "source.m").read_text() == "user source"
     assert not (root / "conversations.sqlite3").exists()
+
+
+def test_backup_fsyncs_copied_directories_and_rename_parent(tmp_path, monkeypatch):
+    root = tmp_path / "verification"
+    nested = root / "conversation" / "tasks"
+    nested.mkdir(parents=True)
+    (nested / "metric.bin").write_bytes(b"evidence")
+    observed = []
+    fsync_directory = cutover._fsync_directory
+
+    def observe(path):
+        path = path.resolve()
+        if path == root.parent.resolve():
+            assert any(
+                item.name.startswith("verification.pre-sqlite-")
+                and not item.name.endswith(".partial")
+                for item in root.parent.iterdir()
+            )
+        observed.append(path)
+        fsync_directory(path)
+
+    monkeypatch.setattr(cutover, "_fsync_directory", observe)
+
+    backup = cutover.prepare_cutover(root, require_empty=False)
+
+    assert backup is not None
+    assert any(path.name == "tasks" for path in observed)
+    assert any(path.name.endswith(".partial") for path in observed)
+    assert observed[-1] == root.parent.resolve()

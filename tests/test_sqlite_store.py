@@ -7,7 +7,7 @@ import pytest
 
 from flight_agent.runtime.agent_contracts import BudgetState
 from flight_agent.runtime.evidence import describe_evidence, persist_agent_run
-from flight_agent.runtime.observations import OutputArtifact
+from flight_agent.runtime.observations import OutputArtifact, TaskResult
 from flight_agent.verification.agent_runtime import accept_verified_run
 from flight_agent.verification.contracts import (
     ConversationMessage,
@@ -16,6 +16,7 @@ from flight_agent.verification.contracts import (
     ToolCall,
 )
 from flight_agent.verification.sqlite_codec import canonical, encode
+from flight_agent.verification.sqlite_schema import DatabaseStartupError
 from flight_agent.verification.sqlite_store import SQLiteConversationStore
 from flight_agent.verification.store import now
 from tests.test_agent_evidence import run as invocation_run
@@ -263,6 +264,86 @@ def test_removing_persisted_artifact_is_rejected_atomically(tmp_path):
     assert store.get(record.id) == before
 
 
+def test_replacing_persisted_artifact_descriptor_is_rejected_atomically(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    original = directory / "metric.json"
+    original.write_text('{"rmse":1}')
+    record.task.artifacts.append(
+        OutputArtifact(**describe_evidence(directory, original.name).model_dump())
+    )
+    store.save(record)
+    before = store.get(record.id)
+    replacement = directory / "replacement.json"
+    replacement.write_text('{"rmse":2}')
+    changed = store.get(record.id)
+    changed.task.artifacts[0] = OutputArtifact(
+        **describe_evidence(directory, replacement.name).model_dump()
+    )
+
+    with pytest.raises(ValueError, match="artifact|immutable"):
+        store.save(changed)
+
+    assert store.get(record.id) == before
+
+
+@pytest.mark.parametrize("payload", ["baseline", "result", "state"])
+def test_completed_task_payload_is_immutable(tmp_path, payload):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    record.task.nodes[0].status = "completed"
+    record.task.result = TaskResult(execution_status="completed")
+    record.task.stage = "completed"
+    record.status = "completed"
+    store.save(record)
+    before = store.get(record.id)
+    changed = store.get(record.id)
+    if payload == "baseline":
+        changed.task.baseline = changed.task.baseline.model_copy(
+            update={"version": changed.task.baseline.version + 1}
+        )
+    elif payload == "result":
+        changed.task.result = TaskResult(execution_status="partial")
+    else:
+        changed.task.budget_state = BudgetState(
+            started_at=now(),
+            calls=1,
+            rounds=1,
+            round_charges=["compute"],
+        )
+
+    with pytest.raises(ValueError, match="terminal|immutable"):
+        store.save(changed)
+
+    assert store.get(record.id) == before
+
+
+def test_completed_current_task_can_be_archived_without_rewriting_payload(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    record.task.nodes[0].status = "completed"
+    record.task.result = TaskResult(execution_status="completed")
+    record.task.stage = "completed"
+    record.status = "completed"
+    store.save(record)
+    completed = store.get(record.id).task
+    record = store.get(record.id)
+    record.archived_tasks.append(record.task)
+    record.task = None
+
+    store.save(record)
+
+    saved = store.get(record.id)
+    assert saved.task is None
+    assert saved.archived_tasks == [completed]
+
+
 def test_checkpoint_order_does_not_reverify_accepted_damaged_evidence(tmp_path):
     store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
     record = store.create()
@@ -294,6 +375,52 @@ def test_checkpoint_order_does_not_reverify_accepted_damaged_evidence(tmp_path):
     store.save(reloaded)
 
     assert store.get(record.id) == reloaded
+
+
+def test_checkpoint_transition_appends_artifact_metadata_without_rewriting_history(
+    tmp_path,
+):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    call_id = "1" * 32
+    record.task.calls.append(
+        ToolCall(
+            id=call_id,
+            node_id="compute",
+            tool="offline_rmse",
+            tool_version="1",
+            baseline_version=1,
+            started_at=now(),
+        )
+    )
+    first = directory / "checkpoint-first.json"
+    first.write_text('{"progress":1}')
+    record.task.checkpoints[call_id] = first.name
+    record.task.checkpoint_sha256[call_id] = hashlib.sha256(
+        first.read_bytes()
+    ).hexdigest()
+    store.save(record)
+    second = directory / "checkpoint-second.json"
+    second.write_text('{"progress":2}')
+    record.task.checkpoints[call_id] = second.name
+    record.task.checkpoint_sha256[call_id] = hashlib.sha256(
+        second.read_bytes()
+    ).hexdigest()
+
+    store.save(record)
+
+    with sqlite3.connect(store.database_path) as connection:
+        rows = connection.execute(
+            """SELECT position, relative_path FROM artifacts
+               WHERE task_id=? AND slot='checkpoint' ORDER BY position""",
+            (record.task.id,),
+        ).fetchall()
+    assert rows == [
+        (0, first.name),
+        (1, second.name),
+    ]
 
 
 def test_persisted_task_directory_identity_is_immutable_without_artifacts(tmp_path):
@@ -393,6 +520,39 @@ def test_restart_interrupts_running_calls_even_under_nonrunning_header(tmp_path)
     assert saved.task.budget_state == task.budget_state
     assert saved.task.nodes[0].status == "interrupted"
     assert SQLiteConversationStore(store.root).get(record.id) == saved
+
+
+def test_startup_rejects_corrupt_completed_conversation_without_rewriting_live_files(
+    tmp_path,
+):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    record.task.nodes[0].status = "completed"
+    record.task.result = TaskResult(execution_status="completed")
+    record.task.stage = "completed"
+    record.status = "completed"
+    store.save(record)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE tasks SET state_json=? WHERE id=?",
+            ('{"malformed":', record.task.id),
+        )
+    before = {
+        path.name: path.read_bytes()
+        for path in store.root.iterdir()
+        if path.is_file()
+    }
+
+    with pytest.raises(DatabaseStartupError, match="validation|startup|JSON|decode"):
+        SQLiteConversationStore(store.root)
+
+    assert {
+        path.name: path.read_bytes()
+        for path in store.root.iterdir()
+        if path.is_file()
+    } == before
 
 
 def test_planning_restart_restores_followup_origin_without_touching_baseline(tmp_path):
@@ -663,6 +823,100 @@ def test_recovery_reserve_accepts_near_limit_state_that_can_recover(tmp_path):
     assert recovered.turn_origin is None
     assert len(canonical(recovered.model_dump(mode="json")).encode("utf-8")) <= hard_limit
     assert len(SQLiteConversationStore(store.root).get(record.id).messages) == 2
+
+
+def test_evidence_hashing_does_not_hold_sqlite_write_lock(tmp_path, monkeypatch):
+    from flight_agent.verification import sqlite_store as sqlite_store_module
+
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    evidence_record = store.create()
+    evidence_directory = store.task_directory(
+        evidence_record.id, "a" * 32, create=True
+    )
+    evidence_record.task = agent_task(evidence_directory)
+    evidence = evidence_directory / "metric.json"
+    evidence.write_text('{"rmse":1}')
+    evidence_record.task.artifacts.append(
+        OutputArtifact(**describe_evidence(evidence_directory, evidence.name).model_dump())
+    )
+    other_record = store.create()
+    hashing = threading.Event()
+    release_hash = threading.Event()
+    evidence_done = threading.Event()
+    other_done = threading.Event()
+    errors = []
+    verify = sqlite_store_module.verify_evidence
+
+    def blocked_verify(root, descriptor):
+        hashing.set()
+        assert release_hash.wait(timeout=5)
+        return verify(root, descriptor)
+
+    def save_evidence():
+        try:
+            store.save(evidence_record)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            evidence_done.set()
+
+    def save_other():
+        try:
+            other_record.messages.append(
+                ConversationMessage(role="user", content="independent", created_at=now())
+            )
+            store.save(other_record)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            other_done.set()
+
+    monkeypatch.setattr(sqlite_store_module, "verify_evidence", blocked_verify)
+    evidence_writer = threading.Thread(target=save_evidence)
+    evidence_writer.start()
+    assert hashing.wait(timeout=5)
+    other_writer = threading.Thread(target=save_other)
+    other_writer.start()
+    completed_while_hashing = other_done.wait(timeout=1)
+    release_hash.set()
+    evidence_writer.join(timeout=5)
+    other_writer.join(timeout=5)
+
+    assert completed_while_hashing
+    assert evidence_done.is_set()
+    assert errors == []
+
+
+def test_evidence_change_between_hash_and_publish_is_rejected(tmp_path, monkeypatch):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    evidence = directory / "metric.json"
+    evidence.write_text('{"rmse":1}')
+    record.task.artifacts.append(
+        OutputArtifact(**describe_evidence(directory, evidence.name).model_dump())
+    )
+    recheck = SQLiteConversationStore._recheck_evidence_claims
+    changed = False
+
+    def mutate_before_publish(claims):
+        nonlocal changed
+        if claims and not changed:
+            changed = True
+            evidence.write_text('{"rmse":9}')
+        recheck(claims)
+
+    monkeypatch.setattr(
+        SQLiteConversationStore,
+        "_recheck_evidence_claims",
+        staticmethod(mutate_before_publish),
+    )
+
+    with pytest.raises(ValueError, match="changed|integrity"):
+        store.save(record)
+
+    assert store.get(record.id).task is None
 
 
 def test_export_keeps_one_snapshot_when_writer_commits_after_aggregate_read(

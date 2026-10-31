@@ -50,6 +50,13 @@ def canonical(value: object) -> str:
     )
 
 
+def _position(row: Row) -> int:
+    value = row["position"]
+    if type(value) is not int:
+        raise ValueError("Artifact position must be an integer")
+    return value
+
+
 def encode(
     record: Conversation,
     existing_artifacts: list[Row] | None = None,
@@ -60,8 +67,23 @@ def encode(
     }
     existing = {
         (row["task_id"], row["slot"], row["call_id"]): row
-        for row in (existing_artifacts or [])
+        for row in sorted(
+            (existing_artifacts or []),
+            key=_position,
+        )
         if row["slot"] in ("receipt", "checkpoint")
+    }
+    next_positions = {
+        (task_id, slot): 1 + max(
+            (
+                _position(row)
+                for row in (existing_artifacts or [])
+                if row["task_id"] == task_id and row["slot"] == slot
+            ),
+            default=-1,
+        )
+        for task_id in {str(row["task_id"]) for row in (existing_artifacts or [])}
+        for slot in ("receipt", "checkpoint")
     }
     result["conversations"].append(
         {
@@ -102,6 +124,12 @@ def encode(
     if len({task.id for task, _ in tasks}) != len(tasks):
         raise ValueError("Current and archived task identities must be unique")
     for task, archive_position in tasks:
+        result["artifacts"].extend(
+            dict(row)
+            for row in (existing_artifacts or [])
+            if row["task_id"] == task.id
+            and row["slot"] in ("receipt", "checkpoint")
+        )
         value = task.model_dump(mode="json")
         if set(value) != _TASK_FIELDS:
             raise ValueError("Unsupported task state fields require an explicit codec update")
@@ -190,6 +218,25 @@ def encode(
                 **describe_evidence(Path(task.result_directory), path).model_dump()
             )
 
+        def disk_position(
+            slot: str,
+            call_id: str,
+            descriptor: OutputArtifact,
+        ) -> int:
+            previous = existing.get((task.id, slot, call_id))
+            if previous is not None:
+                previous_descriptor = OutputArtifact.model_validate_json(
+                    str(previous["descriptor_json"])
+                )
+                if previous_descriptor == descriptor:
+                    return _position(previous)
+                if slot == "receipt":
+                    raise ValueError("Invocation receipt artifact is immutable")
+            key = (task.id, slot)
+            position = next_positions.get(key, 0)
+            next_positions[key] = position + 1
+            return position
+
         def artifact(
             slot: str,
             position: int,
@@ -209,41 +256,64 @@ def encode(
                 if media_type.startswith("image/")
                 else "data"
             )
-            result["artifacts"].append(
-                {
-                    "task_id": task.id,
-                    "slot": slot,
-                    "position": position,
-                    "call_id": call_id,
-                    "relative_path": descriptor.path,
-                    "sha256": descriptor.sha256,
-                    "size": descriptor.size,
-                    "media_type": media_type,
-                    "role": role,
-                    "descriptor_json": canonical(descriptor.model_dump(mode="json")),
-                }
+            row: Row = {
+                "task_id": task.id,
+                "slot": slot,
+                "position": position,
+                "call_id": call_id,
+                "relative_path": descriptor.path,
+                "sha256": descriptor.sha256,
+                "size": descriptor.size,
+                "media_type": media_type,
+                "role": role,
+                "descriptor_json": canonical(descriptor.model_dump(mode="json")),
+            }
+            previous = next(
+                (
+                    item
+                    for item in result["artifacts"]
+                    if item["task_id"] == task.id
+                    and item["slot"] == slot
+                    and item["position"] == position
+                ),
+                None,
             )
+            if previous is not None:
+                if previous != row:
+                    raise ValueError("Artifact position is already immutable")
+                return
+            result["artifacts"].append(row)
 
         for position, descriptor in enumerate(task.artifacts):
             artifact("task", position, descriptor)
         run_position = 0
         output_position = 0
-        for position, run in enumerate(task.analysis_runs):
+        for run in task.analysis_runs:
             descriptor = disk_descriptor(
                 "receipt", run.id, agent_receipt_name(run.id)
             )
-            artifact("receipt", position, descriptor, run.id)
+            artifact(
+                "receipt",
+                disk_position("receipt", run.id, descriptor),
+                descriptor,
+                run.id,
+            )
             for item in run.artifacts:
                 artifact("run", run_position, item, run.id)
                 run_position += 1
             for item in run.output.artifacts:
                 artifact("output", output_position, item, run.id)
                 output_position += 1
-        for position, (call_id, path) in enumerate(sorted(task.checkpoints.items())):
+        for call_id, path in sorted(task.checkpoints.items()):
             descriptor = disk_descriptor("checkpoint", call_id, path)
             if descriptor.sha256 != task.checkpoint_sha256.get(call_id):
                 raise ValueError("Checkpoint digest does not match the recorded state")
-            artifact("checkpoint", position, descriptor, call_id)
+            artifact(
+                "checkpoint",
+                disk_position("checkpoint", call_id, descriptor),
+                descriptor,
+                call_id,
+            )
     return result
 
 

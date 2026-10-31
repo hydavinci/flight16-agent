@@ -140,9 +140,8 @@ def test_changed_confirmed_baseline_is_not_recovered_under_its_old_confirmation(
     done = confirm(runtime, propose(runtime, conversation))
     done.task.baseline.nodes[0].inputs["observed"] = [100, 200]
     done.status = "interrupted"
-    store.save(done)
-    with pytest.raises(ValueError, match="baseline|confirmation|scope"):
-        restarted(runtime, store).resume(done.id)
+    with pytest.raises(ValueError, match="terminal|immutable"):
+        store.save(done)
     assert len(calls) == 1
 
 

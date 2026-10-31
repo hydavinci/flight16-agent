@@ -1,9 +1,11 @@
 import hashlib
 import json
 import sqlite3
+import stat
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -25,6 +27,12 @@ _RESTART_ERROR = (
 _RESTART_MESSAGE = "服务在处理追问时重启；原任务状态已保留，请重新发送问题或续接任务。"
 
 
+@dataclass(frozen=True)
+class _EvidenceClaim:
+    path: Path
+    identity: tuple[int, int, int, int, int, int]
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -35,7 +43,10 @@ class SQLiteConversationStore:
         self.root = root.resolve()
         self.backup_path = prepare_cutover(self.root, require_empty=require_empty)
         self.database_path = self.root / "conversations.sqlite3"
-        migrate_database(self.database_path)
+        migrate_database(
+            self.database_path,
+            validate_aggregates=self._validate_all_aggregates,
+        )
         self._local = threading.local()
         try:
             self._recover_startup()
@@ -46,33 +57,72 @@ class SQLiteConversationStore:
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
-        existing = getattr(self._local, "connection", None)
-        if existing is not None:
+        depth = getattr(self._local, "transaction_depth", 0)
+        if depth:
             name = "nested_" + uuid4().hex
-            existing.execute(f"SAVEPOINT {name}")
+            self._local.transaction_depth = depth + 1
+            self._local.savepoints.append(name)
+            existing = getattr(self._local, "connection", None)
+            if existing is not None:
+                existing.execute(f"SAVEPOINT {name}")
             try:
                 yield
-                existing.execute(f"RELEASE SAVEPOINT {name}")
+                existing = getattr(self._local, "connection", None)
+                if existing is not None:
+                    existing.execute(f"RELEASE SAVEPOINT {name}")
             except BaseException:
-                existing.execute(f"ROLLBACK TO SAVEPOINT {name}")
-                existing.execute(f"RELEASE SAVEPOINT {name}")
+                existing = getattr(self._local, "connection", None)
+                if existing is not None:
+                    existing.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                    existing.execute(f"RELEASE SAVEPOINT {name}")
                 raise
+            finally:
+                self._local.savepoints.pop()
+                self._local.transaction_depth = depth
             return
-        connection = connect_database(self.database_path)
-        self._local.connection = connection
+        self._local.transaction_depth = 1
+        self._local.savepoints = []
+        self._local.connection = None
+        self._local.evidence_claims = []
         try:
-            connection.execute("BEGIN IMMEDIATE")
             yield
-            connection.commit()
+            connection = self._local.connection
+            if connection is not None:
+                self._recheck_evidence_claims(self._local.evidence_claims)
+                connection.commit()
         except sqlite3.Error as exc:
-            connection.rollback()
+            connection = self._local.connection
+            if connection is not None:
+                connection.rollback()
             raise OSError(f"Conversation database transaction failed: {exc}") from exc
         except BaseException:
-            connection.rollback()
+            connection = self._local.connection
+            if connection is not None:
+                connection.rollback()
             raise
         finally:
+            connection = self._local.connection
             self._local.connection = None
+            self._local.transaction_depth = 0
+            self._local.savepoints = []
+            self._local.evidence_claims = []
+            if connection is not None:
+                connection.close()
+
+    def _write_connection(self) -> sqlite3.Connection:
+        connection = getattr(self._local, "connection", None)
+        if connection is not None:
+            return connection
+        connection = connect_database(self.database_path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for name in getattr(self._local, "savepoints", []):
+                connection.execute(f"SAVEPOINT {name}")
+        except BaseException:
             connection.close()
+            raise
+        self._local.connection = connection
+        return connection
 
     @contextmanager
     def _read(self) -> Iterator[sqlite3.Connection]:
@@ -89,6 +139,17 @@ class SQLiteConversationStore:
         finally:
             connection.rollback()
             connection.close()
+
+    @staticmethod
+    def _validate_all_aggregates(connection: sqlite3.Connection) -> None:
+        identifiers = [
+            row[0]
+            for row in connection.execute(
+                "SELECT id FROM conversations ORDER BY id"
+            )
+        ]
+        for identifier in identifiers:
+            decode(connection, str(identifier))
 
     def directory(self, conversation_id: str) -> Path:
         if not JOB_ID.fullmatch(conversation_id):
@@ -224,7 +285,7 @@ class SQLiteConversationStore:
 
     def _recover_startup(self) -> None:
         with self.transaction():
-            connection = self._local.connection
+            connection = self._write_connection()
             identifiers = [
                 row[0]
                 for row in connection.execute(
@@ -347,12 +408,125 @@ class SQLiteConversationStore:
             tuple(row.values()),
         )
 
+    @staticmethod
+    def _evidence_identity(path: Path) -> tuple[int, int, int, int, int, int]:
+        try:
+            info = path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError(f"Evidence is missing: {path.name}") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"Evidence changed identity: {path.name}")
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    @classmethod
+    def _capture_evidence_claim(
+        cls,
+        directory: Path,
+        descriptor: OutputArtifact,
+    ) -> _EvidenceClaim:
+        path = directory / descriptor.path
+        before = cls._evidence_identity(path)
+        verified = verify_evidence(directory, descriptor)
+        after = cls._evidence_identity(path)
+        if verified != path or before != after:
+            raise ValueError(f"Evidence changed while being verified: {descriptor.path}")
+        return _EvidenceClaim(path=path, identity=after)
+
+    @classmethod
+    def _recheck_evidence_claims(cls, claims: list[_EvidenceClaim]) -> None:
+        for claim in claims:
+            if cls._evidence_identity(claim.path) != claim.identity:
+                raise ValueError(
+                    f"Evidence changed between verification and publication: "
+                    f"{claim.path.name}"
+                )
+
+    def _prepare_evidence(
+        self,
+        record: Conversation,
+        rows: dict[str, list[Row]],
+        previous_artifacts: list[Row],
+        previous_calls: list[Row],
+    ) -> list[_EvidenceClaim]:
+        previous_by_key = {
+            (row["task_id"], row["slot"], row["position"]): row
+            for row in previous_artifacts
+        }
+        changed = []
+        for row in rows["artifacts"]:
+            key = (row["task_id"], row["slot"], row["position"])
+            previous = previous_by_key.get(key)
+            if previous is not None:
+                if previous != row:
+                    raise ValueError("Persisted artifact rows are immutable")
+                continue
+            changed.append(row)
+        tasks = {task.id: task for task in self._tasks(record)}
+        previous_call_status = {
+            str(row["id"]): str(row["status"]) for row in previous_calls
+        }
+        for task in tasks.values():
+            runs = {run.id: run for run in task.analysis_runs}
+            for call in task.calls:
+                if (
+                    call.status != "completed"
+                    or previous_call_status.get(call.id) == "completed"
+                ):
+                    continue
+                run = runs.get(call.id)
+                if run is None:
+                    raise ValueError("Completed call lacks its invocation receipt")
+                directory = self.task_directory(
+                    record.id, task.id, task.output_root
+                )
+                if load_agent_run(directory, call.id, run.spec) != run:
+                    raise ValueError(
+                        "Completed call lacks its verified disk receipt"
+                    )
+        claims: list[_EvidenceClaim] = []
+        seen: set[tuple[Path, str, int]] = set()
+        for row in changed:
+            task = tasks[str(row["task_id"])]
+            directory = self.task_directory(
+                record.id, task.id, task.output_root
+            )
+            descriptor = OutputArtifact.model_validate_json(
+                str(row["descriptor_json"])
+            )
+            artifact_key = (
+                directory / descriptor.path,
+                descriptor.sha256,
+                descriptor.size,
+            )
+            if artifact_key in seen:
+                continue
+            seen.add(artifact_key)
+            claims.append(self._capture_evidence_claim(directory, descriptor))
+        return claims
+
     def _check_artifacts(
         self,
         connection: sqlite3.Connection,
         record: Conversation,
         rows: dict[str, list[Row]],
+        claims: list[_EvidenceClaim],
     ) -> None:
+        self._recheck_evidence_claims(claims)
+        accepted_claims = getattr(self._local, "evidence_claims", None)
+        if accepted_claims is not None:
+            known = {(claim.path, claim.identity) for claim in accepted_claims}
+            accepted_claims.extend(
+                claim
+                for claim in claims
+                if (claim.path, claim.identity) not in known
+            )
         tasks = {
             task.id: task
             for task in [
@@ -388,30 +562,6 @@ class SQLiteConversationStore:
                 or previous_state["output_root"] != task.output_root
             ):
                 raise ValueError("Task result directory identity is immutable")
-        for row in rows["artifacts"]:
-            task = tasks[str(row["task_id"])]
-            if row["slot"] in ("receipt", "checkpoint"):
-                previous = connection.execute(
-                    "SELECT * FROM artifacts WHERE task_id=? AND slot=? AND call_id=?",
-                    (row["task_id"], row["slot"], row["call_id"]),
-                ).fetchone()
-            else:
-                previous = connection.execute(
-                    "SELECT * FROM artifacts WHERE task_id=? AND slot=? AND position=?",
-                    (row["task_id"], row["slot"], row["position"]),
-                ).fetchone()
-            if previous is not None and dict(previous) == row:
-                continue
-            if previous is not None and row["slot"] in ("receipt", "checkpoint"):
-                stable = dict(previous)
-                stable["position"] = row["position"]
-                if stable == row:
-                    continue
-            directory = self.task_directory(record.id, task.id, task.output_root)
-            verify_evidence(
-                directory,
-                OutputArtifact.model_validate_json(str(row["descriptor_json"])),
-            )
         for task in tasks.values():
             runs = {run.id: run for run in task.analysis_runs}
             for call in task.calls:
@@ -452,30 +602,51 @@ class SQLiteConversationStore:
                     )
                 if previous is not None and previous["status"] == "completed":
                     continue
-                directory = self.task_directory(
-                    record.id, task.id, task.output_root
-                )
-                if load_agent_run(directory, call.id, run.spec) != run:
-                    raise ValueError(
-                        "Completed call lacks its verified disk receipt"
-                    )
 
     def save(self, record: Conversation) -> None:
         self.directory(record.id)
         validated = Conversation.model_validate(record.model_dump(mode="json"))
         self._check_size(validated)
         validated.updated_at = _now()
+        with self._read() as connection:
+            expected_artifacts = [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT artifacts.* FROM artifacts JOIN tasks ON tasks.id=artifacts.task_id
+                       WHERE tasks.conversation_id=?
+                       ORDER BY artifacts.task_id, artifacts.slot, artifacts.position""",
+                    (record.id,),
+                )
+            ]
+            expected_calls = [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT calls.* FROM calls JOIN tasks ON tasks.id=calls.task_id
+                       WHERE tasks.conversation_id=?
+                       ORDER BY calls.task_id, calls.position""",
+                    (record.id,),
+                )
+            ]
+        rows = encode(validated, expected_artifacts)
+        claims = self._prepare_evidence(
+            validated,
+            rows,
+            expected_artifacts,
+            expected_calls,
+        )
         with self.transaction():
-            connection = self._local.connection
+            connection = self._write_connection()
             previous_artifacts = [
                 dict(row)
                 for row in connection.execute(
                     """SELECT artifacts.* FROM artifacts JOIN tasks ON tasks.id=artifacts.task_id
-                       WHERE tasks.conversation_id=?""",
+                       WHERE tasks.conversation_id=?
+                       ORDER BY artifacts.task_id, artifacts.slot, artifacts.position""",
                     (record.id,),
                 )
             ]
-            rows = encode(validated, previous_artifacts)
+            if previous_artifacts != expected_artifacts:
+                raise ValueError("Stored artifact ledger changed during publication")
             old_messages = [
                 dict(row)
                 for row in connection.execute(
@@ -493,6 +664,26 @@ class SQLiteConversationStore:
             }
             if not set(old_tasks) <= {row["id"] for row in rows["tasks"]}:
                 raise ValueError("Archived tasks cannot be dropped")
+            for row in rows["tasks"]:
+                previous = old_tasks.get(str(row["id"]))
+                if previous is None:
+                    continue
+                row["created_at"] = previous["created_at"]
+                result = json.loads(previous["result_json"])
+                terminal = (
+                    isinstance(result, dict)
+                    and result.get("execution_status") in ("completed", "partial")
+                )
+                if not terminal:
+                    continue
+                immutable_fields = set(row) - {"archive_position", "updated_at"}
+                if any(previous[field] != row[field] for field in immutable_fields):
+                    raise ValueError("Terminal task payload is immutable")
+                old_position = previous["archive_position"]
+                new_position = row["archive_position"]
+                if old_position is not None and new_position != old_position:
+                    raise ValueError("Archived task position is immutable")
+                row["updated_at"] = previous["updated_at"]
             old_calls = [
                 dict(row)
                 for row in connection.execute(
@@ -536,21 +727,22 @@ class SQLiteConversationStore:
                     and old_call != new_call
                 ):
                     raise ValueError("Terminal call records are immutable")
-            old_artifact_keys = {
-                (row["task_id"], row["slot"], row["position"])
+            old_artifacts = {
+                (row["task_id"], row["slot"], row["position"]): row
                 for row in previous_artifacts
             }
-            new_artifact_keys = {
-                (row["task_id"], row["slot"], row["position"])
+            new_artifacts = {
+                (row["task_id"], row["slot"], row["position"]): row
                 for row in rows["artifacts"]
             }
-            if not old_artifact_keys <= new_artifact_keys:
+            if not set(old_artifacts) <= set(new_artifacts):
                 raise ValueError("Persisted artifact evidence cannot be dropped")
-            self._check_artifacts(connection, validated, rows)
-            for row in rows["tasks"]:
-                previous = old_tasks.get(str(row["id"]))
-                if previous is not None:
-                    row["created_at"] = previous["created_at"]
+            if any(
+                old_artifacts[key] != new_artifacts[key]
+                for key in old_artifacts
+            ):
+                raise ValueError("Persisted artifact rows are immutable")
+            self._check_artifacts(connection, validated, rows, claims)
             for table in ("conversations", "tasks", "messages", "calls", "artifacts"):
                 for row in rows[table]:
                     keys = (

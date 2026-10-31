@@ -1,8 +1,6 @@
 import hashlib
 import json
 import logging
-import os
-import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -55,7 +53,7 @@ from .contracts import (
     ToolCall,
 )
 from .conversation_repository import ConversationRepository
-from .intake import safe_directory, validate_output_root
+from .intake import validate_output_root
 from .resources import ResourceRegistry
 from .store import now
 
@@ -246,18 +244,20 @@ def build_context(
     if str(directory) != task.result_directory:
         raise ValueError("Task result directory does not match its persisted identity")
     spec = task.pending_specs[call.id]
-    name = f"agent/checkpoints/{call.id}/checkpoint.json"
+    checkpoint_root = f"agent/checkpoints/{call.id}"
 
     def active() -> None:
         if call.status not in ("running", "interrupted") or task.pending_specs.get(call.id) != spec:
             raise ValueError("Checkpoint access is outside the original unresolved call")
-        if call.id in task.checkpoints and task.checkpoints[call.id] != name:
+        current = task.checkpoints.get(call.id)
+        if current is not None and Path(current).parent.as_posix() != checkpoint_root:
             raise ValueError("Checkpoint reference is outside this call's directory")
 
     def load_checkpoint() -> dict[str, JsonValue] | None:
         active()
         if call.id not in task.checkpoints:
             return None
+        name = task.checkpoints[call.id]
         descriptor = describe_evidence(directory, name)
         if descriptor.sha256 != task.checkpoint_sha256.get(call.id):
             raise ValueError("Checkpoint digest does not match the recorded state")
@@ -293,28 +293,11 @@ def build_context(
         ).encode("utf-8")
         if len(content) > MAX_CHECKPOINT_BYTES:
             raise ValueError("Checkpoint exceeds its serialized size limit")
-        path = directory / name
-        safe_directory(path.parent)
-        if path.is_symlink():
-            raise ValueError("Unsafe checkpoint symlink")
-        if path.exists():
-            if call.id not in task.checkpoints:
-                raise ValueError("Unrecorded checkpoint cannot replace current state")
+        if call.id in task.checkpoints:
             load_checkpoint()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=path.parent, prefix=".checkpoint-", delete=False
-            ) as file:
-                temporary = Path(file.name)
-                file.write(content)
-                file.flush()
-                os.fsync(file.fileno())
-            temporary.replace(path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        digest = hashlib.sha256(content).hexdigest()
+        name = f"{checkpoint_root}/{digest}.json"
+        publish_evidence(directory, name, content)
         descriptor = describe_evidence(directory, name)
         task.checkpoints[call.id] = name
         task.checkpoint_sha256[call.id] = descriptor.sha256
@@ -505,6 +488,25 @@ class AgentExecutor:
             if not task.baseline.confirmed:
                 raise ValueError("Execution requires a confirmed baseline")
             self._validate_structure(task)
+            if (
+                task.result is not None
+                and task.result.execution_status in ("completed", "partial")
+                and all(node.status == "completed" for node in task.nodes)
+            ):
+                try:
+                    self._verify_saved(conversation, task)
+                    conversation.status = "completed"
+                    conversation.error = None
+                    conversation.pending_decision = None
+                except (OSError, ValueError, RuntimeError) as exc:
+                    conversation.status = "failed"
+                    conversation.error = str(exc)[:4000]
+                    conversation.pending_decision = PendingDecision(
+                        kind="retry",
+                        message=conversation.error,
+                    )
+                self.store.save(conversation)
+                return conversation
             task.decisions.append(
                 Decision(action="resume", baseline_version=task.baseline.version, created_at=now())
             )

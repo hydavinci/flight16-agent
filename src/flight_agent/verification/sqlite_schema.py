@@ -226,7 +226,11 @@ def _validate_database(connection: sqlite3.Connection) -> int:
     return version
 
 
-def migrate_database(path: Path) -> None:
+def migrate_database(
+    path: Path,
+    *,
+    validate_aggregates: Callable[[sqlite3.Connection], None] | None = None,
+) -> None:
     connection: sqlite3.Connection | None = None
     expected: SnapshotState | None = None
     try:
@@ -236,6 +240,13 @@ def migrate_database(path: Path) -> None:
                     probe = connect_database(snapshot.database)
                     try:
                         _validate_database(probe)
+                        if validate_aggregates is not None:
+                            try:
+                                validate_aggregates(probe)
+                            except (sqlite3.Error, ValueError) as exc:
+                                raise DatabaseStartupError(
+                                    f"SQLite aggregate validation failed: {exc}"
+                                ) from exc
                     finally:
                         probe.close()
                     expected = snapshot.source_state

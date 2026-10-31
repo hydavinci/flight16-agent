@@ -8,6 +8,14 @@ from .intake import safe_directory
 from .sqlite_schema import DatabaseStartupError
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _inventory(root: Path) -> dict[str, tuple[int, str] | None]:
     result: dict[str, tuple[int, str] | None] = {}
     for path in sorted(root.rglob("*")):
@@ -54,7 +62,12 @@ def prepare_cutover(root: Path, *, require_empty: bool) -> Path | None:
             if path.is_file():
                 with path.open("rb") as stream:
                     os.fsync(stream.fileno())
+        directories = [path for path in partial.rglob("*") if path.is_dir()]
+        for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+            _fsync_directory(path)
+        _fsync_directory(partial)
         partial.rename(target)
+        _fsync_directory(target.parent)
         return target
     except (OSError, ValueError) as exc:
         raise DatabaseStartupError(f"Cutover backup failed: {exc}") from exc
