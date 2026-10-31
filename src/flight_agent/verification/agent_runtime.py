@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -60,7 +61,14 @@ from .contracts import (
 )
 from .conversation_repository import ConversationRepository
 from .intake import validate_output_root
+from .project_snapshots import ProjectSnapshotStore
 from .resources import ResourceRegistry
+from .snapshot_binding import (
+    local_projects,
+    prepare_project_snapshots,
+    validate_managed_boundaries,
+    validate_snapshot_bindings,
+)
 from .store import now
 
 logger = logging.getLogger(__name__)
@@ -412,6 +420,7 @@ class AgentExecutor:
         *,
         locks: ConversationLockRegistry | None = None,
         scheduler: ExecutionScheduler | None = None,
+        snapshots: ProjectSnapshotStore | None = None,
     ) -> None:
         self.store = store
         self.tools = tools
@@ -422,6 +431,12 @@ class AgentExecutor:
             if scheduler is not None
             else ExecutionScheduler(SchedulerSettings.from_environment())
         )
+        self.snapshots = (
+            snapshots
+            if snapshots is not None
+            else ProjectSnapshotStore(store.root / "snapshots")
+        )
+        self.work_root = store.root / "work"
 
     def _directory(
         self, conversation: Conversation, task: AgentTask, *, create: bool = False
@@ -468,15 +483,20 @@ class AgentExecutor:
             raise ValueError("Execution nodes differ from the confirmed baseline")
         if set(baseline.capability_snapshots) != {node.tool for node in baseline.nodes}:
             raise ValueError("Baseline snapshots must cover exactly the confirmed capabilities")
+        validate_snapshot_bindings(baseline, require=False)
         if baseline.confirmed and (
             task.baseline_sha256 != fingerprint(baseline.model_dump(mode="json"))
         ):
             raise ValueError("Baseline differs from its recorded confirmation fingerprint")
 
     def _validate_resource_boundary(self, baseline: AgentPlan, output: str | None) -> None:
-        validate_output_root(output)
-        for source in self.resources.local_roots(baseline.resources):
-            validate_output_root(output, str(source))
+        validate_managed_boundaries(
+            baseline,
+            self.resources,
+            self.snapshots,
+            self.work_root,
+            output,
+        )
 
     def propose(self, conversation: Conversation, plan: AgentPlan) -> Conversation:
         with self.locks.hold(conversation.id):
@@ -519,6 +539,7 @@ class AgentExecutor:
                 result_directory=effective,
                 output_root=output_root,
             )
+            self._validate_structure(task)
             if conversation.task is not None:
                 conversation.archived_tasks.append(conversation.task)
             conversation.task = task
@@ -556,12 +577,67 @@ class AgentExecutor:
     ) -> Conversation:
         with self.locks.hold(conversation_id):
             conversation = self.store.get(conversation_id)
-            prepared = self._prepare_confirm(conversation, version, trusted=trusted)
-            if prepared.save:
-                self.store.save(conversation)
+            conversation, prepared = self._confirm_and_save(
+                conversation,
+                version,
+                trusted=trusted,
+            )
         if not _execute or prepared.task_id is None:
             return conversation
         return self._run(conversation_id, "confirm", prepared.task_id)
+
+    def _confirm_and_save(
+        self,
+        conversation: Conversation,
+        version: int,
+        *,
+        trusted: bool,
+        revalidate: Callable[[], None] | None = None,
+    ) -> tuple[Conversation, _PreparedDecision]:
+        candidate = conversation.model_copy(deep=True)
+        prepared = self._prepare_confirm(candidate, version, trusted=trusted)
+        if not prepared.save:
+            return conversation, prepared
+        task = self._task(candidate)
+        guard = self.snapshots.guard() if local_projects(task.baseline) else nullcontext()
+        with guard:
+            bindings = prepare_project_snapshots(task.baseline, self.snapshots)
+            self.resources.verify(task.baseline.resources)
+            task.baseline = AgentBaseline.model_validate(
+                {
+                    **task.baseline.model_dump(mode="json"),
+                    "project_snapshots": {
+                        identifier: binding.model_dump(mode="json")
+                        for identifier, binding in bindings.items()
+                    },
+                    "confirmed": True,
+                    "confirmed_at": now(),
+                }
+            )
+            validate_snapshot_bindings(task.baseline, require=True)
+            task.baseline_sha256 = fingerprint(task.baseline.model_dump(mode="json"))
+            task.decisions.append(
+                Decision(
+                    action="confirm_baseline",
+                    baseline_version=version,
+                    trusted=True,
+                    created_at=now(),
+                )
+            )
+            candidate.queue_origin = ConversationState(
+                status=candidate.status,
+                pending_decision=candidate.pending_decision,
+                error=candidate.error,
+            )
+            candidate.status = "queued"
+            candidate.queued_action = "confirm"
+            candidate.queued_action_committed = True
+            candidate.pending_decision = None
+            candidate.error = None
+            if revalidate is not None:
+                revalidate()
+            self.store.save(candidate)
+        return candidate, prepared
 
     def _prepare_confirm(
         self,
@@ -589,32 +665,6 @@ class AgentExecutor:
         self.resources.verify(task.baseline.resources)
         self._validate_resource_boundary(task.baseline, task.result_directory)
         self._directory(conversation, task, create=True)
-        task.baseline = AgentBaseline.model_validate(
-            {
-                **task.baseline.model_dump(),
-                "confirmed": True,
-                "confirmed_at": now(),
-            }
-        )
-        task.baseline_sha256 = fingerprint(task.baseline.model_dump(mode="json"))
-        task.decisions.append(
-            Decision(
-                action="confirm_baseline",
-                baseline_version=version,
-                trusted=True,
-                created_at=now(),
-            )
-        )
-        conversation.queue_origin = ConversationState(
-            status=conversation.status,
-            pending_decision=conversation.pending_decision,
-            error=conversation.error,
-        )
-        conversation.status = "queued"
-        conversation.queued_action = "confirm"
-        conversation.queued_action_committed = True
-        conversation.pending_decision = None
-        conversation.error = None
         return _PreparedDecision(task_id=task.id, save=True)
 
     def resume(

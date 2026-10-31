@@ -437,17 +437,29 @@ class EngineeringRuntime:
             queued.queue_origin = None
             queued.queued_action = None
             queued.queued_action_committed = False
-            prepared = self.executor._prepare_decision(
-                queued,
-                action,
-                version=version,
-                trusted=trusted,
-            )
-            if self.store.get(conversation_id) != reservation:
-                raise ValueError("The queued decision is no longer current")
-            if not prepared.save:
-                return reservation
-            self.store.save(queued)
+            if action == "confirm":
+                def revalidate() -> None:
+                    if self.store.get(conversation_id) != reservation:
+                        raise ValueError("The queued decision is no longer current")
+
+                queued, prepared = self.executor._confirm_and_save(
+                    queued,
+                    version if version is not None else 0,
+                    trusted=trusted,
+                    revalidate=revalidate,
+                )
+            else:
+                prepared = self.executor._prepare_decision(
+                    queued,
+                    action,
+                    version=version,
+                    trusted=trusted,
+                )
+                if self.store.get(conversation_id) != reservation:
+                    raise ValueError("The queued decision is no longer current")
+                if not prepared.save:
+                    return reservation
+                self.store.save(queued)
             task_id = prepared.task_id
             if task_id is None:
                 return queued
