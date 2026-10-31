@@ -153,38 +153,66 @@ class EngineeringRuntime:
             reservation_stamp = record.updated_at
             message = record.messages[-1].model_copy(deep=True)
             task_id = record.task.id if record.task is not None else None
+            if record.queue_origin is None:
+                raise ValueError("Queued planning action has no recorded origin")
+            queue_origin = record.queue_origin.model_copy(deep=True)
             planning_record = record.model_copy(deep=True)
-        resources: dict[str, ResourceReference] = {}
-        if planning_record.project_root:
-            if planning_record.resource_location is None:
-                with self.locks.hold(conversation_id):
-                    current = self.store.get(conversation_id)
-                    return self._wait(current, "请先选择资源位置。")
-            resource = self.resources.inspect(
-                planning_record.resource_location,
-                planning_record.project_root,
+        try:
+            resources: dict[str, ResourceReference] = {}
+            if planning_record.project_root:
+                if planning_record.resource_location is None:
+                    with self.locks.hold(conversation_id):
+                        current = self.store.get(conversation_id)
+                        return self._wait(current, "请先选择资源位置。")
+                resource = self.resources.inspect(
+                    planning_record.resource_location,
+                    planning_record.project_root,
+                )
+                resources[resource.id] = resource
+            catalog = self.executor.tools.catalog(tuple(resources.values()))
+            sources = message_sources(planning_record)
+            decision = self.planner.propose(
+                message.content,
+                planning_record,
+                catalog=catalog,
+                resources=resources,
+                sources=sources,
             )
-            resources[resource.id] = resource
-        catalog = self.executor.tools.catalog(tuple(resources.values()))
-        sources = message_sources(planning_record)
-        decision = self.planner.propose(
-            message.content,
-            planning_record,
-            catalog=catalog,
-            resources=resources,
-            sources=sources,
-        )
-        plan = (
-            bind_plan(decision.plan, resources, sources, catalog)
-            if decision.plan is not None
-            else None
-        )
+            plan = (
+                bind_plan(decision.plan, resources, sources, catalog)
+                if decision.plan is not None
+                else None
+            )
+        except Exception as exc:
+            with self.locks.hold(conversation_id):
+                current = self.store.get(conversation_id)
+                current_task_id = (
+                    current.task.id if current.task is not None else None
+                )
+                if (
+                    current.status == "planning"
+                    and current.queued_action == "message"
+                    and current.queue_origin == queue_origin
+                    and current.updated_at == reservation_stamp
+                    and current_task_id == task_id
+                    and current.messages
+                    and current.messages[-1] == message
+                ):
+                    current.status = "failed"
+                    current.error = str(exc)[:4000]
+                    current.pending_decision = None
+                    current.turn_origin = None
+                    current.queued_action = None
+                    current.queue_origin = None
+                    self.store.save(current)
+            raise
         with self.locks.hold(conversation_id):
             record = self.store.get(conversation_id)
             current_task_id = record.task.id if record.task is not None else None
             if (
                 record.status != "planning"
                 or record.queued_action != "message"
+                or record.queue_origin != queue_origin
                 or record.updated_at != reservation_stamp
                 or current_task_id != task_id
                 or not record.messages
@@ -289,21 +317,57 @@ class EngineeringRuntime:
         version: int | None = None,
         trusted: bool = False,
     ) -> Conversation:
-        if action == "confirm":
-            return self.executor.confirm(
+        with self.locks.hold(conversation_id):
+            record = self.store.get(conversation_id)
+            if record.status in ("queued", "planning", "running"):
+                if action == "confirm":
+                    return self.executor.confirm(
+                        conversation_id,
+                        version if version is not None else 0,
+                        trusted=trusted,
+                    )
+                if action == "resume":
+                    return self.executor.resume(conversation_id)
+                if action == "retry":
+                    return self.executor.retry(
+                        conversation_id,
+                        version if version is not None else 0,
+                        trusted=trusted,
+                    )
+            operation = self.prepare_decision(
                 conversation_id,
-                version if version is not None else 0,
+                action,
+                version=version,
                 trusted=trusted,
             )
-        if action == "resume":
-            return self.executor.resume(conversation_id)
-        if action == "retry":
-            return self.executor.retry(
-                conversation_id,
-                version if version is not None else 0,
-                trusted=trusted,
-            )
-        raise ValueError("Submit new requirements for a new confirmed plan")
+            if operation is None:
+                return record
+            if action == "confirm":
+                queued = self.executor.confirm(
+                    conversation_id,
+                    version if version is not None else 0,
+                    trusted=trusted,
+                    _execute=False,
+                )
+            elif action == "resume":
+                queued = self.executor.resume(
+                    conversation_id, _execute=False
+                )
+            elif action == "retry":
+                queued = self.executor.retry(
+                    conversation_id,
+                    version if version is not None else 0,
+                    trusted=trusted,
+                    _execute=False,
+                )
+            else:
+                raise ValueError(
+                    "Submit new requirements for a new confirmed plan"
+                )
+            if queued.task is None:
+                raise ValueError("No task has been planned")
+            task_id = queued.task.id
+        return self.executor._run(conversation_id, action, task_id)
 
     def capability_catalog(self) -> list[dict[str, object]]:
         return self.executor.tools.catalog()

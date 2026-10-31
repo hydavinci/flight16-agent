@@ -7,6 +7,7 @@ import pytest
 
 from flight_agent.runtime.observations import CapabilityOutcome
 from flight_agent.verification.agent_planner import AgentDecision
+from flight_agent.verification.contracts import ConversationState, PendingDecision
 from flight_agent.verification.coordinator import ConversationActive
 from tests.agent_helpers import analysis_plan_data
 from tests.scheduling_helpers import make_runtime, propose_fake
@@ -134,6 +135,153 @@ def test_planner_runs_without_holding_conversation_lock(tmp_path):
     assert runtime.continue_submission(queued.id).status == "completed"
 
 
+def test_stale_planner_result_cannot_overwrite_newer_record(tmp_path):
+    entered, release = Event(), Event()
+
+    class Planner:
+        def propose(self, message, conversation, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return AgentDecision(action="answer", text="Stale answer")
+
+    runtime = make_runtime(
+        tmp_path, Planner(), lambda context, inputs: CapabilityOutcome()
+    )
+    queued = runtime.queue_message(None, "Question")
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(runtime.continue_submission, queued.id)
+        assert entered.wait(5)
+        with runtime.locks.hold(queued.id):
+            newer = runtime.store.get(queued.id)
+            newer.status = "waiting_for_user"
+            newer.queued_action = None
+            newer.queue_origin = None
+            newer.error = "newer planner state"
+            newer.pending_decision = PendingDecision(
+                kind="clarify", message="Newer clarification"
+            )
+            runtime.store.save(newer)
+        release.set()
+        with pytest.raises(ConversationActive, match="changed"):
+            future.result(timeout=5)
+    saved = runtime.store.get(queued.id)
+    assert saved.status == "waiting_for_user"
+    assert saved.error == "newer planner state"
+    assert saved.pending_decision.message == "Newer clarification"
+    assert saved.task is None
+
+
+def test_matching_planner_exception_clears_reservation(tmp_path):
+    class Planner:
+        def propose(self, message, conversation, **kwargs):
+            raise RuntimeError("Planner unavailable")
+
+    runtime = make_runtime(
+        tmp_path, Planner(), lambda context, inputs: CapabilityOutcome()
+    )
+    queued = runtime.queue_message(None, "Question")
+    with pytest.raises(RuntimeError, match="Planner unavailable"):
+        runtime.continue_submission(queued.id)
+    saved = runtime.store.get(queued.id)
+    assert saved.status == "failed"
+    assert saved.error == "Planner unavailable"
+    assert saved.queued_action is None
+    assert saved.queue_origin is None
+
+
+def test_stale_planner_exception_cannot_overwrite_newer_record(tmp_path):
+    entered, release = Event(), Event()
+
+    class Planner:
+        def propose(self, message, conversation, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            raise RuntimeError("Stale planner failure")
+
+    runtime = make_runtime(
+        tmp_path, Planner(), lambda context, inputs: CapabilityOutcome()
+    )
+    queued = runtime.queue_message(None, "Question")
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(runtime.continue_submission, queued.id)
+        assert entered.wait(5)
+        with runtime.locks.hold(queued.id):
+            newer = runtime.store.get(queued.id)
+            newer.status = "waiting_for_user"
+            newer.queued_action = None
+            newer.queue_origin = None
+            newer.error = "newer planner state"
+            runtime.store.save(newer)
+        release.set()
+        with pytest.raises(RuntimeError, match="Stale planner failure"):
+            future.result(timeout=5)
+    saved = runtime.store.get(queued.id)
+    assert saved.status == "waiting_for_user"
+    assert saved.error == "newer planner state"
+
+
+def test_matching_resource_exception_clears_reservation(tmp_path, monkeypatch):
+    runtime = make_runtime(
+        tmp_path, None, lambda context, inputs: CapabilityOutcome()
+    )
+    queued = runtime.queue_message(None, "Question")
+    with runtime.locks.hold(queued.id):
+        record = runtime.store.get(queued.id)
+        record.project_root = str(tmp_path)
+        record.resource_location = "missing"
+        runtime.store.save(record)
+
+    def unavailable(location, locator):
+        raise OSError("Resource unavailable")
+
+    monkeypatch.setattr(runtime.resources, "inspect", unavailable)
+    with pytest.raises(OSError, match="Resource unavailable"):
+        runtime.continue_submission(queued.id)
+    saved = runtime.store.get(queued.id)
+    assert saved.status == "failed"
+    assert saved.error == "Resource unavailable"
+    assert saved.queued_action is None
+    assert saved.queue_origin is None
+
+
+def test_stale_resource_exception_cannot_overwrite_newer_record(
+    tmp_path, monkeypatch
+):
+    entered, release = Event(), Event()
+    runtime = make_runtime(
+        tmp_path, None, lambda context, inputs: CapabilityOutcome()
+    )
+    queued = runtime.queue_message(None, "Question")
+    with runtime.locks.hold(queued.id):
+        record = runtime.store.get(queued.id)
+        record.project_root = str(tmp_path)
+        record.resource_location = "missing"
+        runtime.store.save(record)
+
+    def unavailable(location, locator):
+        entered.set()
+        assert release.wait(5)
+        raise OSError("Stale resource failure")
+
+    monkeypatch.setattr(runtime.resources, "inspect", unavailable)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(runtime.continue_submission, queued.id)
+        assert entered.wait(5)
+        with runtime.locks.hold(queued.id):
+            newer = runtime.store.get(queued.id)
+            newer.status = "waiting_for_user"
+            newer.queued_action = None
+            newer.queue_origin = None
+            newer.error = "newer resource state"
+            runtime.store.save(newer)
+        release.set()
+        with pytest.raises(OSError, match="Stale resource failure"):
+            future.result(timeout=5)
+    saved = runtime.store.get(queued.id)
+    assert saved.status == "waiting_for_user"
+    assert saved.error == "newer resource state"
+
+
 def test_capability_runs_without_holding_conversation_lock(tmp_path):
     runtime = None
     identifier = None
@@ -146,6 +294,113 @@ def test_capability_runs_without_holding_conversation_lock(tmp_path):
     pending = propose_fake(runtime)
     identifier = pending.id
     assert runtime.executor.confirm(pending.id, 1, trusted=True).status == "completed"
+
+
+def test_stale_capability_result_cannot_overwrite_newer_record(tmp_path):
+    entered, release = Event(), Event()
+
+    def operation(context, inputs):
+        entered.set()
+        assert release.wait(5)
+        return CapabilityOutcome()
+
+    runtime = make_runtime(tmp_path, None, operation)
+    pending = propose_fake(runtime)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(
+            runtime.executor.confirm, pending.id, 1, trusted=True
+        )
+        assert entered.wait(5)
+        with runtime.locks.hold(pending.id):
+            newer = runtime.store.get(pending.id)
+            call = newer.task.calls[0].model_copy(deep=True)
+            budget = newer.task.budget_state.model_copy(deep=True)
+            newer.error = "newer capability state"
+            newer.queue_origin = ConversationState(
+                status="waiting_for_user",
+                pending_decision=None,
+                error="newer capability state",
+            )
+            runtime.store.save(newer)
+        release.set()
+        result = future.result(timeout=5)
+    saved = runtime.store.get(pending.id)
+    assert result.error == saved.error == "newer capability state"
+    assert saved.task.calls[0] == call
+    assert saved.task.budget_state == budget
+    assert saved.task.analysis_runs == []
+    assert saved.task.outputs == {}
+
+
+def test_stale_capability_exception_cannot_apply_failure_or_budget(tmp_path):
+    entered, release = Event(), Event()
+
+    def operation(context, inputs):
+        entered.set()
+        assert release.wait(5)
+        context.budget.charge_round(key="stale-callback")
+        raise RuntimeError("Stale capability failure")
+
+    runtime = make_runtime(tmp_path, None, operation)
+    pending = propose_fake(runtime)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(
+            runtime.executor.confirm, pending.id, 1, trusted=True
+        )
+        assert entered.wait(5)
+        with runtime.locks.hold(pending.id):
+            newer = runtime.store.get(pending.id)
+            call = newer.task.calls[0].model_copy(deep=True)
+            budget = newer.task.budget_state.model_copy(deep=True)
+            newer.error = "newer capability state"
+            newer.queue_origin = ConversationState(
+                status="waiting_for_user",
+                pending_decision=None,
+                error="newer capability state",
+            )
+            runtime.store.save(newer)
+        release.set()
+        result = future.result(timeout=5)
+    saved = runtime.store.get(pending.id)
+    assert result.error == saved.error == "newer capability state"
+    assert saved.task.calls[0] == call
+    assert saved.task.budget_state == budget
+    assert saved.task.analysis_runs == []
+
+
+@pytest.mark.parametrize("kind", ["clarify", "capability_gap"])
+@pytest.mark.parametrize("action", ["confirm", "resume", "retry"])
+def test_decide_preserves_pending_followup_guards(tmp_path, kind, action):
+    runtime = make_runtime(
+        tmp_path, None, lambda context, inputs: CapabilityOutcome()
+    )
+    pending = propose_fake(runtime)
+    completed = runtime.executor.confirm(pending.id, 1, trusted=True)
+    with runtime.locks.hold(completed.id):
+        record = runtime.store.get(completed.id)
+        record.status = "waiting_for_user"
+        record.pending_decision = PendingDecision(
+            kind=kind, message="Address this follow-up"
+        )
+        runtime.store.save(record)
+    kwargs = (
+        {"version": 1, "trusted": True}
+        if action in ("confirm", "retry")
+        else {}
+    )
+    with pytest.raises(
+        ValueError,
+        match=(
+            "new unconfirmed baseline"
+            if action == "confirm"
+            else "current follow-up"
+        ),
+    ):
+        runtime.decide(completed.id, action, **kwargs)
+    saved = runtime.store.get(completed.id)
+    assert saved.status == "waiting_for_user"
+    assert saved.pending_decision.kind == kind
+    assert saved.queued_action is None
 
 
 def test_capability_checkpoint_mutation_uses_conversation_lock(tmp_path):

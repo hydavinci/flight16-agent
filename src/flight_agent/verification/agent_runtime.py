@@ -21,7 +21,11 @@ from ..runtime.agent_contracts import (
     validate_bindings,
 )
 from ..runtime.budget import BudgetAccount, BudgetExhausted
-from ..runtime.capabilities import CapabilityRegistry, validate_declared_outcome
+from ..runtime.capabilities import (
+    CapabilityDefinition,
+    CapabilityRegistry,
+    validate_declared_outcome,
+)
 from ..runtime.contracts import fingerprint
 from ..runtime.conversation_locks import ConversationLockRegistry
 from ..runtime.evidence import (
@@ -33,7 +37,7 @@ from ..runtime.evidence import (
     publish_evidence,
     verify_evidence,
 )
-from ..runtime.loop import LoopDecision
+from ..runtime.loop import LoopDecision, run_loop
 from ..runtime.observations import (
     CapabilityOutcome,
     OutputArtifact,
@@ -43,6 +47,7 @@ from ..runtime.observations import (
 from ..runtime.requirements import CapabilityGap
 from ..runtime.resources import ResourceReference, bounded_json
 from ..runtime.scheduling import ExecutionScheduler
+from ..runtime.scheduling_contracts import SchedulingMetadata
 from .contracts import (
     AgentExecutionNode,
     AgentTask,
@@ -242,6 +247,7 @@ def build_context(
     store: ConversationRepository,
     locks: ConversationLockRegistry,
     action: str,
+    queue_origin: ConversationState,
 ) -> AgentContext:
     conversation_id = conversation.id
     task_id = task.id
@@ -261,7 +267,7 @@ def build_context(
             or current_task.id != task_id
             or current.status != "running"
             or current.queued_action != action
-            or current.queue_origin is None
+            or current.queue_origin != queue_origin
             or current_task.stage != node_id
         ):
             raise ValueError("Checkpoint access is outside the admitted action")
@@ -509,7 +515,14 @@ class AgentExecutor:
             self.store.save(conversation)
             return conversation
 
-    def confirm(self, conversation_id: str, version: int, *, trusted: bool) -> Conversation:
+    def confirm(
+        self,
+        conversation_id: str,
+        version: int,
+        *,
+        trusted: bool,
+        _execute: bool = True,
+    ) -> Conversation:
         with self.locks.hold(conversation_id):
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
@@ -558,9 +571,13 @@ class AgentExecutor:
             conversation.error = None
             self.store.save(conversation)
             task_id = task.id
+        if not _execute:
+            return conversation
         return self._run(conversation_id, "confirm", task_id)
 
-    def resume(self, conversation_id: str) -> Conversation:
+    def resume(
+        self, conversation_id: str, *, _execute: bool = True
+    ) -> Conversation:
         with self.locks.hold(conversation_id):
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
@@ -604,9 +621,18 @@ class AgentExecutor:
             conversation.error = None
             self.store.save(conversation)
             task_id = task.id
+        if not _execute:
+            return conversation
         return self._run(conversation_id, "resume", task_id)
 
-    def retry(self, conversation_id: str, version: int, *, trusted: bool) -> Conversation:
+    def retry(
+        self,
+        conversation_id: str,
+        version: int,
+        *,
+        trusted: bool,
+        _execute: bool = True,
+    ) -> Conversation:
         with self.locks.hold(conversation_id):
             conversation = self.store.get(conversation_id)
             task = self._task(conversation)
@@ -641,6 +667,8 @@ class AgentExecutor:
             conversation.error = None
             self.store.save(conversation)
             task_id = task.id
+        if not _execute:
+            return conversation
         return self._run(conversation_id, "retry", task_id)
 
     def _live_node(self, task: AgentTask, node: AgentExecutionNode) -> None:
@@ -849,6 +877,10 @@ class AgentExecutor:
         ]
         for call_id in call_ids:
             node_id: str | None = None
+            node_tool: str | None = None
+            spec: InvocationSpec | None = None
+            definition: CapabilityDefinition | None = None
+            scheduling: SchedulingMetadata | None = None
             try:
                 with self.locks.hold(conversation_id):
                     conversation = self.store.get(conversation_id)
@@ -935,6 +967,7 @@ class AgentExecutor:
                             call.status not in ("running", "interrupted")
                             or conversation.queue_origin != queue_origin
                             or node.tool != node_tool
+                            or call.node_id != node.id
                             or task.pending_specs.get(call.id)
                             != self._spec(task, node, call)
                             or conversation.status != "queued"
@@ -944,7 +977,23 @@ class AgentExecutor:
                             raise ExecutionUncertain(
                                 "Queued reconciliation changed before lane admission"
                             )
+                        self._verify_saved(conversation, task)
                         self._live_node(task, node)
+                        if not set(node.depends_on) <= {
+                            item.id
+                            for item in task.nodes
+                            if item.status == "completed"
+                        }:
+                            raise ExecutionUncertain(
+                                "Queued reconciliation dependencies changed"
+                            )
+                        if (
+                            self.tools.definition(node_tool) != definition
+                            or self.tools.scheduling(node_tool) != scheduling
+                        ):
+                            raise ExecutionUncertain(
+                                "Capability definition or scheduling lane changed"
+                            )
                         budget = self._budget(conversation, task)
                         conversation.status = "running"
                         task.stage = node.id
@@ -954,10 +1003,22 @@ class AgentExecutor:
                             task,
                             node,
                             call,
-                            self._external_budget(conversation, task),
+                            self._external_budget(
+                                conversation,
+                                task,
+                                action=action,
+                                queue_origin=queue_origin,
+                                node_id=node.id,
+                                node_tool=node_tool,
+                                call_id=call.id,
+                                spec=spec,
+                                definition=definition,
+                                scheduling=scheduling,
+                            ),
                             store=self.store,
                             locks=self.locks,
                             action=action,
+                            queue_origin=queue_origin,
                         )
                     output = self.tools.reconcile(
                         node_tool,
@@ -968,41 +1029,23 @@ class AgentExecutor:
                     with self.locks.hold(conversation_id):
                         conversation = self.store.get(conversation_id)
                         task = self._task(conversation)
-                        self._validate_action_reservation(
+                        if node_id is None:
+                            raise ExecutionUncertain(
+                                "Reconciliation node identity was not reserved"
+                            )
+                        node, call = self._validate_call_reservation(
                             conversation,
                             task,
                             action=action,
                             task_id=task_id,
-                            statuses=("running",),
+                            queue_origin=queue_origin,
+                            node_id=node_id,
+                            node_tool=node_tool,
+                            call_id=call_id,
+                            spec=spec,
+                            definition=definition,
+                            scheduling=scheduling,
                         )
-                        call = next(
-                            item for item in task.calls if item.id == call_id
-                        )
-                        node = next(
-                            item for item in task.nodes if item.id == node_id
-                        )
-                        if (
-                            conversation.queue_origin != queue_origin
-                            or node.tool != node_tool
-                            or call.status
-                            not in ("running", "interrupted")
-                            or task.stage != node.id
-                            or task.pending_specs.get(call.id) != spec
-                            or self._spec(task, node, call) != spec
-                        ):
-                            raise ExecutionUncertain(
-                                "Reconciliation state changed before result acceptance"
-                            )
-                        self._verify_saved(conversation, task)
-                        self._live_node(task, node)
-                        if not set(node.depends_on) <= {
-                            item.id
-                            for item in task.nodes
-                            if item.status == "completed"
-                        }:
-                            raise ExecutionUncertain(
-                                "Reconciliation dependencies changed before result acceptance"
-                            )
                         budget = self._budget(conversation, task)
                         if output is None:
                             raise ExecutionUncertain(
@@ -1015,58 +1058,104 @@ class AgentExecutor:
                             conversation, task, node, call, run, budget
                         )
             except ReconciledFailure as exc:
-                with self.locks.hold(conversation_id):
-                    conversation = self.store.get(conversation_id)
-                    task = self._task(conversation)
-                    call = next(item for item in task.calls if item.id == call_id)
-                    node = next(
-                        (item for item in task.nodes if item.id == node_id),
-                        None,
-                    )
-                    call.status = "failed"
-                    call.error = str(exc)[:4000]
-                    call.finished_at = now()
-                    if node is not None:
-                        node.status = "failed"
-                        node.error = call.error
-                    task.pending_specs.pop(call.id, None)
-                    self.store.save(conversation)
+                if (
+                    node_id is None
+                    or node_tool is None
+                    or spec is None
+                    or definition is None
+                    or scheduling is None
+                ):
+                    raise ExecutionUncertain(
+                        "Reconciliation identity was not reserved"
+                    ) from exc
+                self._record_external_failure(
+                    conversation_id,
+                    task_id,
+                    action,
+                    queue_origin,
+                    node_id,
+                    node_tool,
+                    call_id,
+                    spec,
+                    definition,
+                    scheduling,
+                    exc,
+                    interrupted=False,
+                )
                 raise
             except BudgetExhausted as exc:
                 with self.locks.hold(conversation_id):
-                    conversation = self.store.get(conversation_id)
-                    task = self._task(conversation)
-                    call = next(item for item in task.calls if item.id == call_id)
-                    if call.status == "completed":
-                        raise
-                    node = next(
-                        (item for item in task.nodes if item.id == node_id),
-                        None,
+                    current = self.store.get(conversation_id)
+                    current_task = self._task_by_id(current, task_id)
+                    current_call = (
+                        next(
+                            (
+                                item
+                                for item in current_task.calls
+                                if item.id == call_id
+                            ),
+                            None,
+                        )
+                        if current_task is not None
+                        else None
                     )
-                    call.status = "interrupted"
-                    call.error = str(exc)[:4000]
-                    if node is not None:
-                        node.status = "interrupted"
-                        node.error = call.error
-                    self.store.save(conversation)
+                    if (
+                        current_call is not None
+                        and current_call.status == "completed"
+                    ):
+                        raise
+                if (
+                    node_id is None
+                    or node_tool is None
+                    or spec is None
+                    or definition is None
+                    or scheduling is None
+                ):
+                    raise ExecutionUncertain(
+                        "Reconciliation identity was not reserved"
+                    ) from exc
+                self._record_external_failure(
+                    conversation_id,
+                    task_id,
+                    action,
+                    queue_origin,
+                    node_id,
+                    node_tool,
+                    call_id,
+                    spec,
+                    definition,
+                    scheduling,
+                    exc,
+                    interrupted=True,
+                )
                 raise ExecutionUncertain(
                     f"Original invocation state remains unknown: {exc}"
                 ) from exc
             except (OSError, ValueError, RuntimeError) as exc:
-                with self.locks.hold(conversation_id):
-                    conversation = self.store.get(conversation_id)
-                    task = self._task(conversation)
-                    call = next(item for item in task.calls if item.id == call_id)
-                    node = next(
-                        (item for item in task.nodes if item.id == node_id),
-                        None,
-                    )
-                    call.status = "interrupted"
-                    call.error = str(exc)[:4000]
-                    if node is not None:
-                        node.status = "interrupted"
-                        node.error = call.error
-                    self.store.save(conversation)
+                if (
+                    node_id is None
+                    or node_tool is None
+                    or spec is None
+                    or definition is None
+                    or scheduling is None
+                ):
+                    raise ExecutionUncertain(
+                        "Reconciliation identity was not reserved"
+                    ) from exc
+                self._record_external_failure(
+                    conversation_id,
+                    task_id,
+                    action,
+                    queue_origin,
+                    node_id,
+                    node_tool,
+                    call_id,
+                    spec,
+                    definition,
+                    scheduling,
+                    exc,
+                    interrupted=True,
+                )
                 raise ExecutionUncertain(
                     f"Original invocation state remains unknown: {exc}"
                 ) from exc
@@ -1096,7 +1185,18 @@ class AgentExecutor:
         return BudgetAccount(task.baseline.budget, task.budget_state, checkpoint)
 
     def _external_budget(
-        self, conversation: Conversation, task: AgentTask
+        self,
+        conversation: Conversation,
+        task: AgentTask,
+        *,
+        action: str,
+        queue_origin: ConversationState,
+        node_id: str,
+        node_tool: str,
+        call_id: str,
+        spec: InvocationSpec,
+        definition: CapabilityDefinition,
+        scheduling: SchedulingMetadata,
     ) -> BudgetAccount:
         conversation_id = conversation.id
         task_id = task.id
@@ -1111,6 +1211,19 @@ class AgentExecutor:
                     raise ExecutionUncertain(
                         "Budget task changed during the admitted action"
                     )
+                self._validate_call_reservation(
+                    current,
+                    current_task,
+                    action=action,
+                    task_id=task_id,
+                    queue_origin=queue_origin,
+                    node_id=node_id,
+                    node_tool=node_tool,
+                    call_id=call_id,
+                    spec=spec,
+                    definition=definition,
+                    scheduling=scheduling,
+                )
                 if current_task.budget_state != last_state:
                     raise ExecutionUncertain(
                         "Budget state changed during the admitted action"
@@ -1146,6 +1259,65 @@ class AgentExecutor:
             or not task.baseline.confirmed
         ):
             raise ExecutionUncertain("Queued action reservation changed")
+
+    def _validate_call_reservation(
+        self,
+        conversation: Conversation,
+        task: AgentTask,
+        *,
+        action: str,
+        task_id: str,
+        queue_origin: ConversationState,
+        node_id: str,
+        node_tool: str,
+        call_id: str,
+        spec: InvocationSpec,
+        definition: CapabilityDefinition,
+        scheduling: SchedulingMetadata,
+    ) -> tuple[AgentExecutionNode, ToolCall]:
+        self._validate_action_reservation(
+            conversation,
+            task,
+            action=action,
+            task_id=task_id,
+            statuses=("running",),
+        )
+        node = next(
+            (item for item in task.nodes if item.id == node_id), None
+        )
+        call = next(
+            (item for item in task.calls if item.id == call_id), None
+        )
+        if (
+            conversation.queue_origin != queue_origin
+            or node is None
+            or call is None
+            or node.tool != node_tool
+            or call.node_id != node_id
+            or call.status not in ("running", "interrupted")
+            or task.stage != node_id
+            or task.pending_specs.get(call_id) != spec
+            or self._spec(task, node, call) != spec
+        ):
+            raise ExecutionUncertain("Admitted call reservation changed")
+        self._verify_saved(conversation, task)
+        self._live_node(task, node)
+        if not set(node.depends_on) <= {
+            item.id
+            for item in task.nodes
+            if item.status == "completed"
+        }:
+            raise ExecutionUncertain(
+                "Admitted call dependencies changed"
+            )
+        if (
+            self.tools.definition(node_tool) != definition
+            or self.tools.scheduling(node_tool) != scheduling
+        ):
+            raise ExecutionUncertain(
+                "Capability definition or scheduling lane changed"
+            )
+        return node, call
 
     def _dispatch(
         self,
@@ -1216,6 +1388,13 @@ class AgentExecutor:
                         )
                     self._verify_saved(conversation, task)
                     self._live_node(task, node)
+                    if (
+                        self.tools.definition(node_tool) != definition
+                        or self.tools.scheduling(node_tool) != scheduling
+                    ):
+                        raise ExecutionUncertain(
+                            "Capability definition or scheduling lane changed"
+                        )
                     budget = self._budget(conversation, task)
                     budget.check_limits()
                     conversation.status = "running"
@@ -1262,10 +1441,22 @@ class AgentExecutor:
                         task,
                         node,
                         call,
-                        self._external_budget(conversation, task),
+                        self._external_budget(
+                            conversation,
+                            task,
+                            action=action,
+                            queue_origin=queue_origin,
+                            node_id=node.id,
+                            node_tool=node_tool,
+                            call_id=call.id,
+                            spec=spec,
+                            definition=definition,
+                            scheduling=scheduling,
+                        ),
                         store=self.store,
                         locks=self.locks,
                         action=action,
+                        queue_origin=queue_origin,
                     )
                     call_id = call.id
                 try:
@@ -1276,8 +1467,14 @@ class AgentExecutor:
                     self._record_external_failure(
                         conversation_id,
                         task_id,
+                        action,
+                        queue_origin,
                         node_id,
+                        node_tool,
                         call_id,
+                        spec,
+                        definition,
+                        scheduling,
                         exc,
                         interrupted=True,
                     )
@@ -1289,8 +1486,14 @@ class AgentExecutor:
                     self._record_external_failure(
                         conversation_id,
                         task_id,
+                        action,
+                        queue_origin,
                         node_id,
+                        node_tool,
                         call_id,
+                        spec,
+                        definition,
+                        scheduling,
                         exc,
                         interrupted=not pre_dispatch,
                     )
@@ -1303,8 +1506,14 @@ class AgentExecutor:
                     self._record_external_failure(
                         conversation_id,
                         task_id,
+                        action,
+                        queue_origin,
                         node_id,
+                        node_tool,
                         call_id,
+                        spec,
+                        definition,
+                        scheduling,
                         exc,
                         interrupted=False,
                     )
@@ -1312,40 +1521,22 @@ class AgentExecutor:
                 with self.locks.hold(conversation_id):
                     conversation = self.store.get(conversation_id)
                     task = self._task(conversation)
-                    self._validate_action_reservation(
+                    node, call = self._validate_call_reservation(
                         conversation,
                         task,
                         action=action,
                         task_id=task_id,
-                        statuses=("running",),
+                        queue_origin=queue_origin,
+                        node_id=node_id,
+                        node_tool=node_tool,
+                        call_id=call_id,
+                        spec=spec,
+                        definition=definition,
+                        scheduling=scheduling,
                     )
-                    node = next(
-                        item for item in task.nodes if item.id == node_id
-                    )
-                    call = next(
-                        item for item in task.calls if item.id == call_id
-                    )
-                    if (
-                        conversation.queue_origin != queue_origin
-                        or node.tool != node_tool
-                        or call.node_id != node_id
-                        or call.status != "running"
-                        or task.stage != node_id
-                        or task.pending_specs.get(call_id) != spec
-                        or self._spec(task, node, call) != spec
-                    ):
+                    if call.status != "running":
                         raise ExecutionUncertain(
                             "Invocation state changed before its result was applied"
-                        )
-                    self._verify_saved(conversation, task)
-                    self._live_node(task, node)
-                    if not set(node.depends_on) <= {
-                        item.id
-                        for item in task.nodes
-                        if item.status == "completed"
-                    }:
-                        raise ExecutionUncertain(
-                            "Invocation dependencies changed before result acceptance"
                         )
                     budget = self._budget(conversation, task)
                     publishing = False
@@ -1427,29 +1618,41 @@ class AgentExecutor:
         self,
         conversation_id: str,
         task_id: str,
+        action: str,
+        queue_origin: ConversationState,
         node_id: str,
+        node_tool: str,
         call_id: str,
+        spec: InvocationSpec,
+        definition: CapabilityDefinition,
+        scheduling: SchedulingMetadata,
         error: BaseException,
         *,
         interrupted: bool,
     ) -> None:
         with self.locks.hold(conversation_id):
             conversation = self.store.get(conversation_id)
-            task = self._task_by_id(conversation, task_id)
+            task = conversation.task
             if task is None:
                 raise ExecutionUncertain(
                     "Invocation task changed while the capability was running"
                 ) from error
-            node = next(
-                (item for item in task.nodes if item.id == node_id), None
-            )
-            call = next(
-                (item for item in task.calls if item.id == call_id), None
-            )
-            if node is None or call is None or call.status == "completed":
-                raise ExecutionUncertain(
-                    "Invocation identity changed while the capability was running"
-                ) from error
+            try:
+                node, call = self._validate_call_reservation(
+                    conversation,
+                    task,
+                    action=action,
+                    task_id=task_id,
+                    queue_origin=queue_origin,
+                    node_id=node_id,
+                    node_tool=node_tool,
+                    call_id=call_id,
+                    spec=spec,
+                    definition=definition,
+                    scheduling=scheduling,
+                )
+            except ExecutionUncertain as stale:
+                raise stale from error
             call.status = "interrupted" if interrupted else "failed"
             call.error = str(error)[:4000]
             node.status = "interrupted" if interrupted else "failed"
@@ -1511,6 +1714,7 @@ class AgentExecutor:
         task_id: str,
     ) -> Conversation:
         verified = False
+        reservation_origin: ConversationState | None = None
         try:
             with self.locks.hold(conversation_id):
                 conversation = self.store.get(conversation_id)
@@ -1519,10 +1723,14 @@ class AgentExecutor:
                     conversation.status != "queued"
                     or conversation.queued_action != action
                     or task.id != task_id
+                    or conversation.queue_origin is None
                 ):
                     raise ExecutionUncertain(
                         "Queued action changed before execution started"
                     )
+                reservation_origin = conversation.queue_origin.model_copy(
+                    deep=True
+                )
                 self._validate_structure(task)
                 self._directory(conversation, task)
                 conversation.turn_origin = None
@@ -1562,9 +1770,13 @@ class AgentExecutor:
                     raise ValueError(
                         "A known failed call requires an explicit retry"
                     )
+                scope = _scope(task.baseline)
+                max_steps = task.baseline.budget.max_calls
 
-            steps = 0
-            while True:
+            next_node_id: str | None = None
+
+            def decide_next() -> LoopDecision:
+                nonlocal next_node_id
                 with self.locks.hold(conversation_id):
                     conversation = self.store.get(conversation_id)
                     task = self._task(conversation)
@@ -1573,7 +1785,10 @@ class AgentExecutor:
                             raise ExecutionUncertain(
                                 "Completed action task identity changed"
                             )
-                        return conversation
+                        return LoopDecision(
+                            action="stop",
+                            reason="Confirmed execution is complete",
+                        )
                     self._validate_action_reservation(
                         conversation,
                         task,
@@ -1599,27 +1814,52 @@ class AgentExecutor:
                     if all(
                         item.status == "completed" for item in task.nodes
                     ):
-                        break
+                        next_node_id = None
+                        return LoopDecision(
+                            action="stop",
+                            reason="All confirmed nodes are complete",
+                        )
                     if node is None:
                         raise ExecutionUncertain(
                             "No safe pending node is ready; reconcile unknown calls"
                         )
-                    if steps >= task.baseline.budget.max_calls:
-                        raise ValueError(
-                            "The confirmed execution step budget is exhausted"
-                        )
-                    decision = LoopDecision(
+                    next_node_id = node.id
+                    return LoopDecision(
                         action="continue",
                         effect=task.baseline.capability_snapshots[
                             node.tool
                         ].effect,
                         reason=f"Execute the confirmed ready node: {node.id}",
                     )
-                    _scope(task.baseline).authorize(decision.effect)
+
+            def execute_next() -> None:
+                nonlocal verified
+                with self.locks.hold(conversation_id):
+                    conversation = self.store.get(conversation_id)
+                    task = self._task(conversation)
+                    self._validate_action_reservation(
+                        conversation,
+                        task,
+                        action=action,
+                        task_id=task_id,
+                        statuses=("running",),
+                    )
+                    node = next(
+                        (
+                            item
+                            for item in task.nodes
+                            if item.id == next_node_id
+                        ),
+                        None,
+                    )
+                    if node is None or not self._ready(task, node):
+                        raise ExecutionUncertain(
+                            "Selected node changed before dispatch"
+                        )
                     self._verify_saved(conversation, task)
                     verified = True
                     budget = self._budget(conversation, task)
-                conversation = self._dispatch(
+                self._dispatch(
                     conversation,
                     task,
                     node,
@@ -1627,11 +1867,24 @@ class AgentExecutor:
                     action=action,
                     task_id=task_id,
                 )
-                steps += 1
+
+            run_loop(
+                decide=decide_next,
+                execute=execute_next,
+                persist=lambda: None,
+                scope=scope,
+                max_steps=max_steps,
+            )
 
             with self.locks.hold(conversation_id):
                 conversation = self.store.get(conversation_id)
                 task = self._task(conversation)
+                if conversation.status == "completed":
+                    if task.id != task_id:
+                        raise ExecutionUncertain(
+                            "Completed action task identity changed"
+                        )
+                    return conversation
                 self._validate_action_reservation(
                     conversation,
                     task,
@@ -1648,7 +1901,16 @@ class AgentExecutor:
             logger.exception("Agent execution stopped for conversation %s", conversation_id)
             with self.locks.hold(conversation_id):
                 conversation = self.store.get(conversation_id)
-                failed_task = self._task_by_id(conversation, task_id)
+                failed_task = conversation.task
+                if (
+                    reservation_origin is None
+                    or failed_task is None
+                    or failed_task.id != task_id
+                    or conversation.status not in ("queued", "running")
+                    or conversation.queued_action != action
+                    or conversation.queue_origin != reservation_origin
+                ):
+                    return conversation
                 uncertain = isinstance(exc, ExecutionUncertain)
                 conversation.status = (
                     "interrupted" if uncertain else "failed"

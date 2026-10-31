@@ -1,10 +1,15 @@
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
+from threading import Event
 
 import pytest
 
 from flight_agent.runtime.agent_contracts import AgentPlan
 from flight_agent.runtime.capabilities import CapabilityRegistry
 from flight_agent.runtime.evidence import agent_receipt_name
+from flight_agent.runtime.scheduling_contracts import SchedulingMetadata
+from flight_agent.verification.contracts import ConversationState
 from flight_agent.verification.store import ConversationStore
 from tests.agent_helpers import analysis_plan_data, register_rmse
 from tests.test_agent_runtime import confirm, propose, runtime_module, setup
@@ -218,6 +223,170 @@ def test_checkpoint_reconciliation_reads_only_original_call_and_verifies_digest(
     assert lookups == calls
     assert len(calls) == 1
     assert recovered.task.budget_state.calls == 1
+
+
+def reconciliation_case(tmp_path, reconcile):
+    from flight_agent.runtime.capabilities import Capability
+    from flight_agent.runtime.capability_metadata import (
+        CapabilityMetadata,
+        MetricDefinition,
+    )
+    from flight_agent.runtime.observations import CapabilityOutcome
+    from tests.agent_helpers import RmseInput
+
+    calls = []
+
+    def operation(context, inputs):
+        calls.append(context.call_id)
+        context.save_checkpoint({"value": 1.0, "terminal": True})
+        raise KeyboardInterrupt("After durable tool completion checkpoint")
+
+    tools = CapabilityRegistry(agent_mode=True)
+    tools.register(
+        Capability(
+            name="offline_rmse",
+            version="1",
+            description="Reconcile bounded durable measurement.",
+            input_model=RmseInput,
+            output_model=CapabilityOutcome,
+            effect="read_only",
+            operation=operation,
+            reconcile=reconcile,
+            metadata=CapabilityMetadata(
+                metrics=[MetricDefinition(id="rmse", label="RMSE", unit="m")]
+            ),
+        )
+    )
+    runtime, store, conversation, _ = setup(tmp_path, tools=tools)
+    pending = propose(runtime, conversation)
+    with pytest.raises(KeyboardInterrupt):
+        confirm(runtime, pending)
+    return restarted(runtime, store), pending.id, calls
+
+
+@pytest.mark.parametrize("mutation", ["definition", "scheduling"])
+def test_reconciliation_revalidates_registry_before_callback(
+    tmp_path, monkeypatch, mutation
+):
+    lookups = []
+
+    def reconcile(context, inputs):
+        lookups.append(context.call_id)
+        return None
+
+    recovery, identifier, calls = reconciliation_case(tmp_path, reconcile)
+    definition = recovery.tools.definition("offline_rmse")
+    scheduling = recovery.tools.scheduling("offline_rmse")
+    queued = Event()
+    original_save = recovery.store.save
+
+    def observe(record):
+        original_save(record)
+        if record.status == "queued" and record.task.stage.startswith("queued:"):
+            queued.set()
+
+    recovery.store.save = observe
+    with ThreadPoolExecutor(1) as pool:
+        with ExitStack() as stack:
+            for _ in range(4):
+                stack.enter_context(
+                    recovery.scheduler.slot(definition, scheduling)
+                )
+            future = pool.submit(recovery.resume, identifier)
+            assert queued.wait(5)
+            queued_record = recovery.store.get(identifier)
+            call = queued_record.task.calls[0].model_copy(deep=True)
+            budget = queued_record.task.budget_state.model_copy(deep=True)
+            if mutation == "definition":
+                monkeypatch.setattr(
+                    recovery.tools,
+                    "definition",
+                    lambda name: definition.model_copy(
+                        update={"version": "changed"}
+                    ),
+                )
+            else:
+                monkeypatch.setattr(
+                    recovery.tools,
+                    "scheduling",
+                    lambda name: SchedulingMetadata("local_matlab"),
+                )
+        result = future.result(timeout=5)
+    saved = recovery.store.get(identifier)
+    assert result.status == "interrupted"
+    assert lookups == []
+    assert saved.task.calls[0] == call
+    assert saved.task.budget_state == budget
+    assert saved.task.analysis_runs == []
+    assert calls == [call.id]
+
+
+@pytest.mark.parametrize("mutation", ["origin", "definition", "scheduling"])
+def test_reconciliation_rejects_state_changed_during_callback(
+    tmp_path, monkeypatch, mutation
+):
+    from flight_agent.runtime.observations import CapabilityOutcome, Observation
+
+    entered, release = Event(), Event()
+
+    def reconcile(context, inputs):
+        entered.set()
+        assert release.wait(5)
+        return CapabilityOutcome(
+            observations=[
+                Observation(
+                    node_id=context.node_id,
+                    metric_id="rmse",
+                    label="RMSE",
+                    value=1.0,
+                    unit="m",
+                )
+            ]
+        )
+
+    recovery, identifier, calls = reconciliation_case(tmp_path, reconcile)
+    definition = recovery.tools.definition("offline_rmse")
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(recovery.resume, identifier)
+        assert entered.wait(5)
+        with recovery.locks.hold(identifier):
+            newer = recovery.store.get(identifier)
+            call = newer.task.calls[0].model_copy(deep=True)
+            budget = newer.task.budget_state.model_copy(deep=True)
+            if mutation == "origin":
+                newer.error = "newer reconciliation state"
+                newer.queue_origin = ConversationState(
+                    status="waiting_for_user",
+                    pending_decision=None,
+                    error="newer reconciliation state",
+                )
+                recovery.store.save(newer)
+            elif mutation == "definition":
+                monkeypatch.setattr(
+                    recovery.tools,
+                    "definition",
+                    lambda name: definition.model_copy(
+                        update={"version": "changed"}
+                    ),
+                )
+            else:
+                monkeypatch.setattr(
+                    recovery.tools,
+                    "scheduling",
+                    lambda name: SchedulingMetadata("local_matlab"),
+                )
+        release.set()
+        result = future.result(timeout=5)
+    saved = recovery.store.get(identifier)
+    assert saved.task.calls[0] == call
+    assert saved.task.budget_state == budget
+    assert saved.task.analysis_runs == []
+    assert saved.task.outputs == {}
+    assert calls == [call.id]
+    if mutation == "origin":
+        assert result.error == saved.error == "newer reconciliation state"
+    else:
+        assert result.status == "interrupted"
 
 
 def test_receipt_publication_error_stays_unknown_until_original_id_is_reconciled(
