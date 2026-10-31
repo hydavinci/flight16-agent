@@ -105,6 +105,12 @@ class RunState:
 
 
 @dataclass(frozen=True)
+class _PreparedDecision:
+    task_id: str | None
+    save: bool
+
+
+@dataclass(frozen=True)
 class AgentContext:
     directory: Path
     scope: AgentScope
@@ -550,107 +556,120 @@ class AgentExecutor:
     ) -> Conversation:
         with self.locks.hold(conversation_id):
             conversation = self.store.get(conversation_id)
-            task = self._task(conversation)
-            if trusted is not True or type(version) is not int or version != task.baseline.version:
-                raise ValueError(
-                    "Explicit consent for the exact current baseline version is required"
-                )
-            if conversation.status in ("queued", "planning", "running"):
-                if conversation.queued_action == "confirm":
-                    return conversation
-                raise ValueError("This conversation already has an admitted turn")
-            self._validate_structure(task)
-            if task.baseline.confirmed:
-                if conversation.status == "completed":
-                    return conversation
-                raise ValueError("The baseline is already confirmed; resume the original task")
-            task.baseline.check_dispatch_budget()
-            validate_bindings(task.baseline, self.tools)
-            self.resources.verify(task.baseline.resources)
-            self._validate_resource_boundary(task.baseline, task.result_directory)
-            self._directory(conversation, task, create=True)
-            task.baseline = AgentBaseline.model_validate(
-                {
-                    **task.baseline.model_dump(),
-                    "confirmed": True,
-                    "confirmed_at": now(),
-                }
-            )
-            task.baseline_sha256 = fingerprint(task.baseline.model_dump(mode="json"))
-            task.decisions.append(
-                Decision(
-                    action="confirm_baseline",
-                    baseline_version=version,
-                    trusted=True,
-                    created_at=now(),
-                )
-            )
-            conversation.queue_origin = ConversationState(
-                status=conversation.status,
-                pending_decision=conversation.pending_decision,
-                error=conversation.error,
-            )
-            conversation.status = "queued"
-            conversation.queued_action = "confirm"
-            conversation.queued_action_committed = True
-            conversation.pending_decision = None
-            conversation.error = None
-            self.store.save(conversation)
-            task_id = task.id
-        if not _execute:
+            prepared = self._prepare_confirm(conversation, version, trusted=trusted)
+            if prepared.save:
+                self.store.save(conversation)
+        if not _execute or prepared.task_id is None:
             return conversation
-        return self._run(conversation_id, "confirm", task_id)
+        return self._run(conversation_id, "confirm", prepared.task_id)
+
+    def _prepare_confirm(
+        self,
+        conversation: Conversation,
+        version: int,
+        *,
+        trusted: bool,
+    ) -> _PreparedDecision:
+        task = self._task(conversation)
+        if trusted is not True or type(version) is not int or version != task.baseline.version:
+            raise ValueError(
+                "Explicit consent for the exact current baseline version is required"
+            )
+        if conversation.status in ("queued", "planning", "running"):
+            if conversation.queued_action == "confirm":
+                return _PreparedDecision(task_id=None, save=False)
+            raise ValueError("This conversation already has an admitted turn")
+        self._validate_structure(task)
+        if task.baseline.confirmed:
+            if conversation.status == "completed":
+                return _PreparedDecision(task_id=None, save=False)
+            raise ValueError("The baseline is already confirmed; resume the original task")
+        task.baseline.check_dispatch_budget()
+        validate_bindings(task.baseline, self.tools)
+        self.resources.verify(task.baseline.resources)
+        self._validate_resource_boundary(task.baseline, task.result_directory)
+        self._directory(conversation, task, create=True)
+        task.baseline = AgentBaseline.model_validate(
+            {
+                **task.baseline.model_dump(),
+                "confirmed": True,
+                "confirmed_at": now(),
+            }
+        )
+        task.baseline_sha256 = fingerprint(task.baseline.model_dump(mode="json"))
+        task.decisions.append(
+            Decision(
+                action="confirm_baseline",
+                baseline_version=version,
+                trusted=True,
+                created_at=now(),
+            )
+        )
+        conversation.queue_origin = ConversationState(
+            status=conversation.status,
+            pending_decision=conversation.pending_decision,
+            error=conversation.error,
+        )
+        conversation.status = "queued"
+        conversation.queued_action = "confirm"
+        conversation.queued_action_committed = True
+        conversation.pending_decision = None
+        conversation.error = None
+        return _PreparedDecision(task_id=task.id, save=True)
 
     def resume(
         self, conversation_id: str, *, _execute: bool = True
     ) -> Conversation:
         with self.locks.hold(conversation_id):
             conversation = self.store.get(conversation_id)
-            task = self._task(conversation)
-            if conversation.status in ("queued", "planning", "running"):
-                if conversation.queued_action == "resume":
-                    return conversation
-                raise ValueError("This conversation already has an admitted turn")
-            if not task.baseline.confirmed:
-                raise ValueError("Execution requires a confirmed baseline")
-            self._validate_structure(task)
-            if (
-                task.result is not None
-                and task.result.execution_status in ("completed", "partial")
-                and all(node.status == "completed" for node in task.nodes)
-            ):
-                try:
-                    self._verify_saved(conversation, task)
-                    conversation.status = "completed"
-                    conversation.error = None
-                    conversation.pending_decision = None
-                except (OSError, ValueError, RuntimeError) as exc:
-                    conversation.status = "failed"
-                    conversation.error = str(exc)[:4000]
-                    conversation.pending_decision = PendingDecision(
-                        kind="retry",
-                        message=conversation.error,
-                    )
+            prepared = self._prepare_resume(conversation)
+            if prepared.save:
                 self.store.save(conversation)
-                return conversation
-            task.decisions.append(
-                Decision(action="resume", baseline_version=task.baseline.version, created_at=now())
-            )
-            conversation.queue_origin = ConversationState(
-                status=conversation.status,
-                pending_decision=conversation.pending_decision,
-                error=conversation.error,
-            )
-            conversation.status = "queued"
-            conversation.queued_action = "resume"
-            conversation.queued_action_committed = True
-            conversation.pending_decision = None
-            conversation.error = None
-            self.store.save(conversation)
-            task_id = task.id
-        if not _execute:
+        if not _execute or prepared.task_id is None:
             return conversation
-        return self._run(conversation_id, "resume", task_id)
+        return self._run(conversation_id, "resume", prepared.task_id)
+
+    def _prepare_resume(self, conversation: Conversation) -> _PreparedDecision:
+        task = self._task(conversation)
+        if conversation.status in ("queued", "planning", "running"):
+            if conversation.queued_action == "resume":
+                return _PreparedDecision(task_id=None, save=False)
+            raise ValueError("This conversation already has an admitted turn")
+        if not task.baseline.confirmed:
+            raise ValueError("Execution requires a confirmed baseline")
+        self._validate_structure(task)
+        if (
+            task.result is not None
+            and task.result.execution_status in ("completed", "partial")
+            and all(node.status == "completed" for node in task.nodes)
+        ):
+            try:
+                self._verify_saved(conversation, task)
+                conversation.status = "completed"
+                conversation.error = None
+                conversation.pending_decision = None
+            except (OSError, ValueError, RuntimeError) as exc:
+                conversation.status = "failed"
+                conversation.error = str(exc)[:4000]
+                conversation.pending_decision = PendingDecision(
+                    kind="retry",
+                    message=conversation.error,
+                )
+            return _PreparedDecision(task_id=None, save=True)
+        task.decisions.append(
+            Decision(action="resume", baseline_version=task.baseline.version, created_at=now())
+        )
+        conversation.queue_origin = ConversationState(
+            status=conversation.status,
+            pending_decision=conversation.pending_decision,
+            error=conversation.error,
+        )
+        conversation.status = "queued"
+        conversation.queued_action = "resume"
+        conversation.queued_action_committed = True
+        conversation.pending_decision = None
+        conversation.error = None
+        return _PreparedDecision(task_id=task.id, save=True)
 
     def retry(
         self,
@@ -662,42 +681,76 @@ class AgentExecutor:
     ) -> Conversation:
         with self.locks.hold(conversation_id):
             conversation = self.store.get(conversation_id)
-            task = self._task(conversation)
-            if trusted is not True or type(version) is not int or version != task.baseline.version:
-                raise ValueError("Retry requires explicit consent for the current baseline version")
-            if conversation.status in ("queued", "planning", "running"):
-                if conversation.queued_action == "retry":
-                    return conversation
-                raise ValueError("This conversation already has an admitted turn")
-            if has_unresolved_call(task):
-                raise ValueError("Reconcile unknown or unresolved calls before retrying")
-            self._validate_structure(task)
-            if not task.baseline.confirmed or not any(
-                node.status == "failed" for node in task.nodes
-            ):
-                raise ValueError("No known failed call is eligible for explicit retry")
-            for node in task.nodes:
-                if node.status == "failed":
-                    node.status = "pending"
-                    node.error = None
-            task.decisions.append(
-                Decision(action="retry", baseline_version=version, trusted=True, created_at=now())
-            )
-            conversation.queue_origin = ConversationState(
-                status=conversation.status,
-                pending_decision=conversation.pending_decision,
-                error=conversation.error,
-            )
-            conversation.status = "queued"
-            conversation.queued_action = "retry"
-            conversation.queued_action_committed = True
-            conversation.pending_decision = None
-            conversation.error = None
-            self.store.save(conversation)
-            task_id = task.id
-        if not _execute:
+            prepared = self._prepare_retry(conversation, version, trusted=trusted)
+            if prepared.save:
+                self.store.save(conversation)
+        if not _execute or prepared.task_id is None:
             return conversation
-        return self._run(conversation_id, "retry", task_id)
+        return self._run(conversation_id, "retry", prepared.task_id)
+
+    def _prepare_retry(
+        self,
+        conversation: Conversation,
+        version: int,
+        *,
+        trusted: bool,
+    ) -> _PreparedDecision:
+        task = self._task(conversation)
+        if trusted is not True or type(version) is not int or version != task.baseline.version:
+            raise ValueError("Retry requires explicit consent for the current baseline version")
+        if conversation.status in ("queued", "planning", "running"):
+            if conversation.queued_action == "retry":
+                return _PreparedDecision(task_id=None, save=False)
+            raise ValueError("This conversation already has an admitted turn")
+        if has_unresolved_call(task):
+            raise ValueError("Reconcile unknown or unresolved calls before retrying")
+        self._validate_structure(task)
+        if not task.baseline.confirmed or not any(
+            node.status == "failed" for node in task.nodes
+        ):
+            raise ValueError("No known failed call is eligible for explicit retry")
+        for node in task.nodes:
+            if node.status == "failed":
+                node.status = "pending"
+                node.error = None
+        task.decisions.append(
+            Decision(action="retry", baseline_version=version, trusted=True, created_at=now())
+        )
+        conversation.queue_origin = ConversationState(
+            status=conversation.status,
+            pending_decision=conversation.pending_decision,
+            error=conversation.error,
+        )
+        conversation.status = "queued"
+        conversation.queued_action = "retry"
+        conversation.queued_action_committed = True
+        conversation.pending_decision = None
+        conversation.error = None
+        return _PreparedDecision(task_id=task.id, save=True)
+
+    def _prepare_decision(
+        self,
+        conversation: Conversation,
+        action: str,
+        *,
+        version: int | None,
+        trusted: bool,
+    ) -> _PreparedDecision:
+        if action == "confirm":
+            return self._prepare_confirm(
+                conversation,
+                version if version is not None else 0,
+                trusted=trusted,
+            )
+        if action == "resume":
+            return self._prepare_resume(conversation)
+        if action == "retry":
+            return self._prepare_retry(
+                conversation,
+                version if version is not None else 0,
+                trusted=trusted,
+            )
+        raise ValueError("Submit new requirements for a new confirmed plan")
 
     def _live_node(self, task: AgentTask, node: AgentExecutionNode) -> None:
         self._validate_structure(task)

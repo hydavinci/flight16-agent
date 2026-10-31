@@ -420,31 +420,37 @@ class EngineeringRuntime:
         version: int | None = None,
         trusted: bool = False,
     ) -> Conversation:
-        with self.store.transaction():
-            with self.locks.hold(conversation_id):
-                record = self.store.get(conversation_id)
-                origin = record.queue_origin
-                if (
-                    record.status != "queued"
-                    or record.queued_action != action
-                    or origin is None
-                ):
-                    raise ValueError("The queued decision is no longer current")
-                record.status = origin.status
-                record.pending_decision = origin.pending_decision
-                record.error = origin.error
-                record.queue_origin = None
-                record.queued_action = None
-                record.queued_action_committed = False
-                self.store.save(record)
-                queued, task_id = self._queue_decision(
-                    conversation_id,
-                    action,
-                    version=version,
-                    trusted=trusted,
-                )
-                if task_id is None:
-                    return queued
+        with self.locks.hold(conversation_id):
+            reservation = self.store.get(conversation_id)
+            origin = reservation.queue_origin
+            if (
+                reservation.status != "queued"
+                or reservation.queued_action != action
+                or reservation.queued_action_committed
+                or origin is None
+            ):
+                raise ValueError("The queued decision is no longer current")
+            queued = reservation.model_copy(deep=True)
+            queued.status = origin.status
+            queued.pending_decision = origin.pending_decision
+            queued.error = origin.error
+            queued.queue_origin = None
+            queued.queued_action = None
+            queued.queued_action_committed = False
+            prepared = self.executor._prepare_decision(
+                queued,
+                action,
+                version=version,
+                trusted=trusted,
+            )
+            if self.store.get(conversation_id) != reservation:
+                raise ValueError("The queued decision is no longer current")
+            if not prepared.save:
+                return reservation
+            self.store.save(queued)
+            task_id = prepared.task_id
+            if task_id is None:
+                return queued
         return self.executor._run(conversation_id, action, task_id)
 
     def capability_catalog(self) -> list[dict[str, object]]:

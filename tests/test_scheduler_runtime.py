@@ -8,7 +8,7 @@ import pytest
 from flight_agent.runtime.observations import CapabilityOutcome
 from flight_agent.runtime.scheduling import ExecutionTurnScheduler, PlanningScheduler
 from flight_agent.verification.agent_planner import AgentDecision
-from flight_agent.verification.contracts import PendingDecision
+from flight_agent.verification.contracts import ConversationState, PendingDecision
 from flight_agent.verification.coordinator import ConversationActive
 from flight_agent.verification.routes import (
     ConfirmationRequest,
@@ -384,6 +384,102 @@ def test_started_confirm_validation_failure_is_durable(tmp_path):
     assert saved.task.calls == []
     assert saved.queued_action is None
     assert saved.queue_origin is None
+
+
+def test_confirm_preflight_does_not_hold_sqlite_writer(tmp_path):
+    entered = Event()
+    release = Event()
+    persisted = Event()
+    errors = []
+    runtime = make_runtime(
+        tmp_path, None, lambda context, inputs: CapabilityOutcome()
+    )
+    pending = propose_fake(runtime)
+    other = runtime.store.create()
+    verify = runtime.resources.verify
+
+    def blocking_verify(resources):
+        entered.set()
+        assert release.wait(5)
+        verify(resources)
+
+    def persist_other():
+        try:
+            record = runtime.store.get(other.id)
+            record.status = "waiting_for_user"
+            runtime.store.save(record)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            persisted.set()
+
+    runtime.resources.verify = blocking_verify
+    manager = conversation_manager(runtime)
+    writer = Thread(target=persist_other, daemon=True)
+    try:
+        queued = manager.decide(
+            pending.id,
+            "confirm",
+            ConfirmationRequest(version=1, trusted=True),
+        )
+        assert queued.status == "queued"
+        assert entered.wait(5)
+        writer.start()
+        assert persisted.wait(1), (
+            "an unrelated conversation writer was blocked by confirm preflight"
+        )
+        assert not release.is_set()
+        assert errors == []
+    finally:
+        release.set()
+        writer.join(timeout=5)
+        manager.close()
+        runtime.resources.verify = verify
+    assert not writer.is_alive()
+    assert runtime.store.get(other.id).status == "waiting_for_user"
+
+
+def test_changed_confirm_reservation_cannot_commit_consent_or_audit(tmp_path):
+    runtime = make_runtime(
+        tmp_path, None, lambda context, inputs: CapabilityOutcome()
+    )
+    pending = propose_fake(runtime)
+    pending.queue_origin = ConversationState(
+        status=pending.status,
+        pending_decision=pending.pending_decision,
+        error=pending.error,
+    )
+    pending.status = "queued"
+    pending.queued_action = "confirm"
+    pending.queued_action_committed = False
+    runtime.store.save(pending)
+    verify = runtime.resources.verify
+
+    def change_reservation(resources):
+        newer = runtime.store.get(pending.id)
+        newer.error = "newer reservation state"
+        runtime.store.save(newer)
+        verify(resources)
+
+    runtime.resources.verify = change_reservation
+    try:
+        with pytest.raises(ValueError, match="queued decision is no longer current"):
+            runtime.continue_decision(
+                pending.id,
+                "confirm",
+                version=1,
+                trusted=True,
+            )
+    finally:
+        runtime.resources.verify = verify
+    saved = runtime.store.get(pending.id)
+    assert saved.status == "queued"
+    assert saved.queued_action == "confirm"
+    assert saved.queued_action_committed is False
+    assert saved.error == "newer reservation state"
+    assert saved.task.baseline.confirmed is False
+    assert saved.task.baseline_sha256 is None
+    assert saved.task.decisions == []
 
 
 def test_planner_failure_is_one_atomic_coherent_transition(
