@@ -76,3 +76,56 @@ def create_model() -> ChatOpenAI:
         max_retries=0,
         use_responses_api=False,
     )
+
+
+_SCHEDULER_FIELDS = {
+    "FLIGHT_PLANNING_WORKERS": ("planning_workers", 4, 1, 32),
+    "FLIGHT_PLANNING_QUEUE": ("planning_queue", 32, 0, 256),
+    "FLIGHT_LOCAL_MATLAB_SLOTS": ("local_matlab_slots", 1, 1, 8),
+    "FLIGHT_REMOTE_WORKER_SLOTS": ("remote_worker_slots", 1, 1, 16),
+    "FLIGHT_READ_ONLY_SLOTS": ("read_only_slots", 4, 1, 32),
+    "FLIGHT_EXECUTION_TURNS": ("execution_turns", 32, 1, 64),
+}
+
+
+@dataclass(frozen=True)
+class SchedulerSettings:
+    planning_workers: int = 4
+    planning_queue: int = 32
+    local_matlab_slots: int = 1
+    remote_worker_slots: int = 1
+    read_only_slots: int = 4
+    execution_turns: int = 32
+
+    def __post_init__(self) -> None:
+        for variable, (field, default, lower, upper) in _SCHEDULER_FIELDS.items():
+            value = getattr(self, field)
+            if type(value) is not int or not lower <= value <= upper:
+                raise ValueError(
+                    f"{variable} must be an integer between {lower} and {upper}"
+                )
+        if self.execution_turns < (
+            self.local_matlab_slots
+            + self.remote_worker_slots
+            + self.read_only_slots
+        ):
+            raise ValueError(
+                "FLIGHT_EXECUTION_TURNS must cover the sum of execution lane slots"
+            )
+
+    @classmethod
+    def from_environment(cls) -> "SchedulerSettings":
+        values: dict[str, int] = {}
+        for variable, (field, default, lower, upper) in _SCHEDULER_FIELDS.items():
+            text = os.environ.get(variable, str(default)).strip()
+            if not text or not text.isascii() or not text.isdecimal():
+                raise ValueError(
+                    f"{variable} must be an integer between {lower} and {upper}"
+                )
+            value = int(text)
+            if not lower <= value <= upper:
+                raise ValueError(
+                    f"{variable} must be an integer between {lower} and {upper}"
+                )
+            values[field] = value
+        return cls(**values)
