@@ -54,16 +54,17 @@ def conservative_failure_transition(
     message: str,
 ) -> tuple[Literal["failed", "interrupted"], PendingDecision]:
     unresolved = has_unresolved_scheduling(record)
-    if unresolved:
-        return (
-            "interrupted",
-            conservative_pending_decision(
-                record,
-                message,
-                unresolved=True,
-            ),
-        )
-    return "failed", PendingDecision(kind="clarify", message=message)
+    pending = conservative_pending_decision(
+        record,
+        message,
+        unresolved=unresolved,
+    )
+    status: Literal["failed", "interrupted"] = (
+        "interrupted"
+        if unresolved or pending.kind == "resume"
+        else "failed"
+    )
+    return status, pending
 
 
 def recover_scheduling(record: Conversation) -> bool:

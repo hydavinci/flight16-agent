@@ -224,6 +224,89 @@ def test_matching_planner_exception_clears_reservation(tmp_path):
     assert saved.queue_origin is None
 
 
+def test_planner_failure_preserves_failed_task_retry(tmp_path):
+    calls = []
+
+    class Planner:
+        def propose(self, message, conversation, **kwargs):
+            raise RuntimeError("Planner unavailable")
+
+    def operation(context, inputs):
+        calls.append(context.call_id)
+        raise RuntimeError("Known invocation failure")
+
+    runtime = make_runtime(tmp_path, Planner(), operation)
+    pending = propose_fake(runtime)
+    failed = runtime.executor.confirm(pending.id, 1, trusted=True)
+    assert failed.status == "failed"
+    assert failed.pending_decision.kind == "retry"
+    calls.clear()
+
+    runtime.queue_message(failed.id, "Explain the failed task")
+    with pytest.raises(RuntimeError, match="Planner unavailable"):
+        runtime.continue_submission(failed.id)
+    preserved = runtime.store.get(failed.id)
+
+    assert preserved.status == "failed"
+    assert preserved.pending_decision.kind == "retry"
+    assert preserved.error == "Planner unavailable"
+    assert calls == []
+
+    retried = runtime.executor.retry(
+        preserved.id,
+        preserved.task.baseline.version,
+        trusted=True,
+    )
+    assert retried.status == "failed"
+    assert len(calls) == 1
+
+
+def test_planner_failure_preserves_confirmed_task_resume(tmp_path):
+    calls = []
+
+    class Planner:
+        def propose(self, message, conversation, **kwargs):
+            raise RuntimeError("Planner unavailable")
+
+    def operation(context, inputs):
+        calls.append(context.call_id)
+        raise RuntimeError("Known invocation failure")
+
+    runtime = make_runtime(tmp_path, Planner(), operation)
+    pending = propose_fake(runtime)
+    failed = runtime.executor.confirm(pending.id, 1, trusted=True)
+    queued = runtime.executor.retry(
+        failed.id,
+        failed.task.baseline.version,
+        trusted=True,
+        _execute=False,
+    )
+    manager = conversation_manager(runtime)
+    try:
+        manager._fail(queued.id, RuntimeError("Worker did not start"))
+    finally:
+        manager.close()
+    resumable = runtime.store.get(queued.id)
+    assert resumable.status == "interrupted"
+    assert resumable.pending_decision.kind == "resume"
+    assert not any(node.status == "failed" for node in resumable.task.nodes)
+    calls.clear()
+
+    runtime.queue_message(resumable.id, "Explain the resumable task")
+    with pytest.raises(RuntimeError, match="Planner unavailable"):
+        runtime.continue_submission(resumable.id)
+    preserved = runtime.store.get(resumable.id)
+
+    assert preserved.status == "interrupted"
+    assert preserved.pending_decision.kind == "resume"
+    assert preserved.error == "Planner unavailable"
+    assert calls == []
+
+    resumed = runtime.executor.resume(preserved.id)
+    assert resumed.status == "failed"
+    assert len(calls) == 1
+
+
 def test_archived_only_unresolved_planner_failure_requires_reconciliation(tmp_path):
     class Planner:
         def propose(self, message, conversation, **kwargs):
@@ -378,6 +461,56 @@ def test_manager_stale_planner_failure_cannot_overwrite_newer_turn(tmp_path):
     assert saved.error == "newer planned state"
     assert saved.pending_decision == newer.pending_decision
     assert saved.task is None
+
+
+def test_manager_stale_success_cannot_overwrite_newer_clarification(tmp_path):
+    entered = Event()
+    release = Event()
+
+    class Planner:
+        def propose(self, message, conversation, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return AgentDecision(action="answer", text="Stale answer")
+
+    runtime = make_runtime(
+        tmp_path, Planner(), lambda context, inputs: CapabilityOutcome()
+    )
+    manager = conversation_manager(runtime)
+    try:
+        queued = manager.submit(
+            None,
+            MessageRequest(message="Question with a stale answer"),
+        )
+        assert entered.wait(5)
+        newer = runtime.store.get(queued.id)
+        newer.status = "waiting_for_user"
+        newer.pending_decision = PendingDecision(
+            kind="clarify",
+            message="Newer clarification",
+        )
+        newer.error = None
+        newer.queued_action = None
+        newer.queued_action_committed = False
+        newer.queue_origin = None
+        newer.turn_origin = None
+        runtime.store.save(newer)
+        expected = newer.model_dump_json()
+        release.set()
+    finally:
+        release.set()
+        manager.close()
+    saved = runtime.store.get(queued.id)
+
+    assert saved.model_dump_json() == expected
+    assert saved.status == "waiting_for_user"
+    assert saved.pending_decision.message == "Newer clarification"
+    assert saved.error is None
+    assert not any(
+        message.role == "assistant"
+        and message.content.startswith("Request failed:")
+        for message in saved.messages
+    )
 
 
 def test_stale_planner_exception_cannot_overwrite_newer_record(tmp_path):

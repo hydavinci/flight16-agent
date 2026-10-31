@@ -22,7 +22,12 @@ from .contracts import (
     ConversationMessage,
     ConversationState,
 )
-from .coordinator import ConversationActive, EngineeringRuntime, PlanningFailure
+from .coordinator import (
+    ConversationActive,
+    EngineeringRuntime,
+    PlanningFailure,
+    PlanningSuperseded,
+)
 from .scheduling_recovery import (
     conservative_failure_transition,
     conservative_pending_decision,
@@ -194,6 +199,11 @@ class ConversationManager:
         with self.runtime.locks.hold(conversation_id):
             try:
                 operation()
+            except PlanningSuperseded:
+                logger.exception(
+                    "Conversation %s planning result was superseded",
+                    conversation_id,
+                )
             except PlanningFailure as exc:
                 state = "finalized" if exc.finalized else "stale"
                 logger.exception(

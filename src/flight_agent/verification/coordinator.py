@@ -24,6 +24,10 @@ class ConversationActive(ValueError):
     pass
 
 
+class PlanningSuperseded(ConversationActive):
+    pass
+
+
 class PlanningFailure(RuntimeError):
     def __init__(self, cause: Exception, *, finalized: bool):
         super().__init__(str(cause))
@@ -239,9 +243,12 @@ class EngineeringRuntime:
                 or not record.messages
                 or record.messages[-1] != message
             ):
-                raise ConversationActive(
+                conflict = (
                     "Queued planning state changed before its result was applied"
                 )
+                if _managed:
+                    raise PlanningSuperseded(conflict)
+                raise ConversationActive(conflict)
             if decision.plan is not None:
                 assert plan is not None
                 return self.executor.propose(record, plan)
