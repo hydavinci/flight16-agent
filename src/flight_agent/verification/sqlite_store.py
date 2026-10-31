@@ -13,20 +13,14 @@ from uuid import uuid4
 from ..models import JOB_ID
 from ..runtime.evidence import load_agent_run, verify_evidence
 from ..runtime.observations import OutputArtifact
-from .contracts import AgentTask, Conversation, ConversationMessage, PendingDecision
+from .contracts import AgentTask, Conversation
 from .intake import safe_directory
+from .scheduling_recovery import recover_scheduling
 from .sqlite_codec import Row, canonical, decode, encode
 from .sqlite_cutover import prepare_cutover
 from .sqlite_schema import DatabaseStartupError, connect_database, migrate_database
 
 MAX_CONVERSATION_BYTES = 8_000_000
-_RECOVERY_TIMESTAMP = "2000-01-01T00:00:00.000000+00:00"
-_RESTART_ERROR = (
-    "Service restarted; resume saved work without resubmitting a worker run."
-)
-_RESTART_MESSAGE = "服务在处理追问时重启；原任务状态已保留，请重新发送问题或续接任务。"
-
-
 @dataclass(frozen=True)
 class _EvidenceClaim:
     path: Path
@@ -216,53 +210,6 @@ class SQLiteConversationStore:
             *([record.task] if record.task else []),
         ]
 
-    @classmethod
-    def _requires_recovery(cls, record: Conversation) -> bool:
-        return record.status in ("planning", "running") or any(
-            call.status == "running"
-            for task in cls._tasks(record)
-            for call in task.calls
-        )
-
-    @classmethod
-    def _apply_startup_recovery(cls, record: Conversation, stamp: str) -> None:
-        restored_origin = (
-            record.status == "planning" and record.restore_turn_origin()
-        )
-        for task in cls._tasks(record):
-            interrupted_nodes = set()
-            for call in task.calls:
-                if call.status == "running":
-                    call.status = "interrupted"
-                    call.error = _RESTART_ERROR
-                    call.finished_at = stamp
-                    interrupted_nodes.add(call.node_id)
-            for node in task.nodes:
-                if node.status == "running" or node.id in interrupted_nodes:
-                    node.status = "interrupted"
-                    node.error = _RESTART_ERROR
-            if interrupted_nodes:
-                task.stage = "interrupted"
-        if restored_origin:
-            record.messages.append(
-                ConversationMessage(
-                    role="assistant",
-                    content=_RESTART_MESSAGE,
-                    created_at=stamp,
-                )
-            )
-            return
-        record.status = "interrupted"
-        record.error = _RESTART_ERROR
-        record.pending_decision = PendingDecision(
-            kind=(
-                "resume"
-                if record.task and record.task.baseline.confirmed
-                else "clarify"
-            ),
-            message=_RESTART_ERROR,
-        )
-
     @staticmethod
     def _serialized_size(record: Conversation) -> int:
         return len(canonical(record.model_dump(mode="json")).encode("utf-8"))
@@ -273,10 +220,9 @@ class SQLiteConversationStore:
             raise ValueError(
                 "Conversation exceeds 8 MB; existing state was not replaced"
             )
-        if not cls._requires_recovery(record):
-            return
         recovered = record.model_copy(deep=True)
-        cls._apply_startup_recovery(recovered, _RECOVERY_TIMESTAMP)
+        if not recover_scheduling(recovered):
+            return
         if cls._serialized_size(recovered) > MAX_CONVERSATION_BYTES:
             raise ValueError(
                 "Conversation exceeds the 8 MB limit including its startup "
@@ -292,15 +238,16 @@ class SQLiteConversationStore:
                     """SELECT DISTINCT conversations.id FROM conversations
                        LEFT JOIN tasks ON tasks.conversation_id=conversations.id
                        LEFT JOIN calls ON calls.task_id=tasks.id
-                       WHERE conversations.status IN ('planning','running')
+                       WHERE conversations.scheduling_status='queued'
+                          OR conversations.status IN ('planning','running')
                           OR calls.status='running'
                        ORDER BY conversations.id"""
                 )
             ]
-            for identifier in identifiers:
-                record = decode(connection, identifier)
-                self._apply_startup_recovery(record, _now())
-                self.save(record)
+            for conversation_id in identifiers:
+                record = decode(connection, conversation_id)
+                if recover_scheduling(record):
+                    self.save(record)
 
     def export(self, conversation_id: str) -> bytes:
         self.directory(conversation_id)

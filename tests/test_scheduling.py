@@ -222,6 +222,59 @@ def test_concurrent_close_submit_and_cancel_drains_admitted_work_once():
     assert third.is_set()
 
 
+def test_shutdown_drains_running_and_queued_work_but_refuses_new_admission():
+    runner = PlanningScheduler(1, 1)
+    entered, release, stopped, second = Event(), Event(), Event(), Event()
+
+    def first():
+        entered.set()
+        assert release.wait(5)
+
+    def close():
+        runner.stop_accepting()
+        stopped.set()
+        runner.close()
+
+    with ThreadPoolExecutor(1) as pool:
+        with runner.reserve() as reservation:
+            a = reservation.submit(first)
+        assert entered.wait(5)
+        with runner.reserve() as reservation:
+            b = reservation.submit(second.set)
+        closing = pool.submit(close)
+        try:
+            assert stopped.wait(5)
+            assert not closing.done()
+            with pytest.raises(SchedulerClosed):
+                with runner.reserve():
+                    pytest.fail("shutdown admitted work")
+        finally:
+            release.set()
+        closing.result(timeout=5)
+        a.result(timeout=5)
+        b.result(timeout=5)
+    assert second.is_set()
+
+
+def test_shutdown_waits_for_a_reserved_but_not_yet_published_request():
+    runner = PlanningScheduler(1, 0)
+    stopped = Event()
+
+    def close():
+        runner.stop_accepting()
+        stopped.set()
+        runner.close()
+
+    with ThreadPoolExecutor(1) as pool:
+        with runner.reserve() as reservation:
+            closing = pool.submit(close)
+            assert stopped.wait(5)
+            assert not closing.done()
+            future = reservation.submit(lambda: None)
+        future.result(timeout=5)
+        closing.result(timeout=5)
+
+
 def test_local_wait_does_not_occupy_remote_or_read_only_permits():
     scheduler = ExecutionScheduler(SchedulerSettings())
     attempted, remote, readonly = Event(), Event(), Event()
