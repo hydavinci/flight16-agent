@@ -7,6 +7,7 @@ from .intake import safe_directory, validate_output_root
 from .matlab_contracts import MatlabProjectDescriptor
 from .project_snapshots import ProjectSnapshotStore
 from .resources import ResourceRegistry
+from .snapshot_lock import is_reparse_point
 
 
 def local_projects(baseline: AgentPlan) -> dict[str, ResourceReference]:
@@ -25,6 +26,8 @@ def local_projects(baseline: AgentPlan) -> dict[str, ResourceReference]:
 
 def _descriptor(resource: ResourceReference) -> MatlabProjectDescriptor:
     project = MatlabProjectDescriptor.model_validate(resource.metadata.get("project"))
+    if not project.files:
+        raise ValueError("Project inventory cannot be empty")
     if resource.version != "1" or (
         project.root,
         project.fingerprint,
@@ -79,6 +82,24 @@ def _overlap(left: Path, right: Path) -> bool:
     return left.is_relative_to(right) or right.is_relative_to(left)
 
 
+def _reject_reparse_components(path: Path) -> None:
+    lexical = path if path.is_absolute() else path.absolute()
+    current = Path(lexical.anchor)
+    components = [current]
+    for part in lexical.parts[1:]:
+        current /= part
+        components.append(current)
+    for component in components:
+        try:
+            info = component.lstat()
+        except FileNotFoundError:
+            continue
+        if is_reparse_point(info):
+            raise ValueError(
+                f"Managed boundary path cannot traverse a reparse point: {component}"
+            )
+
+
 def validate_managed_boundaries(
     baseline: AgentPlan,
     registry: ResourceRegistry,
@@ -100,6 +121,13 @@ def validate_managed_boundaries(
         if isinstance(baseline, AgentBaseline) and baseline.confirmed
         else registry.local_roots(baseline.resources)
     )
+    boundary_paths = [
+        *managed,
+        *source_roots,
+        *([Path(normalized_output)] if normalized_output else []),
+    ]
+    for path in boundary_paths:
+        _reject_reparse_components(path)
     protected = [
         *source_roots,
         *([Path(normalized_output)] if normalized_output else []),

@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Thread
 
@@ -29,7 +30,22 @@ class ProbeInput(AgentContract):
     tag: str
 
 
-def project_executor(tmp_path, *, after_first=None, snapshot_root=None):
+class ReparseStat:
+    def __init__(self, base):
+        self._base = base
+        self.st_file_attributes = 0x00000400
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+def project_executor(
+    tmp_path,
+    *,
+    after_first=None,
+    snapshot_root=None,
+    secondary_state=None,
+):
     source = prepared_project(tmp_path / "source")
     project = discover_matlab_project(str(source))
     resource = ResourceReference(
@@ -50,6 +66,44 @@ def project_executor(tmp_path, *, after_first=None, snapshot_root=None):
             raise ValueError("Source changed before confirmation")
 
     resources.register("matlab_project", "agent", verify, local=True)
+    plan_resources = [resource.model_dump(mode="json")]
+    requirements = [
+        ResourceRequirement(
+            role="project",
+            kind="matlab_project",
+            location="agent",
+        )
+    ]
+    resource_bindings = {"project": "local"}
+    if secondary_state is not None:
+        secondary = ResourceReference(
+            id="secondary",
+            kind="calibration_data",
+            location="worker",
+            locator="worker://calibration/current",
+            fingerprint="b" * 64,
+            version="1",
+        )
+
+        def verify_secondary(current):
+            verifications.append(current.id)
+            if not secondary_state["valid"] or current != secondary:
+                raise ValueError("Secondary resource changed before confirmation")
+
+        resources.register(
+            "calibration_data",
+            "worker",
+            verify_secondary,
+        )
+        plan_resources.append(secondary.model_dump(mode="json"))
+        requirements.append(
+            ResourceRequirement(
+                role="secondary",
+                kind="calibration_data",
+                location="worker",
+            )
+        )
+        resource_bindings["secondary"] = "secondary"
     store = ConversationStore(tmp_path / "state")
     snapshots = ProjectSnapshotStore(snapshot_root or store.root / "snapshots")
     calls = []
@@ -88,15 +142,7 @@ def project_executor(tmp_path, *, after_first=None, snapshot_root=None):
             effect="execute_project",
             operation=execute,
             scheduling=SchedulingMetadata(lane="local_matlab"),
-            metadata=CapabilityMetadata(
-                resources=[
-                    ResourceRequirement(
-                        role="project",
-                        kind="matlab_project",
-                        location="agent",
-                    )
-                ],
-            ),
+            metadata=CapabilityMetadata(resources=requirements),
         )
     )
     executor = AgentExecutor(store, tools, resources, snapshots=snapshots)
@@ -127,14 +173,14 @@ def project_executor(tmp_path, *, after_first=None, snapshot_root=None):
                 "overall_requested": False,
                 "delivery_formats": [],
             },
-            "resources": [resource.model_dump(mode="json")],
+            "resources": plan_resources,
             "nodes": [
                 {
                     "id": "first",
                     "tool": "snapshot_probe",
                     "tool_version": "1",
                     "inputs": {"tag": "first"},
-                    "resource_bindings": {"project": "local"},
+                    "resource_bindings": resource_bindings,
                 },
                 {
                     "id": "second",
@@ -142,7 +188,7 @@ def project_executor(tmp_path, *, after_first=None, snapshot_root=None):
                     "tool_version": "1",
                     "depends_on": ["first"],
                     "inputs": {"tag": "second"},
-                    "resource_bindings": {"project": "local"},
+                    "resource_bindings": resource_bindings,
                 },
             ],
             "allowed_effects": ["read_only", "execute_project"],
@@ -283,6 +329,104 @@ def test_snapshot_root_overlap_with_source_rejects_proposal_without_creation(
     assert not executor.snapshots.root.exists()
 
 
+def test_empty_project_inventory_rejects_proposal_before_snapshot_guard(tmp_path):
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    project = plan.resources[0].metadata["project"]
+    empty = {
+        **project,
+        "files": [],
+        "models": [],
+        "entries": [],
+        "project_files": [],
+    }
+    resource = plan.resources[0].model_copy(update={"metadata": {"project": empty}})
+    invalid = plan.model_copy(update={"resources": [resource]})
+    permissive = ResourceRegistry()
+    permissive.register(
+        "matlab_project",
+        "agent",
+        lambda current: None,
+        local=True,
+    )
+    replacement = AgentExecutor(
+        store,
+        executor.tools,
+        permissive,
+        snapshots=executor.snapshots,
+    )
+    with pytest.raises(ValueError, match="inventory.*empty|empty.*inventory"):
+        replacement.propose(store.create(), invalid)
+    assert not executor.snapshots.root.exists()
+    assert calls == []
+
+
+def test_empty_project_inventory_rejects_confirmation_before_snapshot_guard(
+    tmp_path,
+):
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    pending = executor.propose(store.create(), plan)
+    record = store.get(pending.id)
+    project = record.task.baseline.resources[0].metadata["project"]
+    empty = {
+        **project,
+        "files": [],
+        "models": [],
+        "entries": [],
+        "project_files": [],
+    }
+    resource = record.task.baseline.resources[0].model_copy(
+        update={"metadata": {"project": empty}}
+    )
+    record.task.baseline = record.task.baseline.model_copy(
+        update={"resources": [resource]}
+    )
+    store.save(record)
+    with pytest.raises(ValueError, match="inventory.*empty|empty.*inventory"):
+        executor.confirm(
+            pending.id,
+            pending.task.baseline.version,
+            trusted=True,
+            _execute=False,
+        )
+    assert not executor.snapshots.root.exists()
+    _assert_unconfirmed_without_references(store, pending.id)
+    assert calls == []
+
+
+@pytest.mark.parametrize("boundary", ["managed", "source", "output"])
+def test_reparse_boundary_component_rejects_before_snapshot_guard(
+    tmp_path,
+    monkeypatch,
+    boundary,
+):
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    record = store.create()
+    if boundary == "managed":
+        executor.work_root.mkdir()
+        target = executor.work_root
+    elif boundary == "source":
+        target = source
+    else:
+        target = tmp_path / "delivery"
+        target.mkdir()
+        record.output_root = str(target)
+        store.save(record)
+        plan = plan.model_copy(
+            update={"allowed_effects": (*plan.allowed_effects, "write_delivery")}
+        )
+    original_lstat = Path.lstat
+
+    def reparse_lstat(path):
+        info = original_lstat(path)
+        return ReparseStat(info) if path == target else info
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    with pytest.raises(ValueError, match="reparse"):
+        executor.propose(record, plan)
+    assert not executor.snapshots.root.exists()
+    assert calls == []
+
+
 def test_stale_managed_reservation_after_publication_persists_no_binding(
     tmp_path, monkeypatch
 ):
@@ -318,6 +462,73 @@ def test_stale_managed_reservation_after_publication_persists_no_binding(
     assert calls == []
 
 
+def test_lifecycle_guard_covers_managed_reservation_comparison_and_save(
+    tmp_path, monkeypatch
+):
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    pending = executor.propose(store.create(), plan)
+    reservation = _queued_confirmation(store, pending)
+    state = {
+        "held": False,
+        "published": False,
+        "compared": False,
+        "saved": False,
+    }
+    guard = executor.snapshots.guard
+    ensure = executor.snapshots.ensure
+    get = store.get
+    save = store.save
+
+    @contextmanager
+    def tracked_guard(*, exclusive=False):
+        with guard(exclusive=exclusive):
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+    def tracked_ensure(project):
+        binding = ensure(project)
+        state["published"] = True
+        return binding
+
+    def tracked_get(conversation_id):
+        record = get(conversation_id)
+        if state["published"] and not state["saved"]:
+            assert state["held"]
+            state["compared"] = True
+        return record
+
+    def tracked_save(record):
+        if record.task is not None and record.task.baseline.confirmed:
+            assert state["held"]
+            save(record)
+            state["saved"] = True
+            return
+        save(record)
+
+    monkeypatch.setattr(executor.snapshots, "guard", tracked_guard)
+    monkeypatch.setattr(executor.snapshots, "ensure", tracked_ensure)
+    monkeypatch.setattr(store, "get", tracked_get)
+    monkeypatch.setattr(store, "save", tracked_save)
+    monkeypatch.setattr(executor, "_run", lambda *args, **kwargs: reservation)
+    runtime = EngineeringRuntime(store, object(), executor, executor.resources)
+    runtime.continue_decision(
+        reservation.id,
+        "confirm",
+        version=reservation.task.baseline.version,
+        trusted=True,
+    )
+    assert state == {
+        "held": False,
+        "published": True,
+        "compared": True,
+        "saved": True,
+    }
+    assert calls == []
+
+
 def test_store_save_failure_after_publication_persists_no_binding(
     tmp_path, monkeypatch
 ):
@@ -349,6 +560,42 @@ def test_store_save_failure_after_publication_persists_no_binding(
     assert len(published) == 1
     assert executor.snapshots.verify(published[0]).is_dir()
     _assert_unconfirmed_without_references(store, pending.id)
+    assert calls == []
+
+
+def test_post_copy_revalidates_all_original_resources(tmp_path, monkeypatch):
+    secondary_state = {"valid": True}
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        secondary_state=secondary_state,
+    )
+    pending = executor.propose(store.create(), plan)
+    published = []
+    ensure = executor.snapshots.ensure
+
+    def publish_then_change_secondary(project):
+        binding = ensure(project)
+        published.append(binding)
+        secondary_state["valid"] = False
+        return binding
+
+    monkeypatch.setattr(
+        executor.snapshots,
+        "ensure",
+        publish_then_change_secondary,
+    )
+    with pytest.raises(ValueError, match="Secondary resource changed"):
+        executor.confirm(
+            pending.id,
+            pending.task.baseline.version,
+            trusted=True,
+            _execute=False,
+        )
+    assert len(published) == 1
+    assert executor.snapshots.verify(published[0]).is_dir()
+    _assert_unconfirmed_without_references(store, pending.id)
+    assert verifications.count("secondary") == 3
+    assert verifications[-2:] == ["local", "secondary"]
     assert calls == []
 
 
