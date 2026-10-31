@@ -97,6 +97,11 @@ class EngineeringRuntime:
                 if record.task is not None
                 else None
             )
+            record.queue_origin = ConversationState(
+                status=record.status,
+                pending_decision=record.pending_decision,
+                error=record.error,
+            )
             changed = (
                 selected is not None
                 and record.resource_location is not None
@@ -128,7 +133,6 @@ class EngineeringRuntime:
                 record.resource_location = locations[0].id
             record.status = "queued"
             record.queued_action = "message"
-            record.queue_origin = None
             record.pending_decision = None
             record.error = None
             self.store.save(record)
@@ -145,25 +149,52 @@ class EngineeringRuntime:
             ):
                 raise ValueError("No queued user message is available for planning")
             record.status = "planning"
-            record.queued_action = None
             self.store.save(record)
-            resources: dict[str, ResourceReference] = {}
-            if record.project_root:
-                if record.resource_location is None:
-                    return self._wait(record, "请先选择资源位置。")
-                resource = self.resources.inspect(record.resource_location, record.project_root)
-                resources[resource.id] = resource
-            catalog = self.executor.tools.catalog(tuple(resources.values()))
-            sources = message_sources(record)
-            decision = self.planner.propose(
-                record.messages[-1].content,
-                record,
-                catalog=catalog,
-                resources=resources,
-                sources=sources,
+            reservation_stamp = record.updated_at
+            message = record.messages[-1].model_copy(deep=True)
+            task_id = record.task.id if record.task is not None else None
+            planning_record = record.model_copy(deep=True)
+        resources: dict[str, ResourceReference] = {}
+        if planning_record.project_root:
+            if planning_record.resource_location is None:
+                with self.locks.hold(conversation_id):
+                    current = self.store.get(conversation_id)
+                    return self._wait(current, "请先选择资源位置。")
+            resource = self.resources.inspect(
+                planning_record.resource_location,
+                planning_record.project_root,
             )
+            resources[resource.id] = resource
+        catalog = self.executor.tools.catalog(tuple(resources.values()))
+        sources = message_sources(planning_record)
+        decision = self.planner.propose(
+            message.content,
+            planning_record,
+            catalog=catalog,
+            resources=resources,
+            sources=sources,
+        )
+        plan = (
+            bind_plan(decision.plan, resources, sources, catalog)
+            if decision.plan is not None
+            else None
+        )
+        with self.locks.hold(conversation_id):
+            record = self.store.get(conversation_id)
+            current_task_id = record.task.id if record.task is not None else None
+            if (
+                record.status != "planning"
+                or record.queued_action != "message"
+                or record.updated_at != reservation_stamp
+                or current_task_id != task_id
+                or not record.messages
+                or record.messages[-1] != message
+            ):
+                raise ConversationActive(
+                    "Queued planning state changed before its result was applied"
+                )
             if decision.plan is not None:
-                plan = bind_plan(decision.plan, resources, sources, catalog)
+                assert plan is not None
                 return self.executor.propose(record, plan)
             record.messages.append(
                 ConversationMessage(
@@ -187,6 +218,8 @@ class EngineeringRuntime:
                     message=decision.text,
                 )
             record.turn_origin = None
+            record.queued_action = None
+            record.queue_origin = None
             self.store.save(record)
             return record
 
@@ -256,19 +289,21 @@ class EngineeringRuntime:
         version: int | None = None,
         trusted: bool = False,
     ) -> Conversation:
-        with self.locks.hold(conversation_id):
-            record = self.store.get(conversation_id)
-            if record.status in ("queued", "planning", "running"):
-                raise ConversationActive("This conversation already has an admitted turn")
-            operation = self.prepare_decision(
+        if action == "confirm":
+            return self.executor.confirm(
                 conversation_id,
-                action,
-                version=version,
+                version if version is not None else 0,
                 trusted=trusted,
             )
-        # A queued execution may wait for a lane, so do not retain the
-        # conversation lock while invoking the executor.
-        return operation() if operation is not None else self.store.get(conversation_id)
+        if action == "resume":
+            return self.executor.resume(conversation_id)
+        if action == "retry":
+            return self.executor.retry(
+                conversation_id,
+                version if version is not None else 0,
+                trusted=trusted,
+            )
+        raise ValueError("Submit new requirements for a new confirmed plan")
 
     def capability_catalog(self) -> list[dict[str, object]]:
         return self.executor.tools.catalog()

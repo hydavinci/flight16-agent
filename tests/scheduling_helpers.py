@@ -41,10 +41,10 @@ def make_runtime(tmp_path, planner, operation, *, lane="read_only", settings=Non
     return runtime
 
 
-def propose_fake(runtime, *, lane="read_only"):
+def propose_fake(runtime, *, lane="read_only", data=None):
     from flight_agent.runtime.agent_contracts import AgentPlan
 
-    data = analysis_plan_data()
+    data = analysis_plan_data() if data is None else data
     data["allowed_effects"] = [
         "read_only" if lane == "read_only" else "execute_project"
     ]

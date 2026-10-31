@@ -8,6 +8,7 @@ from flight_agent.runtime.evidence import agent_receipt_name
 from flight_agent.verification.store import ConversationStore
 from tests.agent_helpers import analysis_plan_data, register_rmse
 from tests.test_agent_runtime import confirm, propose, runtime_module, setup
+from tests.test_scheduler_runtime import assert_conversation_lock_available
 
 
 def restarted(runtime, store, tools=None):
@@ -154,6 +155,8 @@ def test_checkpoint_reconciliation_reads_only_original_call_and_verifies_digest(
 
     calls = []
     lookups = []
+    identifier = None
+    recovery = None
 
     def operation(context, inputs):
         calls.append(context.call_id)
@@ -161,6 +164,7 @@ def test_checkpoint_reconciliation_reads_only_original_call_and_verifies_digest(
         raise KeyboardInterrupt("After durable tool completion checkpoint")
 
     def reconcile(context, inputs):
+        assert_conversation_lock_available(recovery, identifier)
         lookups.append(context.call_id)
         data = context.load_checkpoint()
         if data is None:
@@ -195,13 +199,15 @@ def test_checkpoint_reconciliation_reads_only_original_call_and_verifies_digest(
     )
     runtime, store, conversation, _ = setup(tmp_path, tools=tools)
     pending = propose(runtime, conversation)
+    identifier = pending.id
     with pytest.raises(KeyboardInterrupt):
         confirm(runtime, pending)
     if tamper:
         saved = store.get(pending.id).task
         checkpoint = Path(saved.result_directory) / saved.checkpoints[calls[0]]
         checkpoint.write_text('{"value":999}')
-    recovered = restarted(runtime, store).resume(pending.id)
+    recovery = restarted(runtime, store)
+    recovered = recovery.resume(pending.id)
     if tamper:
         assert recovered.status == "interrupted"
         assert "digest" in recovered.error.lower()
