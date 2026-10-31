@@ -17,15 +17,14 @@ from ..runtime.scheduling import (
     SchedulerClosed,
     Submission,
 )
-from .agent_runtime import has_unresolved_call
 from .contracts import (
     Conversation,
     ConversationMessage,
     ConversationState,
-    PendingDecision,
 )
-from .coordinator import ConversationActive, EngineeringRuntime
+from .coordinator import ConversationActive, EngineeringRuntime, PlanningFailure
 from .scheduling_recovery import (
+    conservative_failure_transition,
     conservative_pending_decision,
     has_unresolved_scheduling,
 )
@@ -184,16 +183,10 @@ class ConversationManager:
                         )
                     )
                 else:
-                    uncertain = (
-                        record.task is not None
-                        and has_unresolved_call(record.task)
+                    record.status, record.pending_decision = (
+                        conservative_failure_transition(record, message)
                     )
-                    record.status = "interrupted" if uncertain else "failed"
                     record.error = message
-                    record.pending_decision = PendingDecision(
-                        kind="resume" if uncertain else "clarify",
-                        message=message,
-                    )
             record.turn_origin = None
             self.runtime.store.save(record)
 
@@ -201,6 +194,13 @@ class ConversationManager:
         with self.runtime.locks.hold(conversation_id):
             try:
                 operation()
+            except PlanningFailure as exc:
+                state = "finalized" if exc.finalized else "stale"
+                logger.exception(
+                    "Conversation %s planning failed with %s reservation state",
+                    conversation_id,
+                    state,
+                )
             except Exception as exc:
                 self._fail(conversation_id, exc)
 
@@ -254,7 +254,10 @@ class ConversationManager:
                 return self._schedule(
                     record,
                     reservation,
-                    lambda: self.runtime.continue_submission(identifier),
+                    lambda: self.runtime.continue_submission(
+                        identifier,
+                        _managed=True,
+                    ),
                 )
 
     def _decision(

@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from typing import Literal
 
 from .contracts import Conversation, ConversationMessage, PendingDecision
 
@@ -46,6 +47,23 @@ def conservative_pending_decision(
     if record.task is not None and record.task.baseline.confirmed:
         return PendingDecision(kind="resume", message=message)
     return PendingDecision(kind="clarify", message=message)
+
+
+def conservative_failure_transition(
+    record: Conversation,
+    message: str,
+) -> tuple[Literal["failed", "interrupted"], PendingDecision]:
+    unresolved = has_unresolved_scheduling(record)
+    if unresolved:
+        return (
+            "interrupted",
+            conservative_pending_decision(
+                record,
+                message,
+                unresolved=True,
+            ),
+        )
+    return "failed", PendingDecision(kind="clarify", message=message)
 
 
 def recover_scheduling(record: Conversation) -> bool:

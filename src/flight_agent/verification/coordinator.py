@@ -14,6 +14,7 @@ from .contracts import (
 from .conversation_repository import ConversationRepository
 from .intake import parse_directories, validate_output_root
 from .resources import ResourceRegistry, resolve_location
+from .scheduling_recovery import conservative_failure_transition
 from .store import now
 
 Action = Literal["confirm", "resume", "retry"]
@@ -21,6 +22,12 @@ Action = Literal["confirm", "resume", "retry"]
 
 class ConversationActive(ValueError):
     pass
+
+
+class PlanningFailure(RuntimeError):
+    def __init__(self, cause: Exception, *, finalized: bool):
+        super().__init__(str(cause))
+        self.finalized = finalized
 
 
 class EngineeringRuntime:
@@ -140,7 +147,12 @@ class EngineeringRuntime:
             self.store.save(record)
             return record
 
-    def continue_submission(self, conversation_id: str) -> Conversation:
+    def continue_submission(
+        self,
+        conversation_id: str,
+        *,
+        _managed: bool = False,
+    ) -> Conversation:
         with self.locks.hold(conversation_id):
             record = self.store.get(conversation_id)
             if (
@@ -186,6 +198,7 @@ class EngineeringRuntime:
                 else None
             )
         except Exception as exc:
+            finalized = False
             with self.locks.hold(conversation_id):
                 current = self.store.get(conversation_id)
                 current_task_id = (
@@ -200,14 +213,19 @@ class EngineeringRuntime:
                     and current.messages
                     and current.messages[-1] == message
                 ):
-                    current.status = "failed"
-                    current.error = str(exc)[:4000]
-                    current.pending_decision = None
+                    error = str(exc)[:4000] or "Conversation planning failed"
+                    current.status, current.pending_decision = (
+                        conservative_failure_transition(current, error)
+                    )
+                    current.error = error
                     current.turn_origin = None
                     current.queued_action = None
                     current.queued_action_committed = False
                     current.queue_origin = None
                     self.store.save(current)
+                    finalized = True
+            if _managed:
+                raise PlanningFailure(exc, finalized=finalized) from exc
             raise
         with self.locks.hold(conversation_id):
             record = self.store.get(conversation_id)
