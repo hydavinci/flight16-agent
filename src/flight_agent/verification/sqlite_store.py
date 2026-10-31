@@ -11,11 +11,18 @@ from uuid import uuid4
 from ..models import JOB_ID
 from ..runtime.evidence import load_agent_run, verify_evidence
 from ..runtime.observations import OutputArtifact
-from .contracts import Conversation, ConversationMessage, PendingDecision
+from .contracts import AgentTask, Conversation, ConversationMessage, PendingDecision
 from .intake import safe_directory
 from .sqlite_codec import Row, canonical, decode, encode
 from .sqlite_cutover import prepare_cutover
 from .sqlite_schema import DatabaseStartupError, connect_database, migrate_database
+
+MAX_CONVERSATION_BYTES = 8_000_000
+_RECOVERY_TIMESTAMP = "2000-01-01T00:00:00.000000+00:00"
+_RESTART_ERROR = (
+    "Service restarted; resume saved work without resubmitting a worker run."
+)
+_RESTART_MESSAGE = "服务在处理追问时重启；原任务状态已保留，请重新发送问题或续接任务。"
 
 
 def _now() -> str:
@@ -141,6 +148,80 @@ class SQLiteConversationStore:
             ]
             return [decode(connection, identifier) for identifier in identifiers]
 
+    @staticmethod
+    def _tasks(record: Conversation) -> list[AgentTask]:
+        return [
+            *record.archived_tasks,
+            *([record.task] if record.task else []),
+        ]
+
+    @classmethod
+    def _requires_recovery(cls, record: Conversation) -> bool:
+        return record.status in ("planning", "running") or any(
+            call.status == "running"
+            for task in cls._tasks(record)
+            for call in task.calls
+        )
+
+    @classmethod
+    def _apply_startup_recovery(cls, record: Conversation, stamp: str) -> None:
+        restored_origin = (
+            record.status == "planning" and record.restore_turn_origin()
+        )
+        for task in cls._tasks(record):
+            interrupted_nodes = set()
+            for call in task.calls:
+                if call.status == "running":
+                    call.status = "interrupted"
+                    call.error = _RESTART_ERROR
+                    call.finished_at = stamp
+                    interrupted_nodes.add(call.node_id)
+            for node in task.nodes:
+                if node.status == "running" or node.id in interrupted_nodes:
+                    node.status = "interrupted"
+                    node.error = _RESTART_ERROR
+            if interrupted_nodes:
+                task.stage = "interrupted"
+        if restored_origin:
+            record.messages.append(
+                ConversationMessage(
+                    role="assistant",
+                    content=_RESTART_MESSAGE,
+                    created_at=stamp,
+                )
+            )
+            return
+        record.status = "interrupted"
+        record.error = _RESTART_ERROR
+        record.pending_decision = PendingDecision(
+            kind=(
+                "resume"
+                if record.task and record.task.baseline.confirmed
+                else "clarify"
+            ),
+            message=_RESTART_ERROR,
+        )
+
+    @staticmethod
+    def _serialized_size(record: Conversation) -> int:
+        return len(canonical(record.model_dump(mode="json")).encode("utf-8"))
+
+    @classmethod
+    def _check_size(cls, record: Conversation) -> None:
+        if cls._serialized_size(record) > MAX_CONVERSATION_BYTES:
+            raise ValueError(
+                "Conversation exceeds 8 MB; existing state was not replaced"
+            )
+        if not cls._requires_recovery(record):
+            return
+        recovered = record.model_copy(deep=True)
+        cls._apply_startup_recovery(recovered, _RECOVERY_TIMESTAMP)
+        if cls._serialized_size(recovered) > MAX_CONVERSATION_BYTES:
+            raise ValueError(
+                "Conversation exceeds the 8 MB limit including its startup "
+                "recovery reserve; existing state was not replaced"
+            )
+
     def _recover_startup(self) -> None:
         with self.transaction():
             connection = self._local.connection
@@ -157,60 +238,7 @@ class SQLiteConversationStore:
             ]
             for identifier in identifiers:
                 record = decode(connection, identifier)
-                tasks = [
-                    *record.archived_tasks,
-                    *([record.task] if record.task else []),
-                ]
-                running = [
-                    call
-                    for task in tasks
-                    for call in task.calls
-                    if call.status == "running"
-                ]
-                if (
-                    record.status == "planning"
-                    and not running
-                    and record.restore_turn_origin()
-                ):
-                    record.messages.append(
-                        ConversationMessage(
-                            role="assistant",
-                            content=(
-                                "服务在处理追问时重启；原任务状态已保留，请重新发送问题或续接任务。"
-                            ),
-                            created_at=_now(),
-                        )
-                    )
-                    self.save(record)
-                    continue
-                error = (
-                    "Service restarted; resume saved work without resubmitting "
-                    "a worker run."
-                )
-                for task in tasks:
-                    interrupted_nodes = set()
-                    for call in task.calls:
-                        if call.status == "running":
-                            call.status = "interrupted"
-                            call.error = error
-                            call.finished_at = _now()
-                            interrupted_nodes.add(call.node_id)
-                    for node in task.nodes:
-                        if node.status == "running" or node.id in interrupted_nodes:
-                            node.status = "interrupted"
-                            node.error = error
-                    if interrupted_nodes:
-                        task.stage = "interrupted"
-                record.status = "interrupted"
-                record.error = error
-                record.pending_decision = PendingDecision(
-                    kind=(
-                        "resume"
-                        if record.task and record.task.baseline.confirmed
-                        else "clarify"
-                    ),
-                    message=error,
-                )
+                self._apply_startup_recovery(record, _now())
                 self.save(record)
 
     def export(self, conversation_id: str) -> bytes:
@@ -218,12 +246,18 @@ class SQLiteConversationStore:
         with self._read() as connection:
             record = decode(connection, conversation_id)
             tasks = {
-                task.id: task
-                for task in [
-                    *record.archived_tasks,
-                    *([record.task] if record.task else []),
-                ]
+                task.id: task for task in self._tasks(record)
             }
+            roots = {}
+            for task in tasks.values():
+                root = self.task_directory(
+                    record.id, task.id, task.output_root
+                )
+                if str(root) != task.result_directory:
+                    raise ValueError(
+                        "Task result directory does not match its persisted identity"
+                    )
+                roots[task.id] = root
             artifacts = [
                 dict(row)
                 for row in connection.execute(
@@ -234,14 +268,8 @@ class SQLiteConversationStore:
                 )
             ]
             for row in artifacts:
-                task = tasks[str(row["task_id"])]
-                root = self.task_directory(record.id, task.id, task.output_root)
-                if str(root) != task.result_directory:
-                    raise ValueError(
-                        "Task result directory does not match its persisted identity"
-                    )
                 verify_evidence(
-                    root,
+                    roots[str(row["task_id"])],
                     OutputArtifact.model_validate_json(row["descriptor_json"]),
                 )
             events = [
@@ -392,13 +420,7 @@ class SQLiteConversationStore:
     def save(self, record: Conversation) -> None:
         self.directory(record.id)
         validated = Conversation.model_validate(record.model_dump(mode="json"))
-        if (
-            len(canonical(validated.model_dump(mode="json")).encode("utf-8"))
-            > 8_000_000
-        ):
-            raise ValueError(
-                "Conversation exceeds 8 MB; existing state was not replaced"
-            )
+        self._check_size(validated)
         validated.updated_at = _now()
         with self.transaction():
             connection = self._local.connection

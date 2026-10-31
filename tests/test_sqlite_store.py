@@ -1,18 +1,21 @@
 import hashlib
 import json
 import sqlite3
+import threading
 
 import pytest
 
+from flight_agent.runtime.agent_contracts import BudgetState
 from flight_agent.runtime.evidence import describe_evidence, persist_agent_run
 from flight_agent.runtime.observations import OutputArtifact
 from flight_agent.verification.agent_runtime import accept_verified_run
 from flight_agent.verification.contracts import (
     ConversationMessage,
+    ConversationState,
     PendingDecision,
     ToolCall,
 )
-from flight_agent.verification.sqlite_codec import encode
+from flight_agent.verification.sqlite_codec import canonical, encode
 from flight_agent.verification.sqlite_store import SQLiteConversationStore
 from flight_agent.verification.store import now
 from tests.test_agent_evidence import run as invocation_run
@@ -433,3 +436,180 @@ def test_export_is_stable_complete_and_does_not_change_live_state(tmp_path):
     (directory / "metric.json").write_text('{"rmse":2}')
     with pytest.raises(ValueError, match="integrity"):
         store.export(record.id)
+
+
+def test_planning_restart_with_running_call_restores_origin_and_recovery_evidence(
+    tmp_path,
+):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    task = record.task
+    run = invocation_run()
+    persist_agent_run(directory, run)
+    task.calls.append(
+        ToolCall(
+            id=run.id,
+            node_id="compute",
+            tool=run.spec.capability,
+            tool_version=run.spec.capability_version,
+            baseline_version=task.baseline.version,
+            status="running",
+            inputs=run.spec.inputs,
+            started_at=run.started_at,
+        )
+    )
+    task.pending_specs[run.id] = run.spec
+    task.analysis_runs.append(run)
+    task.nodes[0].status = "running"
+    checkpoint = directory / "checkpoint.json"
+    checkpoint.write_text('{"progress":1}')
+    task.checkpoints[run.id] = checkpoint.name
+    task.checkpoint_sha256[run.id] = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    metric = directory / "metric.json"
+    metric.write_text('{"rmse":1}')
+    task.artifacts.append(
+        OutputArtifact(**describe_evidence(directory, metric.name).model_dump())
+    )
+    task.budget_state = BudgetState(
+        started_at=now(),
+        calls=1,
+        rounds=1,
+        round_charges=["compute"],
+    )
+    origin = ConversationState(
+        status="waiting_for_user",
+        pending_decision=PendingDecision(kind="retry", message="Continue prior task"),
+        error="Prior task state",
+    )
+    record.turn_origin = origin
+    record.status = "planning"
+    store.save(record)
+
+    saved = SQLiteConversationStore(store.root).get(record.id)
+
+    assert saved.status == origin.status
+    assert saved.pending_decision == origin.pending_decision
+    assert saved.error == origin.error
+    assert saved.turn_origin is None
+    assert saved.task.calls[0].status == "interrupted"
+    assert saved.task.pending_specs == task.pending_specs
+    assert saved.task.analysis_runs == task.analysis_runs
+    assert saved.task.checkpoints == task.checkpoints
+    assert saved.task.checkpoint_sha256 == task.checkpoint_sha256
+    assert saved.task.artifacts == task.artifacts
+    assert saved.task.budget_state == task.budget_state
+    assert len(saved.messages) == 1
+    with sqlite3.connect(store.database_path) as connection:
+        event_count = connection.execute("SELECT count(*) FROM task_events").fetchone()[0]
+
+    restarted = SQLiteConversationStore(store.root).get(record.id)
+
+    assert restarted == saved
+    assert len(restarted.messages) == 1
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM task_events").fetchone()[0] == event_count
+
+
+@pytest.mark.parametrize("missing_task", ["current", "archived"])
+def test_export_validates_artifact_free_current_and_archived_task_directories(
+    tmp_path, missing_task
+):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    current_directory = store.task_directory(record.id, "a" * 32, create=True)
+    archived_directory = store.task_directory(record.id, "b" * 32, create=True)
+    record.task = agent_task(current_directory)
+    archived = agent_task(archived_directory)
+    archived.id = "b" * 32
+    record.archived_tasks = [archived]
+    store.save(record)
+    target = current_directory if missing_task == "current" else archived_directory
+    target.rmdir()
+
+    with pytest.raises(ValueError, match="directory is missing"):
+        store.export(record.id)
+
+
+def test_recovery_reserve_accepts_near_limit_state_that_can_recover(tmp_path):
+    hard_limit = 8_000_000
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    record.status = "planning"
+    record.turn_origin = ConversationState(status="waiting_for_user")
+    created_at = now()
+    record.messages.append(
+        ConversationMessage(role="user", content="x", created_at=created_at)
+    )
+
+    base_size = len(canonical(record.model_dump(mode="json")).encode("utf-8"))
+    content = "x" * (1 + hard_limit - 16 - base_size)
+    record.messages[0] = ConversationMessage(
+        role="user", content=content, created_at=created_at
+    )
+    assert len(canonical(record.model_dump(mode="json")).encode("utf-8")) == hard_limit - 16
+    with pytest.raises(ValueError, match="recovery reserve"):
+        store.save(record)
+
+    record.messages[0] = ConversationMessage(
+        role="user", content=content[:-1008], created_at=created_at
+    )
+    accepted_size = len(canonical(record.model_dump(mode="json")).encode("utf-8"))
+    assert accepted_size == hard_limit - 1024
+    store.save(record)
+
+    recovered = SQLiteConversationStore(store.root).get(record.id)
+
+    assert recovered.status == "waiting_for_user"
+    assert recovered.turn_origin is None
+    assert len(canonical(recovered.model_dump(mode="json")).encode("utf-8")) <= hard_limit
+    assert len(SQLiteConversationStore(store.root).get(record.id).messages) == 2
+
+
+def test_export_keeps_one_snapshot_when_writer_commits_after_aggregate_read(
+    tmp_path, monkeypatch
+):
+    from flight_agent.verification import sqlite_store as sqlite_store_module
+
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    store.save(record)
+    aggregate_read = threading.Event()
+    writer_finished = threading.Event()
+    writer_errors = []
+    original_decode = sqlite_store_module.decode
+
+    def coordinated_decode(connection, conversation_id):
+        value = original_decode(connection, conversation_id)
+        aggregate_read.set()
+        assert writer_finished.wait(timeout=5)
+        return value
+
+    def write_event():
+        try:
+            assert aggregate_read.wait(timeout=5)
+            with sqlite3.connect(store.database_path, timeout=5) as connection:
+                connection.execute(
+                    """INSERT INTO task_events(task_id, kind, created_at, payload_json)
+                       VALUES (?, 'writer_transition', ?, '{}')""",
+                    (record.task.id, now()),
+                )
+        except BaseException as exc:
+            writer_errors.append(exc)
+        finally:
+            writer_finished.set()
+
+    monkeypatch.setattr(sqlite_store_module, "decode", coordinated_decode)
+    writer = threading.Thread(target=write_event)
+    writer.start()
+    payload = json.loads(store.export(record.id))
+    writer.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert writer_errors == []
+    assert [event["kind"] for event in payload["task_events"]] == ["state_transition"]
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM task_events").fetchone()[0] == 2
