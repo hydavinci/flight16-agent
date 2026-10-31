@@ -110,62 +110,6 @@ def test_background_runner_requires_positive_capacity():
         BackgroundRunner(max_workers=0)
 
 
-@pytest.mark.parametrize("busy", [False, True])
-def test_scheduler_failure_is_durable_and_does_not_leak_the_slot(tmp_path, monkeypatch, busy):
-    from flight_agent.background import BackgroundRunner, BusyError
-
-    def unavailable(self, operation):
-        raise BusyError("Scheduler unavailable") if busy else RuntimeError("Scheduler unavailable")
-
-    app, runtime, calls, _ = make_agent_web(tmp_path, [])
-    monkeypatch.setattr(BackgroundRunner, "submit", unavailable)
-    with TestClient(app, base_url="http://127.0.0.1") as client:
-        headers = auth(client)
-        for _ in range(2):
-            response = client.post(API, headers=headers, json={"message": "Analyze."})
-            assert response.status_code == (409 if busy else 503)
-        records = runtime.store.recent()
-        assert len(records) == 2
-        assert all(record.status == "failed" for record in records)
-        assert all(record.error == "Scheduler unavailable" for record in records)
-        assert not calls
-
-
-def test_admission_stays_locked_until_background_slot_is_released(tmp_path, monkeypatch):
-    from flight_agent.background import BackgroundRunner
-
-    operation_done, release_slot = threading.Event(), threading.Event()
-
-    def delayed_release(self, operation):
-        try:
-            operation()
-        finally:
-            operation_done.set()
-            assert release_slot.wait(5)
-            self.slot.release()
-
-    monkeypatch.setattr(BackgroundRunner, "_run", delayed_release)
-    app, runtime, _, _ = make_agent_web(
-        tmp_path, [{"action": "answer", "text": "No execution."}]
-    )
-    with TestClient(app, base_url="http://127.0.0.1") as client:
-        try:
-            headers = auth(client)
-            assert client.post(
-                API, headers=headers, json={"message": "Explain RMSE."}
-            ).status_code == 202
-            assert operation_done.wait(5)
-
-            response = client.post(
-                API, headers=headers, json={"message": "Explain overshoot."}
-            )
-
-            assert response.status_code == 409
-            assert len(runtime.store.recent()) == 1
-        finally:
-            release_slot.set()
-
-
 @pytest.mark.parametrize("requested", ["agent", "worker", "d1", "d2"])
 def test_unregistered_location_alias_is_rejected_before_creating_a_record(tmp_path, requested):
     from flight_agent.verification.resources import ResourceAdapter
@@ -621,32 +565,6 @@ def test_unknown_call_blocks_new_requirement_and_retry_without_extra_execution(t
             == 409
         )
         assert len(calls) == 1
-
-
-def test_model_planning_occupies_the_shared_job_slot(tmp_path, monkeypatch):
-    app, runtime, _, _ = make_agent_web(tmp_path, [{"action": "answer", "text": "Done."}])
-    entered, release = threading.Event(), threading.Event()
-    original = runtime.planner.propose
-
-    def blocked(*args, **kwargs):
-        entered.set()
-        assert release.wait(5)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(runtime.planner, "propose", blocked)
-    with TestClient(app, base_url="http://127.0.0.1") as client:
-        try:
-            headers = auth(client)
-            identifier = post_message(client, headers)
-            assert entered.wait(5)
-            response = client.post(API, headers=headers, json={"message": "Another."})
-            assert response.status_code == 409
-            assert len(runtime.store.recent()) == 1
-        finally:
-            release.set()
-        wait_for_conversation(
-            client, identifier, headers, lambda item: item["status"] == "completed"
-        )
 
 
 def test_store_injection_does_not_interrupt_an_existing_active_record(tmp_path):

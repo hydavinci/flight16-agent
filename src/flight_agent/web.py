@@ -13,8 +13,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
-from .background import BackgroundRunner
-from .config import ModelSettings
+from .config import ModelSettings, SchedulerSettings
 from .directories import (
     DirectoryListing,
     NativeDirectoryError,
@@ -23,6 +22,11 @@ from .directories import (
 )
 from .remote import RemoteError
 from .runtime.capabilities import CapabilityRegistry
+from .runtime.scheduling import (
+    ExecutionScheduler,
+    ExecutionTurnScheduler,
+    PlanningScheduler,
+)
 from .service import BodyLimitMiddleware, install_validation_handler
 from .verification.agent_planner import AgentPlanner
 from .verification.agent_runtime import AgentContext, AgentExecutor
@@ -32,7 +36,7 @@ from .verification.diagnostic_planner import DiagnosticReviewer
 from .verification.local_matlab import LocalMatlabBackend
 from .verification.plugins import register_builtin_plugins
 from .verification.resources import ResourceLocation, ResourceRegistry, resolve_location
-from .verification.routes import verification_router
+from .verification.routes import ConversationManager, verification_router
 from .verification.sqlite_store import SQLiteConversationStore
 
 
@@ -49,7 +53,18 @@ def create_web_app(
     *,
     engineering_runtime: EngineeringRuntime | None = None,
     native_directory_picker: bool = False,
+    scheduler_settings: SchedulerSettings | None = None,
 ) -> FastAPI:
+    settings = scheduler_settings if scheduler_settings is not None else (
+        engineering_runtime.executor.scheduler.settings
+        if engineering_runtime is not None
+        else SchedulerSettings.from_environment()
+    )
+    if (
+        engineering_runtime is not None
+        and engineering_runtime.executor.scheduler.settings != settings
+    ):
+        raise ValueError("Injected runtime and Web scheduler settings must match")
     local_backend = LocalMatlabBackend.from_environment()
     resources = (
         engineering_runtime.resources if engineering_runtime is not None else ResourceRegistry()
@@ -67,18 +82,30 @@ def create_web_app(
         )
         engineering_runtime = EngineeringRuntime(
             conversations, AgentPlanner(),
-            AgentExecutor(conversations, tools, resources), resources,
+            AgentExecutor(
+                conversations,
+                tools,
+                resources,
+                scheduler=ExecutionScheduler(settings),
+            ),
+            resources,
         )
     runtime = engineering_runtime
-    jobs = BackgroundRunner()
+    manager = ConversationManager(
+        runtime,
+        PlanningScheduler(settings.planning_workers, settings.planning_queue),
+        ExecutionTurnScheduler(settings.execution_turns),
+    )
     token = secrets.token_urlsafe(32)
     static = Path(__file__).parent / "static"
     native_picker_lock = Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        yield
-        jobs.close()
+        try:
+            yield
+        finally:
+            manager.close()
 
     def same_origin(request: Request) -> None:
         origin = request.headers.get("origin")
@@ -106,7 +133,8 @@ def create_web_app(
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     install_validation_handler(app)
     auth = [Depends(authorize)]
-    app.include_router(verification_router(runtime, jobs, authorize))
+    app.state.conversation_manager = manager
+    app.include_router(verification_router(manager, authorize))
 
     @app.middleware("http")
     async def response_headers(

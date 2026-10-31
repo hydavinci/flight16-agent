@@ -83,10 +83,14 @@ class BoundedRunner:
             if not reservation._submitted:
                 reservation._release()
 
-    def close(self) -> None:
+    def stop_accepting(self) -> None:
         with self._condition:
             self._closing = True
             self._condition.notify_all()
+
+    def close(self) -> None:
+        self.stop_accepting()
+        with self._condition:
             if self._closed or current_thread() in self._worker_threads:
                 return
             while self._shutdown_started and not self._closed:

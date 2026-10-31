@@ -1,18 +1,30 @@
 import logging
-import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 from typing import Literal, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from ..background import BackgroundRunner, BusyError
 from ..runtime.evidence import verify_evidence
-from .contracts import Conversation, ConversationMessage, PendingDecision
-from .coordinator import EngineeringRuntime
+from ..runtime.scheduling import (
+    CapacityExceeded,
+    ExecutionTurnScheduler,
+    PlanningScheduler,
+    SchedulerClosed,
+    Submission,
+)
+from .agent_runtime import has_unresolved_call
+from .contracts import (
+    Conversation,
+    ConversationMessage,
+    ConversationState,
+    PendingDecision,
+)
+from .coordinator import ConversationActive, EngineeringRuntime
 from .store import now
 from .views import ConversationView, to_conversation_view
 
@@ -71,74 +83,139 @@ class ConfirmationRequest(BaseModel):
 
 
 class ConversationManager:
-    def __init__(self, runtime: EngineeringRuntime, jobs: BackgroundRunner):
+    def __init__(
+        self,
+        runtime: EngineeringRuntime,
+        planning: PlanningScheduler,
+        execution: ExecutionTurnScheduler,
+    ) -> None:
         self.runtime = runtime
-        self.jobs = jobs
-        self.lock = threading.Lock()
+        self.planning = planning
+        self.execution = execution
+        self._close_lock = Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self.planning.stop_accepting()
+            self.execution.stop_accepting()
+            self.planning.close()
+            self.execution.close()
+            self._closed = True
 
     def _fail(self, conversation_id: str, error: Exception) -> None:
         logger.exception("Conversation %s failed", conversation_id)
-        record = self.runtime.store.get(conversation_id)
-        message = str(error)[:4000] or "Conversation operation failed"
-        if record.restore_turn_origin():
-            record.messages.append(ConversationMessage(
-                role="assistant", content="Follow-up request failed: " + message, created_at=now(),
-            ))
+        with self.runtime.locks.hold(conversation_id):
+            record = self.runtime.store.get(conversation_id)
+            message = str(error)[:4000] or "Conversation operation failed"
+            action = record.queued_action
+            origin = record.queue_origin
+            record.queued_action = None
+            record.queue_origin = None
+            restored = record.restore_turn_origin()
+            if (
+                not restored
+                and origin is not None
+                and (action != "message" or len(record.messages) > 1)
+            ):
+                record.status = origin.status
+                record.pending_decision = origin.pending_decision
+                record.error = origin.error
+                restored = True
+            if restored:
+                record.messages.append(
+                    ConversationMessage(
+                        role="assistant",
+                        content="Request failed: " + message,
+                        created_at=now(),
+                    )
+                )
+            else:
+                uncertain = (
+                    record.task is not None and has_unresolved_call(record.task)
+                )
+                record.status = "interrupted" if uncertain else "failed"
+                record.error = message
+                record.pending_decision = PendingDecision(
+                    kind="resume" if uncertain else "clarify",
+                    message=message,
+                )
             self.runtime.store.save(record)
-            return
-        record.pending_decision = PendingDecision(
-            kind=(
-                record.pending_decision.kind
-                if record.pending_decision
-                else "resume"
-                if record.status != "planning" and record.task and record.task.baseline.confirmed
-                else "clarify"
-            ),
-            message=message,
-        )
-        record.status = "failed"
-        record.error = record.pending_decision.message
-        self.runtime.store.save(record)
 
     def _run(self, conversation_id: str, operation: Callable[[], Conversation]) -> None:
-        try:
-            operation()
-        except Exception as exc:
-            # Background failures must be visible in the durable record and the server log.
-            self._fail(conversation_id, exc)
+        with self.runtime.locks.hold(conversation_id):
+            try:
+                operation()
+            except Exception as exc:
+                self._fail(conversation_id, exc)
 
-    def _schedule(self, record: Conversation, operation: Callable[[], Conversation]) -> None:
+    def _schedule(
+        self,
+        record: Conversation,
+        reservation: Submission,
+        operation: Callable[[], Conversation],
+    ) -> Conversation:
+        response = record.model_copy(deep=True)
         try:
-            future = self.jobs.submit(lambda: self._run(record.id, operation))
-            future.add_done_callback(lambda _: self.lock.release())
-        except BusyError as exc:
-            self._fail(record.id, exc)
-            raise
+            reservation.submit(lambda: self._run(record.id, operation))
         except RuntimeError as exc:
             self._fail(record.id, exc)
-            raise HTTPException(
-                status_code=503, detail="Unable to schedule conversation: " + str(exc)
+            raise SchedulerClosed(
+                "Unable to publish reserved conversation work"
             ) from exc
+        return response
 
     def submit(self, conversation_id: str | None, request: MessageRequest) -> Conversation:
-        if not self.lock.acquire(blocking=False):
-            raise BusyError("Another task is running; wait for it to finish")
-        dispatched = False
-        try:
-            record = self.runtime.queue_message(
-                conversation_id,
-                request.canonical_message(),
-                request.project_root,
-                output_root=request.output_root,
-                location=request.location,
-            )
-            if record.status == "planning":
-                self._schedule(record, lambda: self.runtime.continue_submission(record.id))
-                dispatched = True
-            return record
-        finally:
-            if not dispatched:
-                self.lock.release()
+        if conversation_id is not None:
+            current = self.runtime.store.get(conversation_id)
+            if current.status in ("queued", "planning", "running"):
+                raise ConversationActive(
+                    "This conversation already has an admitted turn"
+                )
+        with self.planning.reserve() as reservation:
+            if conversation_id is None:
+                record = self.runtime.queue_message(
+                    None,
+                    request.canonical_message(),
+                    request.project_root,
+                    output_root=request.output_root,
+                    location=request.location,
+                )
+                identifier = record.id
+            else:
+                identifier = conversation_id
+                record = None
+            with self.runtime.locks.hold(identifier):
+                if record is None:
+                    record = self.runtime.queue_message(
+                        identifier,
+                        request.canonical_message(),
+                        request.project_root,
+                        output_root=request.output_root,
+                        location=request.location,
+                    )
+                if record.status != "queued" or record.queued_action != "message":
+                    return record.model_copy(deep=True)
+                return self._schedule(
+                    record,
+                    reservation,
+                    lambda: self.runtime.continue_submission(identifier),
+                )
+
+    def _decision(
+        self,
+        conversation_id: str,
+        action: Literal["confirm", "resume", "retry"],
+        request: ConfirmationRequest | None,
+    ) -> Conversation:
+        return self.runtime.continue_decision(
+            conversation_id,
+            action,
+            version=request.version if request is not None else None,
+            trusted=request.trusted if request is not None else False,
+        )
 
     def decide(
         self,
@@ -146,35 +223,47 @@ class ConversationManager:
         action: Literal["confirm", "resume", "retry"],
         request: ConfirmationRequest | None = None,
     ) -> Conversation:
-        if not self.lock.acquire(blocking=False):
-            raise BusyError("Another task is running; wait for it to finish")
-        dispatched = False
-        try:
-            record = self.runtime.store.get(conversation_id)
-            operation = self.runtime.prepare_decision(
-                conversation_id, action,
-                version=request.version if request is not None else None,
-                trusted=request.trusted if request is not None else False,
+        current = self.runtime.store.get(conversation_id)
+        if current.status in ("queued", "planning", "running"):
+            raise ConversationActive(
+                "This conversation already has an admitted turn"
             )
-            if operation is None:
-                return record
-            record.status = "running"
-            record.error = None
-            self.runtime.store.save(record)
-            self._schedule(record, operation)
-            dispatched = True
-            return record
-        finally:
-            if not dispatched:
-                self.lock.release()
+        with self.execution.reserve() as reservation:
+            with self.runtime.locks.hold(conversation_id):
+                record = self.runtime.store.get(conversation_id)
+                if record.status in ("queued", "planning", "running"):
+                    raise ConversationActive(
+                        "This conversation already has an admitted turn"
+                    )
+                operation = self.runtime.prepare_decision(
+                    conversation_id,
+                    action,
+                    version=request.version if request is not None else None,
+                    trusted=request.trusted if request is not None else False,
+                )
+                if operation is None:
+                    return record.model_copy(deep=True)
+                record.queue_origin = ConversationState(
+                    status=record.status,
+                    pending_decision=record.pending_decision,
+                    error=record.error,
+                )
+                record.queued_action = action
+                record.status = "queued"
+                self.runtime.store.save(record)
+                return self._schedule(
+                    record,
+                    reservation,
+                    lambda: self._decision(conversation_id, action, request),
+                )
 
 
 def verification_router(
-    runtime: EngineeringRuntime, jobs: BackgroundRunner,
+    manager: ConversationManager,
     authorize: Callable[[Request], None],
 ) -> APIRouter:
+    runtime = manager.runtime
     router = APIRouter(prefix="/api/conversations", dependencies=[Depends(authorize)])
-    manager = ConversationManager(runtime, jobs)
 
     @contextmanager
     def request_errors() -> Iterator[None]:
@@ -182,6 +271,17 @@ def verification_router(
             yield
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Unknown conversation or task") from exc
+        except CapacityExceeded as exc:
+            raise HTTPException(
+                status_code=429,
+                detail={"code": "scheduler_capacity", "message": str(exc)},
+                headers={"Retry-After": "1"},
+            ) from exc
+        except SchedulerClosed as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "scheduler_closed", "message": str(exc)},
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except OSError as exc:

@@ -334,39 +334,87 @@ class EngineeringRuntime:
                         version if version is not None else 0,
                         trusted=trusted,
                     )
-            operation = self.prepare_decision(
+            queued, task_id = self._queue_decision(
                 conversation_id,
                 action,
                 version=version,
                 trusted=trusted,
             )
-            if operation is None:
-                return record
-            if action == "confirm":
-                queued = self.executor.confirm(
+            if task_id is None:
+                return queued
+        return self.executor._run(conversation_id, action, task_id)
+
+    def _queue_decision(
+        self,
+        conversation_id: str,
+        action: Action,
+        *,
+        version: int | None,
+        trusted: bool,
+    ) -> tuple[Conversation, str | None]:
+        record = self.store.get(conversation_id)
+        operation = self.prepare_decision(
+            conversation_id,
+            action,
+            version=version,
+            trusted=trusted,
+        )
+        if operation is None:
+            return record, None
+        if action == "confirm":
+            queued = self.executor.confirm(
+                conversation_id,
+                version if version is not None else 0,
+                trusted=trusted,
+                _execute=False,
+            )
+        elif action == "resume":
+            queued = self.executor.resume(conversation_id, _execute=False)
+        elif action == "retry":
+            queued = self.executor.retry(
+                conversation_id,
+                version if version is not None else 0,
+                trusted=trusted,
+                _execute=False,
+            )
+        else:
+            raise ValueError("Submit new requirements for a new confirmed plan")
+        if queued.task is None:
+            raise ValueError("No task has been planned")
+        return queued, queued.task.id
+
+    def continue_decision(
+        self,
+        conversation_id: str,
+        action: Action,
+        *,
+        version: int | None = None,
+        trusted: bool = False,
+    ) -> Conversation:
+        with self.store.transaction():
+            with self.locks.hold(conversation_id):
+                record = self.store.get(conversation_id)
+                origin = record.queue_origin
+                if (
+                    record.status != "queued"
+                    or record.queued_action != action
+                    or origin is None
+                ):
+                    raise ValueError("The queued decision is no longer current")
+                record.status = origin.status
+                record.pending_decision = origin.pending_decision
+                record.error = origin.error
+                record.queue_origin = None
+                record.queued_action = None
+                self.store.save(record)
+                queued, task_id = self._queue_decision(
                     conversation_id,
-                    version if version is not None else 0,
+                    action,
+                    version=version,
                     trusted=trusted,
-                    _execute=False,
                 )
-            elif action == "resume":
-                queued = self.executor.resume(
-                    conversation_id, _execute=False
-                )
-            elif action == "retry":
-                queued = self.executor.retry(
-                    conversation_id,
-                    version if version is not None else 0,
-                    trusted=trusted,
-                    _execute=False,
-                )
-            else:
-                raise ValueError(
-                    "Submit new requirements for a new confirmed plan"
-                )
-            if queued.task is None:
-                raise ValueError("No task has been planned")
-            task_id = queued.task.id
+                if task_id is None:
+                    return queued
         return self.executor._run(conversation_id, action, task_id)
 
     def capability_catalog(self) -> list[dict[str, object]]:
