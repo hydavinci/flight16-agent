@@ -25,6 +25,10 @@ from .contracts import (
     PendingDecision,
 )
 from .coordinator import ConversationActive, EngineeringRuntime
+from .scheduling_recovery import (
+    conservative_pending_decision,
+    has_unresolved_scheduling,
+)
 from .store import now
 from .views import ConversationView, to_conversation_view
 
@@ -133,37 +137,64 @@ class ConversationManager:
             message = str(error)[:4000] or "Conversation operation failed"
             action = record.queued_action
             origin = record.queue_origin
+            committed = (
+                record.queued_action_committed
+                and action in ("confirm", "resume", "retry")
+            )
             record.queued_action = None
             record.queued_action_committed = False
             record.queue_origin = None
-            restored = record.restore_turn_origin()
-            if (
-                not restored
-                and origin is not None
-                and (action != "message" or len(record.messages) > 1)
-            ):
-                record.status = origin.status
-                record.pending_decision = origin.pending_decision
-                record.error = origin.error
-                restored = True
-            if restored:
-                record.messages.append(
-                    ConversationMessage(
-                        role="assistant",
-                        content="Request failed: " + message,
-                        created_at=now(),
-                    )
+            if committed:
+                unresolved = has_unresolved_scheduling(record)
+                failed = record.task is not None and any(
+                    node.status == "failed" for node in record.task.nodes
+                )
+                confirmed = (
+                    record.task is not None
+                    and record.task.baseline.confirmed
+                )
+                record.status = (
+                    "interrupted"
+                    if unresolved or confirmed and not failed
+                    else "failed"
+                )
+                record.error = message
+                record.pending_decision = conservative_pending_decision(
+                    record,
+                    message,
+                    unresolved=unresolved,
                 )
             else:
-                uncertain = (
-                    record.task is not None and has_unresolved_call(record.task)
-                )
-                record.status = "interrupted" if uncertain else "failed"
-                record.error = message
-                record.pending_decision = PendingDecision(
-                    kind="resume" if uncertain else "clarify",
-                    message=message,
-                )
+                restored = record.restore_turn_origin()
+                if (
+                    not restored
+                    and origin is not None
+                    and (action != "message" or len(record.messages) > 1)
+                ):
+                    record.status = origin.status
+                    record.pending_decision = origin.pending_decision
+                    record.error = origin.error
+                    restored = True
+                if restored:
+                    record.messages.append(
+                        ConversationMessage(
+                            role="assistant",
+                            content="Request failed: " + message,
+                            created_at=now(),
+                        )
+                    )
+                else:
+                    uncertain = (
+                        record.task is not None
+                        and has_unresolved_call(record.task)
+                    )
+                    record.status = "interrupted" if uncertain else "failed"
+                    record.error = message
+                    record.pending_decision = PendingDecision(
+                        kind="resume" if uncertain else "clarify",
+                        message=message,
+                    )
+            record.turn_origin = None
             self.runtime.store.save(record)
 
     def _run(self, conversation_id: str, operation: Callable[[], Conversation]) -> None:

@@ -110,6 +110,22 @@ def receipt_bytes(record):
     }
 
 
+def manager_with_captured_operation(runtime, monkeypatch):
+    manager = ConversationManager(
+        runtime,
+        PlanningScheduler(1, 0),
+        ExecutionTurnScheduler(1),
+    )
+    operations = []
+
+    def capture(record, reservation, operation):
+        operations.append(operation)
+        return record.model_copy(deep=True)
+
+    monkeypatch.setattr(manager, "_schedule", capture)
+    return manager, operations
+
+
 def queue_committed_action(tmp_path, action):
     calls = []
     terminal = None if action == "confirm" else "fail"
@@ -359,7 +375,11 @@ def test_archived_running_call_recovers_under_real_queued_message_header(tmp_pat
     recovered = first.archived_tasks[-1]
 
     assert first.status == "interrupted"
-    assert first.pending_decision.kind == "resume"
+    assert first.pending_decision.kind == "clarify"
+    assert "reconcil" in first.pending_decision.message.lower()
+    assert "reconcil" in first.messages[-1].content.lower()
+    assert "resume" not in first.messages[-1].content.lower()
+    assert first.task is None
     assert first.queued_action is None
     assert first.queue_origin is None
     assert [call.id for call in recovered.calls] == [
@@ -506,3 +526,167 @@ def test_committed_retry_failure_recovers_as_actionable_retry(tmp_path, monkeypa
     assert len(calls) == 1
     assert retried.queued_action is None
     assert retried.model_dump().get("queued_action_committed") is False
+
+
+def test_manager_failure_does_not_rollback_committed_confirm(tmp_path, monkeypatch):
+    calls = []
+
+    def operation(context, inputs):
+        calls.append(context.call_id)
+        context.save_checkpoint({"phase": "dispatched"})
+        raise TypeError("Unexpected capability bug")
+
+    runtime = make_runtime(tmp_path, None, operation)
+    pending = propose_fake(runtime)
+    manager, operations = manager_with_captured_operation(runtime, monkeypatch)
+    try:
+        admitted = manager.decide(
+            pending.id,
+            "confirm",
+            ConfirmationRequest(version=1, trusted=True),
+        )
+        assert admitted.queued_action == "confirm"
+        assert admitted.queued_action_committed is False
+        assert len(operations) == 1
+        manager._run(pending.id, operations[0])
+        failed = runtime.store.get(pending.id)
+    finally:
+        manager.close()
+
+    call = failed.task.calls[0]
+    budget = failed.task.budget_state
+    decisions = failed.task.decisions
+    pending_specs = failed.task.pending_specs
+    checkpoints = failed.task.checkpoints
+    checkpoint_sha256 = failed.task.checkpoint_sha256
+    messages = len(failed.messages)
+    assert failed.status == "interrupted"
+    assert failed.pending_decision.kind == "resume"
+    assert failed.task.baseline.confirmed
+    assert [decision.action for decision in decisions] == ["confirm_baseline"]
+    assert call.status == "running"
+    assert budget.calls == 1
+    assert failed.queued_action is None
+    assert failed.queued_action_committed is False
+    assert failed.queue_origin is None
+    assert failed.turn_origin is None
+    assert calls == [call.id]
+
+    first_store, executor = reopen(runtime)
+    first = first_store.get(pending.id)
+
+    assert first.status == "interrupted"
+    assert first.pending_decision.kind == "resume"
+    assert first.task.calls[0].id == call.id
+    assert first.task.calls[0].status == "interrupted"
+    assert first.task.budget_state == budget
+    assert first.task.decisions == decisions
+    assert first.task.pending_specs == pending_specs
+    assert first.task.checkpoints == checkpoints
+    assert first.task.checkpoint_sha256 == checkpoint_sha256
+    assert len(first.messages) == messages + 1
+    assert calls == [call.id]
+
+    second = ConversationStore(first_store.root).get(pending.id)
+    assert second == first
+    assert calls == [call.id]
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_status", "expected_decision"),
+    [
+        ("resume", "failed", "retry"),
+        ("retry", "interrupted", "resume"),
+    ],
+)
+def test_manager_failure_routes_committed_actions_from_persisted_task_state(
+    tmp_path, action, expected_status, expected_decision
+):
+    runtime, queued, calls = queue_committed_action(tmp_path, action)
+    task_state = preserved_task_state(queued)
+    messages = len(queued.messages)
+    manager = ConversationManager(
+        runtime,
+        PlanningScheduler(1, 0),
+        ExecutionTurnScheduler(1),
+    )
+    try:
+        manager._fail(queued.id, TypeError("Worker callback failed"))
+    finally:
+        manager.close()
+    failed = runtime.store.get(queued.id)
+
+    assert failed.status == expected_status
+    assert failed.pending_decision.kind == expected_decision
+    assert any(node.status == "failed" for node in failed.task.nodes) is (
+        action == "resume"
+    )
+    assert preserved_task_state(failed) == task_state
+    assert len(failed.messages) == messages
+    assert failed.queued_action is None
+    assert failed.queued_action_committed is False
+    assert failed.queue_origin is None
+    assert failed.turn_origin is None
+    assert calls == []
+
+    continued = (
+        runtime.executor.retry(
+            failed.id,
+            failed.task.baseline.version,
+            trusted=True,
+        )
+        if expected_decision == "retry"
+        else runtime.executor.resume(failed.id)
+    )
+    assert continued.status == "failed"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("action", ["confirm", "resume", "retry"])
+def test_manager_failure_restores_admission_only_decision_origin(
+    tmp_path, monkeypatch, action
+):
+    calls = []
+    runtime = make_runtime(
+        tmp_path,
+        None,
+        evidence_operation(calls, "fail"),
+    )
+    pending = propose_fake(
+        runtime,
+        data=two_node_plan() if action != "confirm" else analysis_plan_data(),
+    )
+    if action != "confirm":
+        pending = runtime.executor.confirm(pending.id, 1, trusted=True)
+        assert pending.status == "failed"
+    calls.clear()
+    origin = pending.model_copy(deep=True)
+    manager, operations = manager_with_captured_operation(runtime, monkeypatch)
+    request = (
+        ConfirmationRequest(
+            version=pending.task.baseline.version,
+            trusted=True,
+        )
+        if action in ("confirm", "retry")
+        else None
+    )
+    try:
+        admitted = manager.decide(pending.id, action, request)
+        assert admitted.queued_action == action
+        assert admitted.queued_action_committed is False
+        assert len(operations) == 1
+        manager._fail(pending.id, RuntimeError("Worker did not start"))
+    finally:
+        manager.close()
+    restored = runtime.store.get(pending.id)
+
+    assert restored.status == origin.status
+    assert restored.pending_decision == origin.pending_decision
+    assert restored.error == origin.error
+    assert restored.task == origin.task
+    assert restored.queued_action is None
+    assert restored.queued_action_committed is False
+    assert restored.queue_origin is None
+    assert restored.turn_origin is None
+    assert len(restored.messages) == len(origin.messages) + 1
+    assert calls == []

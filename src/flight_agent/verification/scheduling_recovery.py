@@ -6,6 +6,46 @@ RESTART_MESSAGE = (
     "Service restarted before this request completed. No queued request was replayed; "
     "review the saved state and explicitly resend, confirm, or resume."
 )
+ARCHIVED_RECONCILIATION_MESSAGE = (
+    "Unresolved calls remain only in archived task history. No request was replayed; "
+    "explicitly reconcile the saved call IDs and evidence before continuing."
+)
+
+
+def has_unresolved_scheduling(record: Conversation) -> bool:
+    tasks = [*record.archived_tasks, *([record.task] if record.task else [])]
+    return any(
+        call.status in ("running", "interrupted")
+        for task in tasks
+        for call in task.calls
+    )
+
+
+def conservative_pending_decision(
+    record: Conversation,
+    message: str,
+    *,
+    unresolved: bool | None = None,
+) -> PendingDecision:
+    unresolved = (
+        has_unresolved_scheduling(record) if unresolved is None else unresolved
+    )
+    if unresolved:
+        return PendingDecision(
+            kind="resume" if record.task is not None else "clarify",
+            message=(
+                message
+                if record.task is not None
+                else ARCHIVED_RECONCILIATION_MESSAGE
+            ),
+        )
+    if record.task is not None and any(
+        node.status == "failed" for node in record.task.nodes
+    ):
+        return PendingDecision(kind="retry", message=message)
+    if record.task is not None and record.task.baseline.confirmed:
+        return PendingDecision(kind="resume", message=message)
+    return PendingDecision(kind="clarify", message=message)
 
 
 def recover_scheduling(record: Conversation) -> bool:
@@ -16,11 +56,7 @@ def recover_scheduling(record: Conversation) -> bool:
     has_queued_node = any(
         node.status == "queued" for task in tasks for node in task.nodes
     )
-    has_unknown = any(
-        call.status in ("running", "interrupted")
-        for task in tasks
-        for call in task.calls
-    )
+    has_unknown = has_unresolved_scheduling(record)
     for task in tasks:
         unresolved_nodes = {
             call.node_id
@@ -67,31 +103,27 @@ def recover_scheduling(record: Conversation) -> bool:
     elif not has_unknown and not has_queued_node and record.status == "queued":
         restored = record.restore_turn_origin()
     if not restored:
-        record.status = "interrupted"
-        record.error = RESTART_MESSAGE
-        confirmed = record.task is not None and record.task.baseline.confirmed
-        failed = record.task is not None and any(
-            node.status == "failed" for node in record.task.nodes
+        recovery_message = (
+            ARCHIVED_RECONCILIATION_MESSAGE
+            if has_unknown and record.task is None
+            else RESTART_MESSAGE
         )
-        record.pending_decision = PendingDecision(
-            kind=(
-                "resume"
-                if has_unknown
-                else "retry"
-                if committed_action and failed
-                else "resume"
-                if confirmed
-                else "clarify"
-            ),
-            message=RESTART_MESSAGE,
+        record.status = "interrupted"
+        record.error = recovery_message
+        record.pending_decision = conservative_pending_decision(
+            record,
+            recovery_message,
+            unresolved=has_unknown,
         )
         record.turn_origin = None
         if record.task is not None:
             record.task.stage = "interrupted"
+    else:
+        recovery_message = RESTART_MESSAGE
     record.messages.append(
         ConversationMessage(
             role="assistant",
-            content=RESTART_MESSAGE,
+            content=recovery_message,
             created_at=datetime.now(UTC).isoformat(),
         )
     )
