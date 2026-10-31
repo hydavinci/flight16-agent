@@ -446,6 +446,7 @@ def test_source_and_output_directories_must_not_overlap(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     conversation.output_root = str(source)
+    runtime.store.save(conversation)
     runtime.resources.register("project", "web", lambda resource: None, local=True)
     data = analysis_plan_data()
     data["allowed_effects"].append("write_delivery")
@@ -565,6 +566,7 @@ def test_external_output_requires_delivery_permission_before_creating_directorie
     runtime, _, conversation, calls = setup(tmp_path)
     root = tmp_path / "external"
     conversation.output_root = str(root)
+    runtime.store.save(conversation)
     with pytest.raises(ValueError, match="write_delivery|delivery permission"):
         propose(runtime, conversation)
     assert not root.exists()
@@ -575,6 +577,7 @@ def test_external_output_directory_is_created_only_after_explicit_confirmation(t
     runtime, _, conversation, calls = setup(tmp_path)
     root = tmp_path / "external"
     conversation.output_root = str(root)
+    runtime.store.save(conversation)
     data = analysis_plan_data()
     data["allowed_effects"].append("write_delivery")
     pending = propose(runtime, conversation, data)

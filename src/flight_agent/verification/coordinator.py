@@ -1,10 +1,7 @@
-import threading
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from functools import partial
 from typing import Literal
 
-from ..background import BusyError
 from ..runtime.resources import ResourceReference
 from .agent_planner import AgentPlanner, bind_plan, message_sources
 from .agent_runtime import AgentExecutor, has_unresolved_call
@@ -22,6 +19,10 @@ from .store import now
 Action = Literal["confirm", "resume", "retry"]
 
 
+class ConversationActive(ValueError):
+    pass
+
+
 class EngineeringRuntime:
     def __init__(
         self,
@@ -36,16 +37,7 @@ class EngineeringRuntime:
         self.planner = planner
         self.executor = executor
         self.resources = resources
-        self.lock = threading.Lock()
-
-    @contextmanager
-    def _operation(self) -> Iterator[None]:
-        if not self.lock.acquire(blocking=False):
-            raise BusyError("Another engineering operation is running")
-        try:
-            yield
-        finally:
-            self.lock.release()
+        self.locks = executor.locks
 
     @staticmethod
     def _message(record: Conversation, role: str, text: str) -> None:
@@ -61,6 +53,8 @@ class EngineeringRuntime:
 
     def _wait(self, record: Conversation, text: str) -> Conversation:
         record.turn_origin = None
+        record.queued_action = None
+        record.queue_origin = None
         record.status = "waiting_for_user"
         record.error = None
         record.pending_decision = PendingDecision(kind="clarify", message=text)
@@ -77,11 +71,14 @@ class EngineeringRuntime:
         output_root: str | None = None,
         location: str | None = None,
     ) -> Conversation:
-        with self._operation():
-            if not message.strip() or len(message) > 4000:
-                raise ValueError("A message between 1 and 4000 characters is required")
-            selected = resolve_location(location, self.resources.locations())
-            record = self.store.get(conversation_id) if conversation_id else self.store.create()
+        if not message.strip() or len(message) > 4000:
+            raise ValueError("A message between 1 and 4000 characters is required")
+        selected = resolve_location(location, self.resources.locations())
+        identifier = conversation_id if conversation_id is not None else self.store.create().id
+        with self.locks.hold(identifier):
+            record = self.store.get(identifier)
+            if record.status in ("queued", "planning", "running"):
+                raise ConversationActive("This conversation already has an admitted turn")
             self._message(record, "user", message.strip())
             if record.task is not None and has_unresolved_call(record.task):
                 self._message(
@@ -91,8 +88,6 @@ class EngineeringRuntime:
                 )
                 self.store.save(record)
                 return record
-            if record.status in ("planning", "running"):
-                raise BusyError("The current conversation is already active")
             record.turn_origin = (
                 ConversationState(
                     status=record.status,
@@ -131,21 +126,27 @@ class EngineeringRuntime:
                         record, "请明确目录所属的已注册资源位置，不能猜测 Agent 或 Worker。"
                     )
                 record.resource_location = locations[0].id
-            record.status = "planning"
+            record.status = "queued"
+            record.queued_action = "message"
+            record.queue_origin = None
             record.pending_decision = None
             record.error = None
             self.store.save(record)
             return record
 
     def continue_submission(self, conversation_id: str) -> Conversation:
-        with self._operation():
+        with self.locks.hold(conversation_id):
             record = self.store.get(conversation_id)
             if (
-                record.status != "planning"
+                record.status != "queued"
+                or record.queued_action != "message"
                 or not record.messages
                 or record.messages[-1].role != "user"
             ):
                 raise ValueError("No queued user message is available for planning")
+            record.status = "planning"
+            record.queued_action = None
+            self.store.save(record)
             resources: dict[str, ResourceReference] = {}
             if record.project_root:
                 if record.resource_location is None:
@@ -197,44 +198,55 @@ class EngineeringRuntime:
         version: int | None = None,
         trusted: bool = False,
     ) -> Callable[[], Conversation] | None:
-        record = self.store.get(conversation_id)
-        task = record.task
-        if task is None:
-            raise ValueError("No task has been planned")
-        if action != "resume" and (
-            type(version) is not int or version != task.baseline.version or trusted is not True
-        ):
-            raise ValueError("Explicit consent for the current baseline version is required")
-        if action in ("confirm", "resume") and record.status == "completed":
-            return None
-        if action == "confirm":
-            if (
-                task.baseline.confirmed
-                or record.pending_decision is None
-                or record.pending_decision.kind != "confirm_baseline"
+        with self.locks.hold(conversation_id):
+            record = self.store.get(conversation_id)
+            task = record.task
+            if task is None:
+                raise ValueError("No task has been planned")
+            if action != "resume" and (
+                type(version) is not int
+                or version != task.baseline.version
+                or trusted is not True
             ):
-                raise ValueError("A new unconfirmed baseline is required")
-            return partial(
-                self.executor.confirm, conversation_id, task.baseline.version, trusted=True
-            )
-        if not task.baseline.confirmed:
-            raise ValueError("Confirm the current baseline before continuing")
-        if record.pending_decision is not None and record.pending_decision.kind not in (
-            "resume",
-            "retry",
-        ):
-            raise ValueError("Address the current follow-up before continuing the previous task")
-        if action == "resume":
-            return partial(self.executor.resume, conversation_id)
-        if action == "retry":
-            if has_unresolved_call(task):
-                raise ValueError("Reconcile unknown calls before retrying")
-            if not any(node.status == "failed" for node in task.nodes):
-                raise ValueError("Only a known failed invocation may be retried")
-            return partial(
-                self.executor.retry, conversation_id, task.baseline.version, trusted=True
-            )
-        raise ValueError("Submit new requirements for a new confirmed plan")
+                raise ValueError("Explicit consent for the current baseline version is required")
+            if action in ("confirm", "resume") and record.status == "completed":
+                return None
+            if action == "confirm":
+                if (
+                    task.baseline.confirmed
+                    or record.pending_decision is None
+                    or record.pending_decision.kind != "confirm_baseline"
+                ):
+                    raise ValueError("A new unconfirmed baseline is required")
+                return partial(
+                    self.executor.confirm,
+                    conversation_id,
+                    task.baseline.version,
+                    trusted=True,
+                )
+            if not task.baseline.confirmed:
+                raise ValueError("Confirm the current baseline before continuing")
+            if record.pending_decision is not None and record.pending_decision.kind not in (
+                "resume",
+                "retry",
+            ):
+                raise ValueError(
+                    "Address the current follow-up before continuing the previous task"
+                )
+            if action == "resume":
+                return partial(self.executor.resume, conversation_id)
+            if action == "retry":
+                if has_unresolved_call(task):
+                    raise ValueError("Reconcile unknown calls before retrying")
+                if not any(node.status == "failed" for node in task.nodes):
+                    raise ValueError("Only a known failed invocation may be retried")
+                return partial(
+                    self.executor.retry,
+                    conversation_id,
+                    task.baseline.version,
+                    trusted=True,
+                )
+            raise ValueError("Submit new requirements for a new confirmed plan")
 
     def decide(
         self,
@@ -244,7 +256,18 @@ class EngineeringRuntime:
         version: int | None = None,
         trusted: bool = False,
     ) -> Conversation:
-        operation = self.prepare_decision(conversation_id, action, version=version, trusted=trusted)
+        with self.locks.hold(conversation_id):
+            record = self.store.get(conversation_id)
+            if record.status in ("queued", "planning", "running"):
+                raise ConversationActive("This conversation already has an admitted turn")
+            operation = self.prepare_decision(
+                conversation_id,
+                action,
+                version=version,
+                trusted=trusted,
+            )
+        # A queued execution may wait for a lane, so do not retain the
+        # conversation lock while invoking the executor.
         return operation() if operation is not None else self.store.get(conversation_id)
 
     def capability_catalog(self) -> list[dict[str, object]]:

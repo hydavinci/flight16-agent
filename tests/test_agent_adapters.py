@@ -226,7 +226,10 @@ def test_simulink_budget_exhaustion_before_worker_checkpoint_is_known_failure(
 
     coordinator = EngineeringRuntime(store, None, runtime, runtime.resources)
     queued = coordinator.queue_message(saved.id, "Prepare a new plan with a revised budget")
-    assert queued.status == "planning"
+    assert queued.status == "queued"
+    queued.status = "planning"
+    queued.queued_action = None
+    store.save(queued)
     next_proposal = runtime.propose(queued, simulink_plan(resource))
     assert next_proposal.status == "waiting_for_user"
 

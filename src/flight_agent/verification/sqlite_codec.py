@@ -90,7 +90,12 @@ def encode(
             "id": record.id,
             "created_at": record.created_at,
             "updated_at": record.updated_at,
-            "status": record.status,
+            "status": (
+                "planning" if record.queued_action == "message" else "running"
+            )
+            if record.status == "queued"
+            else record.status,
+            "scheduling_status": "queued" if record.status == "queued" else None,
             "project_root": record.project_root,
             "resource_location": record.resource_location,
             "output_root": record.output_root,
@@ -100,7 +105,13 @@ def encode(
             "state_json": canonical(
                 {
                     key: data[key]
-                    for key in ("schema_version", "output_root_reset", "turn_origin")
+                    for key in (
+                        "schema_version",
+                        "output_root_reset",
+                        "turn_origin",
+                        "queued_action",
+                        "queue_origin",
+                    )
                 }
             ),
         }
@@ -339,6 +350,12 @@ def decode(connection: sqlite3.Connection, conversation_id: str) -> Conversation
             )
         }
     )
+    scheduling_status = (
+        header["scheduling_status"]
+        if "scheduling_status" in header.keys()
+        else None
+    )
+    data["status"] = scheduling_status or header["status"]
     data["pending_decision"] = json.loads(header["pending_decision_json"])
     data["messages"] = [
         {

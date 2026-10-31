@@ -233,7 +233,7 @@ class InspectProjectRequest(Contract):
 
 
 NodeIdentifier = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
-NodeStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
+NodeStatus = Literal["pending", "queued", "running", "completed", "failed", "interrupted"]
 
 
 class PendingDecision(Contract):
@@ -298,8 +298,15 @@ Task = AgentTask
 
 
 ConversationStatus = Literal[
-    "planning", "waiting_for_user", "running", "completed", "failed", "interrupted"
+    "queued",
+    "planning",
+    "waiting_for_user",
+    "running",
+    "completed",
+    "failed",
+    "interrupted",
 ]
+ScheduledAction = Literal["message", "confirm", "resume", "retry"]
 
 
 class ConversationState(Contract):
@@ -324,6 +331,8 @@ class Conversation(MutableRecord):
     messages: list[ConversationMessage] = []
     error: str | None = None
     turn_origin: ConversationState | None = None
+    queued_action: ScheduledAction | None = None
+    queue_origin: ConversationState | None = None
 
     def restore_turn_origin(self) -> bool:
         if self.turn_origin is None:

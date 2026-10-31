@@ -41,7 +41,7 @@ def intake_runtime(tmp_path):
 
 def submit(runtime, *args, **kwargs):
     record = runtime.queue_message(*args, **kwargs)
-    return runtime.continue_submission(record.id) if record.status == "planning" else record
+    return runtime.continue_submission(record.id) if record.status == "queued" else record
 
 
 @pytest.mark.parametrize(

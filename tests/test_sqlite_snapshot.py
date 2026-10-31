@@ -86,7 +86,7 @@ def test_startup_refuses_unstable_preflight_without_opening_live_database(tmp_pa
     with pytest.raises(DatabaseStartupError, match="source changed"):
         migrate_database(database)
 
-    assert validations == [1]
+    assert validations == [sqlite_schema.MIGRATIONS[-1].version]
     assert database.read_bytes() == before
 
 

@@ -14,7 +14,10 @@ def test_schema_is_versioned_idempotent_and_wal(tmp_path):
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
         assert connection.execute("PRAGMA synchronous").fetchone()[0] == 2
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == schema.MIGRATIONS[-1].version
+        )
         names = {
             row[0]
             for row in connection.execute(
@@ -46,15 +49,17 @@ def test_future_schema_is_refused_without_rewriting_it(tmp_path):
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 999
         assert (
-            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == len(schema.MIGRATIONS)
         )
 
 
 def test_failed_upgrade_rolls_back_ddl_and_version(tmp_path, monkeypatch):
     path = tmp_path / "conversations.sqlite3"
     schema.migrate_database(path)
+    before = schema.MIGRATIONS[-1].version
     broken = schema.Migration(
-        2,
+        before + 1,
         "failure-probe",
         (
             "CREATE TABLE migration_probe (value TEXT)",
@@ -65,7 +70,7 @@ def test_failed_upgrade_rolls_back_ddl_and_version(tmp_path, monkeypatch):
     with pytest.raises(schema.DatabaseStartupError, match="migration"):
         schema.migrate_database(path)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == before
         assert (
             connection.execute(
                 "SELECT name FROM sqlite_master WHERE name='migration_probe'"
@@ -73,7 +78,8 @@ def test_failed_upgrade_rolls_back_ddl_and_version(tmp_path, monkeypatch):
             is None
         )
         assert (
-            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == before
         )
 
 
@@ -92,14 +98,20 @@ def test_next_migration_preserves_existing_data(tmp_path, monkeypatch):
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE retained_probe (value TEXT)")
         connection.execute("INSERT INTO retained_probe VALUES ('keep')")
-    upgrade = schema.Migration(2, "upgrade-probe", ("CREATE TABLE upgraded_probe (value TEXT)",))
+    before = schema.MIGRATIONS[-1].version
+    upgrade = schema.Migration(
+        before + 1,
+        "upgrade-probe",
+        ("CREATE TABLE upgraded_probe (value TEXT)",),
+    )
     monkeypatch.setattr(schema, "MIGRATIONS", (*schema.MIGRATIONS, upgrade))
     schema.migrate_database(path)
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT value FROM retained_probe").fetchone()[0] == "keep"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == before + 1
         assert (
-            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 2
+            connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
+            == before + 1
         )
 
 

@@ -185,8 +185,11 @@ def test_budget_exhaustion_after_acceptance_keeps_committed_receipt_and_progress
 
     coordinator = EngineeringRuntime(store, None, executor, executor.resources)
     queued = coordinator.queue_message(record.id, "Prepare a new plan with a revised budget")
-    assert queued.status == "planning"
+    assert queued.status == "queued"
     assert queued.task.calls[0].status == "completed"
+    queued.status = "planning"
+    queued.queued_action = None
+    store.save(queued)
     replacement = propose(executor, queued, data)
     assert replacement.status == "waiting_for_user"
     assert replacement.archived_tasks[-1].calls[0].id == call.id

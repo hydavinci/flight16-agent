@@ -27,7 +27,7 @@ class Migration:
         return hashlib.sha256("\n".join(self.statements).encode("utf-8")).hexdigest()
 
 
-MIGRATIONS = (
+MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         1,
         "conversation-ledger",
@@ -124,6 +124,20 @@ MIGRATIONS = (
             "CREATE INDEX conversations_recent ON conversations(updated_at DESC, id)",
             "CREATE INDEX calls_status ON calls(status, task_id)",
             "CREATE INDEX task_events_task ON task_events(task_id, sequence)",
+        ),
+    ),
+)
+
+MIGRATIONS = (
+    *MIGRATIONS,
+    Migration(
+        2,
+        "scheduler-queued-state",
+        (
+            """ALTER TABLE conversations ADD COLUMN scheduling_status TEXT
+       CHECK (scheduling_status IS NULL OR scheduling_status='queued')""",
+            """CREATE INDEX conversations_scheduling_status
+       ON conversations(scheduling_status, status, updated_at, id)""",
         ),
     ),
 )
