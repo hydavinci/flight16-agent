@@ -88,6 +88,10 @@ class BoundedRunner:
             self._closing = True
             self._condition.notify_all()
 
+    def is_worker_thread(self) -> bool:
+        with self._condition:
+            return current_thread() in self._worker_threads
+
     def close(self) -> None:
         self.stop_accepting()
         with self._condition:

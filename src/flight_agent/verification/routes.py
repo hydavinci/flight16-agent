@@ -2,7 +2,7 @@ import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from threading import Lock
+from threading import Condition
 from typing import Literal, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -92,18 +92,39 @@ class ConversationManager:
         self.runtime = runtime
         self.planning = planning
         self.execution = execution
-        self._close_lock = Lock()
+        self._close_condition = Condition()
+        self._admission_stopped = False
+        self._draining = False
         self._closed = False
 
     def close(self) -> None:
-        with self._close_lock:
+        with self._close_condition:
             if self._closed:
                 return
-            self.planning.stop_accepting()
-            self.execution.stop_accepting()
+            if not self._admission_stopped:
+                self.planning.stop_accepting()
+                self.execution.stop_accepting()
+                self._admission_stopped = True
+        if self.planning.is_worker_thread() or self.execution.is_worker_thread():
+            return
+        with self._close_condition:
+            while self._draining and not self._closed:
+                self._close_condition.wait()
+            if self._closed:
+                return
+            self._draining = True
+        try:
             self.planning.close()
             self.execution.close()
+        except BaseException:
+            with self._close_condition:
+                self._draining = False
+                self._close_condition.notify_all()
+            raise
+        with self._close_condition:
             self._closed = True
+            self._draining = False
+            self._close_condition.notify_all()
 
     def _fail(self, conversation_id: str, error: Exception) -> None:
         logger.exception("Conversation %s failed", conversation_id)

@@ -1,11 +1,17 @@
-from threading import Event
+from multiprocessing import get_context
+from threading import Barrier, Event, Lock, Thread
 from typing import cast
 
+import pytest
 from fastapi.testclient import TestClient
 
 from flight_agent.config import SchedulerSettings
 from flight_agent.runtime.observations import CapabilityOutcome
-from flight_agent.runtime.scheduling import ExecutionTurnScheduler, PlanningScheduler
+from flight_agent.runtime.scheduling import (
+    ExecutionTurnScheduler,
+    PlanningScheduler,
+    SchedulerClosed,
+)
 from flight_agent.verification.agent_planner import AgentDecision, AgentPlanner
 from flight_agent.verification.coordinator import EngineeringRuntime
 from flight_agent.verification.routes import ConversationManager
@@ -14,6 +20,69 @@ from tests.agent_helpers import wait_for_conversation
 from tests.scheduling_helpers import make_runtime
 
 API = "/api/conversations"
+
+
+def _assert_runner_drained(runner):
+    with pytest.raises(SchedulerClosed):
+        with runner.reserve():
+            pytest.fail("closed scheduler admitted work")
+    assert runner._closed
+    assert all(not thread.is_alive() for thread in runner._pool._threads)
+
+
+def _planning_worker_close_with_external(completed):
+    planning = PlanningScheduler(1, 0)
+    execution = ExecutionTurnScheduler(1)
+    manager = ConversationManager(
+        cast(EngineeringRuntime, object()), planning, execution
+    )
+    entered, invoke_close, worker_returned = Event(), Event(), Event()
+    external_done = Event()
+
+    def operation():
+        entered.set()
+        assert invoke_close.wait(5)
+        manager.close()
+        worker_returned.set()
+
+    def close_external():
+        manager.close()
+        external_done.set()
+
+    with planning.reserve() as reservation:
+        future = reservation.submit(operation)
+    assert entered.wait(5)
+    closer = Thread(target=close_external, daemon=True)
+    closer.start()
+    with planning._condition:
+        assert planning._condition.wait_for(
+            lambda: planning._shutdown_started, timeout=5
+        )
+    invoke_close.set()
+    assert worker_returned.wait(5)
+    future.result(timeout=5)
+    assert external_done.wait(5)
+    closer.join(5)
+    assert not closer.is_alive()
+    _assert_runner_drained(planning)
+    _assert_runner_drained(execution)
+    completed.set()
+
+
+def _assert_process_completes(target, message):
+    context = get_context("spawn")
+    completed = context.Event()
+    process = context.Process(target=target, args=(completed,))
+    process.start()
+    try:
+        assert completed.wait(5), message
+        process.join(5)
+        assert not process.is_alive(), "scheduler child process did not exit"
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
 
 
 def build(tmp_path, entered, release):
@@ -37,23 +106,38 @@ def build(tmp_path, entered, release):
     ), runtime
 
 
-def test_manager_close_stops_both_admissions_before_draining_exactly_once():
+def test_planning_worker_close_yields_to_external_drain_without_deadlock():
+    _assert_process_completes(
+        _planning_worker_close_with_external,
+        "planning worker close deadlocked with the external drain owner",
+    )
+
+
+def test_manager_close_orders_lifecycle_and_is_terminally_idempotent():
     events = []
 
-    class Scheduler:
-        def __init__(self, name):
-            self.name = name
-
+    class OrderedPlanningScheduler(PlanningScheduler):
         def stop_accepting(self):
-            events.append(f"{self.name}:stop")
+            events.append("planning:stop")
+            super().stop_accepting()
 
         def close(self):
-            events.append(f"{self.name}:close")
+            events.append("planning:close")
+            super().close()
 
+    class OrderedExecutionScheduler(ExecutionTurnScheduler):
+        def stop_accepting(self):
+            events.append("execution:stop")
+            super().stop_accepting()
+
+        def close(self):
+            events.append("execution:close")
+            super().close()
+
+    planning = OrderedPlanningScheduler(1, 0)
+    execution = OrderedExecutionScheduler(1)
     manager = ConversationManager(
-        cast(EngineeringRuntime, object()),
-        cast(PlanningScheduler, Scheduler("planning")),
-        cast(ExecutionTurnScheduler, Scheduler("execution")),
+        cast(EngineeringRuntime, object()), planning, execution
     )
     manager.close()
     manager.close()
@@ -61,8 +145,126 @@ def test_manager_close_stops_both_admissions_before_draining_exactly_once():
         "planning:stop",
         "execution:stop",
         "planning:close",
+        "planning:stop",
         "execution:close",
+        "execution:stop",
     ]
+    _assert_runner_drained(planning)
+    _assert_runner_drained(execution)
+
+
+def test_execution_completion_callback_close_requires_external_drain():
+    planning = PlanningScheduler(1, 0)
+    execution = ExecutionTurnScheduler(1)
+    manager = ConversationManager(
+        cast(EngineeringRuntime, object()), planning, execution
+    )
+    entered, release, callback_returned = Event(), Event(), Event()
+
+    def operation():
+        entered.set()
+        assert release.wait(5)
+
+    def close_from_callback(_future):
+        manager.close()
+        callback_returned.set()
+
+    try:
+        with execution.reserve() as reservation:
+            future = reservation.submit(operation)
+        assert entered.wait(5)
+        future.add_done_callback(close_from_callback)
+        release.set()
+        future.result(timeout=5)
+        assert callback_returned.wait(5)
+        with pytest.raises(SchedulerClosed):
+            with planning.reserve():
+                pytest.fail("planning admitted work after callback close")
+        with pytest.raises(SchedulerClosed):
+            with execution.reserve():
+                pytest.fail("execution admitted work after callback close")
+        manager.close()
+        _assert_runner_drained(planning)
+        _assert_runner_drained(execution)
+    finally:
+        release.set()
+        planning.close()
+        execution.close()
+
+
+def test_concurrent_external_close_has_one_drain_owner_and_waiters():
+    counter_lock = Lock()
+
+    class CountingPlanningScheduler(PlanningScheduler):
+        def __init__(self):
+            super().__init__(1, 0)
+            self.close_calls = 0
+            self.close_started = Event()
+
+        def close(self):
+            with counter_lock:
+                self.close_calls += 1
+            self.close_started.set()
+            super().close()
+
+    class CountingExecutionScheduler(ExecutionTurnScheduler):
+        def __init__(self):
+            super().__init__(1)
+            self.close_calls = 0
+
+        def close(self):
+            with counter_lock:
+                self.close_calls += 1
+            super().close()
+
+    planning = CountingPlanningScheduler()
+    execution = CountingExecutionScheduler()
+    manager = ConversationManager(
+        cast(EngineeringRuntime, object()), planning, execution
+    )
+    entered, release = Event(), Event()
+    barrier = Barrier(3)
+    done = (Event(), Event())
+
+    def operation():
+        entered.set()
+        assert release.wait(5)
+
+    def close_external(finished):
+        barrier.wait()
+        manager.close()
+        finished.set()
+
+    try:
+        with planning.reserve() as reservation:
+            future = reservation.submit(operation)
+        assert entered.wait(5)
+        threads = [
+            Thread(target=close_external, args=(finished,), daemon=True)
+            for finished in done
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        assert planning.close_started.wait(5)
+        release.set()
+        future.result(timeout=5)
+        for finished in done:
+            assert finished.wait(5)
+        for thread in threads:
+            thread.join(5)
+            assert not thread.is_alive()
+        assert planning.close_calls == 1
+        assert execution.close_calls == 1
+        _assert_runner_drained(planning)
+        _assert_runner_drained(execution)
+        manager.close()
+        assert planning.close_calls == 1
+        assert execution.close_calls == 1
+    finally:
+        release.set()
+        planning.close()
+        execution.close()
 
 
 def test_saturation_is_queued_then_typed_capacity_without_phantom_messages(tmp_path):
