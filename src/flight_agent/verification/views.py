@@ -21,6 +21,7 @@ from .contracts import (
     ConversationMessage,
     ConversationStatus,
     PendingDecision,
+    ScheduledAction,
     ToolCall,
 )
 
@@ -119,6 +120,7 @@ class TaskView(Contract):
 class ConversationView(Contract):
     id: str
     status: ConversationStatus
+    queued_action: ScheduledAction | None = None
     project_root: str | None
     resource_location: str | None
     output_root: str | None
@@ -179,6 +181,7 @@ def to_conversation_view(record: Conversation) -> ConversationView:
     return ConversationView(
         id=record.id,
         status=record.status,
+        queued_action=record.queued_action,
         project_root=record.project_root,
         resource_location=record.resource_location,
         output_root=record.output_root,

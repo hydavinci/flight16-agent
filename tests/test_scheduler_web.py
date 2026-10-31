@@ -298,6 +298,23 @@ def test_saturation_is_queued_then_typed_capacity_without_phantom_messages(tmp_p
         )
 
 
+def test_queued_view_exposes_action_without_claiming_execution(tmp_path):
+    entered, release = Event(), Event()
+    app, runtime = build(tmp_path, entered, release)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = {"x-flight-token": client.get("/api/bootstrap").json()["token"]}
+        try:
+            client.post(API, headers=headers, json={"message": "Blocker"})
+            assert entered.wait(5)
+            queued = client.post(API, headers=headers, json={"message": "Queued"}).json()
+            view = client.get(f"{API}/{queued['id']}/view", headers=headers).json()
+            assert view["status"] == "queued"
+            assert view["queued_action"] == "message"
+            assert view["task"] is None
+        finally:
+            release.set()
+
+
 def test_same_queued_conversation_conflict_does_not_append_another_turn(tmp_path):
     entered, release = Event(), Event()
     app, runtime = build(tmp_path, entered, release)

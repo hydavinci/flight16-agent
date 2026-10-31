@@ -192,3 +192,31 @@ def test_directory_task_leaves_location_selection_to_registered_server_resources
     assert record["resource_location"] == ("registered-0" if location_count == 1 else None)
     assert record["status"] == ("completed" if location_count == 1 else "waiting_for_user")
     assert not calls
+
+
+def test_directory_task_waits_for_queued_work_without_resubmitting(monkeypatch, capsys):
+    import httpx
+
+    module = cli_module()
+    identifier = "c" * 32
+    real_client = httpx.Client
+    requests = []
+    statuses = iter(["queued", "planning", "completed"])
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/api/bootstrap":
+            return httpx.Response(200, json={"token": "test-token"})
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": identifier, "status": "queued"})
+        return httpx.Response(200, json={"id": identifier, "status": next(statuses)})
+
+    monkeypatch.setattr(
+        module.httpx, "Client",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    assert module.main(["directory-task", "propose", "--request", "Explain the result."]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "completed"
+    assert sum(method == "POST" for method, path in requests) == 1
+    assert requests[2:] == [("GET", f"/api/conversations/{identifier}")] * 3

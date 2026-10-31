@@ -3,11 +3,12 @@
 const $ = (id) => document.getElementById(id);
 const API = "/api/conversations";
 const statuses = {
+  queued: "排队中",
   planning: "正在规划", waiting_for_user: "等待确认或补充", running: "执行中",
   completed: "已完成", failed: "失败", interrupted: "已中断",
 };
 const nodeStatuses = {
-  pending: "待执行", running: "运行中", completed: "已完成", failed: "失败", interrupted: "已中断",
+  pending: "待执行", queued: "排队中", running: "运行中", completed: "已完成", failed: "失败", interrupted: "已中断",
 };
 let token = "";
 let current = null;
@@ -85,7 +86,7 @@ async function conversation(path, id, options) {
 }
 
 function active() {
-  return pendingView !== null || (current && ["planning", "running"].includes(current.status));
+  return pendingView !== null || (current && ["queued", "planning", "running"].includes(current.status));
 }
 
 function resourceLocation() {
@@ -103,7 +104,11 @@ function renderProgress(record = null) {
   let step = 0;
   let next = "直接描述需求；知识问答不需要目录，工程任务执行前需确认方案。";
   const decision = record?.pending_decision?.kind;
-  if (record?.status === "planning") {
+  if (record?.status === "queued") {
+    next = record.queued_action === "message"
+      ? "请求已排队，尚未开始规划；不会据此获得执行授权。"
+      : "工作已排队，尚未开始下一项操作；现有确认与证据保持不变。";
+  } else if (record?.status === "planning") {
     next = record.task ? "正在处理追问或变更；现有证据保留，新增方案仍需确认。"
       : "正在整理需求、来源和能力范围，尚未获得执行授权。";
   } else if (["clarify", "capability_gap"].includes(decision)) {

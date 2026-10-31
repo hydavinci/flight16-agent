@@ -21,6 +21,51 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_queued_state_keeps_polling_and_disables_confirmation(tmp_path):
+    from threading import Event
+
+    app, runtime, calls, tools = make_agent_web(tmp_path, [])
+    record = runtime.store.create()
+    identifier = record.id
+    queued = {
+        "id": identifier, "status": "queued", "queued_action": "message",
+        "project_root": None, "resource_location": None, "output_root": None,
+        "task": None, "archived_tasks": [], "messages": [],
+        "pending_decision": None, "error": None,
+    }
+    completed = {**queued, "status": "completed", "queued_action": None}
+    views = []
+    show_completed = Event()
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.set_default_timeout(10000)
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.add_init_script(
+            f"localStorage.setItem('verification-conversation', '{identifier}')"
+        )
+
+        def reply(route):
+            views.append(route.request.url)
+            route.fulfill(json=completed if show_completed.is_set() else queued)
+
+        page.route(f"**/api/conversations/{identifier}/view", reply)
+        try:
+            page.goto(url)
+            expect(page.locator("#conversation-status")).to_have_text("排队中")
+            expect(page.locator("#send")).to_be_disabled()
+            expect(page.locator("#trusted")).to_be_disabled()
+            expect(page.locator("#next-action")).to_contain_text("尚未")
+            show_completed.set()
+            expect(page.locator("#conversation-status")).to_have_text("已完成")
+            assert len(views) >= 2
+            assert not calls
+            assert not errors
+        finally:
+            browser.close()
+
+
 def test_budget_guidance_is_visible_bounded_and_escaped(tmp_path):
     from flight_agent.runtime.agent_contracts import AgentPlan
     from flight_agent.verification.contracts import PendingDecision

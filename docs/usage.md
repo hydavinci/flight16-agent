@@ -409,3 +409,39 @@ SQLite 启动按离线、单所有者契约设计：同一运行目录的维护�
 
 自带算例和离线数据是软件演示。仓库不包含真实 F-16 模型或审核过的航空标准；
 合成回归、报告生成和数值判据均不能代替具体工程的独立验收。
+
+## Scheduler isolation
+
+Independent conversations can plan concurrently. The default planning limit is
+four active jobs plus 32 queued jobs. A conversation admits one operation at a
+time; sending another request does not create a second active turn or authorize
+a new baseline. A conflict response does not append another user message.
+
+Local MATLAB defaults to **one** slot. `FLIGHT_LOCAL_MATLAB_SLOTS` accepts 1–8.
+`FLIGHT_REMOTE_WORKER_SLOTS` defaults to 1 and accepts 1–16.
+`FLIGHT_READ_ONLY_SLOTS` defaults to 4 and accepts 1–32. Delivery still requires
+its confirmed write permission even though it uses the general/read-only lane.
+The server selects lanes from registered effects and scheduling metadata;
+requests and model plans cannot select a lane.
+
+`FLIGHT_PLANNING_WORKERS` accepts 1–32; `FLIGHT_PLANNING_QUEUE` accepts 0–256.
+`FLIGHT_EXECUTION_TURNS` defaults to 32, accepts 1–64, and must cover the sum of
+the three execution-lane limits. It bounds coordination threads, including
+threads waiting for a lane. These are per-process limits, not distributed
+quotas. Run one Web process per writable state root. A remote limit does not
+override the remote Worker's independent capacity.
+
+Queued requests return HTTP 202 and remain visible as `queued`; the CLI and
+workbench continue polling. Full admission capacity returns HTTP 429 with
+`detail.code=scheduler_capacity` and `Retry-After: 1`, without creating a
+conversation or appending a message. Shutdown refuses new work with HTTP 503
+and drains admitted work so all thread-owned SQLite contexts have exited. No cancellation
+or automatic inference retry is introduced.
+
+After an abrupt restart, queued work is not replayed. A queued confirmation
+returns to its original confirmation state. Interrupted follow-up planning
+restores the original task state. A confirmed task waiting for a lane can be
+explicitly resumed; no dispatched call existed until the permit was acquired.
+An already dispatched unknown call retains its identity and budget charge and
+cannot be retried until the original operation is reconciled. Existing evidence
+and source project directories are not removed by scheduler recovery.

@@ -110,7 +110,9 @@ def directory_task(args: argparse.Namespace) -> int:
         ):
             raise ValueError("Server returned a mismatched conversation identity")
         deadline = time.monotonic() + args.timeout
-        while args.action != "status" and record.get("status") in ("planning", "running"):
+        while args.action != "status" and record.get("status") in (
+            "queued", "planning", "running"
+        ):
             if time.monotonic() >= deadline:
                 raise ValueError(
                     f"Task {actual_id} continues on the local server; use directory-task status"
@@ -118,7 +120,7 @@ def directory_task(args: argparse.Namespace) -> int:
             record = request("GET", f"{base}/{actual_id}")
             if record.get("id") != actual_id:
                 raise ValueError("Server returned a mismatched conversation identity")
-            if record.get("status") in ("planning", "running"):
+            if record.get("status") in ("queued", "planning", "running"):
                 time.sleep(0.2)
         print(json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False))
         return 1 if record.get("status") in ("failed", "interrupted") else 0
