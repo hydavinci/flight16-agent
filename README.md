@@ -189,6 +189,11 @@ runs/verification/<conversation_id>/tasks/<task_id>/
 指定输出根目录后，成果位于其下的 `flight-agent-<task_id>/`。
 会话记录仍保存在默认位置，旧任务和交付不会被新需求覆盖。
 
+v2 会话元数据和执行状态保存在
+`runs/verification/conversations.sqlite3`，证据文件仍保存在任务成果目录。
+首次升级前须停止旧服务；备份、硬切换、续接与回滚边界见
+[SQLite 会话存储](docs/sqlite-conversation-store.md)。
+
 字段约束、请求示例、报告内容和文件清单见[输入与输出参考](docs/inputs-outputs.md)。
 
 ## 详细文档
