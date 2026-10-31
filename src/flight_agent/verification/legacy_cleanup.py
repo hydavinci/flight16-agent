@@ -1,5 +1,6 @@
 import json
 import shutil
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -7,6 +8,8 @@ from typing import Any, Literal
 from ..models import JOB_ID
 from ..runtime.resources import ResourceReference
 from .intake import safe_directory
+from .sqlite_codec import decode
+from .sqlite_schema import MIGRATIONS
 
 RecordKind = Literal["v1", "v2", "unknown"]
 
@@ -105,6 +108,97 @@ def _record_paths(data: Any, *, legacy_directory: Path | None) -> list[Path]:
     return paths
 
 
+def _sqlite_paths(root: Path) -> set[Path]:
+    database = root / "conversations.sqlite3"
+    for path in (
+        database,
+        *(root / f"conversations.sqlite3-{suffix}" for suffix in ("wal", "shm", "journal")),
+    ):
+        if path.is_symlink():
+            raise ValueError("SQLite ownership contains a symlink")
+    if not database.exists():
+        if any(
+            (root / f"conversations.sqlite3-{suffix}").exists()
+            for suffix in ("wal", "shm", "journal")
+        ):
+            raise ValueError("SQLite ownership database is missing")
+        return set()
+    if not database.is_file():
+        raise ValueError("SQLite ownership database is not a file")
+    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        if [row[0] for row in connection.execute("PRAGMA integrity_check")] != ["ok"]:
+            raise ValueError("SQLite ownership integrity check failed")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise ValueError("SQLite ownership has invalid references")
+        if connection.execute("PRAGMA user_version").fetchone()[0] != MIGRATIONS[-1].version:
+            raise ValueError("SQLite ownership schema is unsupported")
+        ledger = connection.execute(
+            "SELECT version, name, sha256 FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        if [tuple(row) for row in ledger] != [
+            (migration.version, migration.name, migration.sha256) for migration in MIGRATIONS
+        ]:
+            raise ValueError("SQLite ownership migration ledger is invalid")
+        protected: set[Path] = set()
+        for row in connection.execute("SELECT id FROM conversations ORDER BY id"):
+            record = decode(connection, row["id"])
+            directory = root / record.id
+            safe_directory(directory)
+            if not directory.is_dir():
+                raise ValueError("SQLite conversation directory is missing")
+            protected.add(directory.resolve())
+            if record.project_root is not None:
+                project = Path(record.project_root)
+                if not project.is_absolute():
+                    raise ValueError("SQLite project ownership is unresolved")
+                protected.add(project.resolve(strict=True))
+            if record.output_root is not None:
+                path = Path(record.output_root)
+                safe_directory(path)
+                protected.add(path.resolve())
+            for task in [*record.archived_tasks, *([record.task] if record.task else [])]:
+                for resource in task.baseline.resources:
+                    path = Path(resource.locator)
+                    if not path.is_absolute():
+                        raise ValueError("SQLite resource ownership is unresolved")
+                    protected.add(path.resolve(strict=True))
+                expected = (
+                    Path(task.output_root) / f"flight-agent-{task.id}"
+                    if task.output_root
+                    else root / record.id / "tasks" / task.id
+                )
+                safe_directory(expected)
+                if str(expected) != task.result_directory:
+                    raise ValueError("SQLite task directory identity mismatch")
+                has_artifacts = connection.execute(
+                    "SELECT 1 FROM artifacts WHERE task_id=? LIMIT 1", (task.id,)
+                ).fetchone()
+                if (
+                    task.baseline.confirmed
+                    or task.calls
+                    or task.artifacts
+                    or task.analysis_runs
+                    or task.checkpoints
+                    or task.checkpoint_sha256
+                    or task.outputs
+                    or task.result is not None
+                    or has_artifacts is not None
+                ) and not expected.is_dir():
+                    raise ValueError("SQLite task directory is missing")
+                protected.add(expected.resolve())
+                if task.output_root is not None:
+                    output = Path(task.output_root)
+                    safe_directory(output)
+                    protected.add(output.resolve())
+        return protected
+    finally:
+        connection.close()
+
+
 def cleanup_legacy_records(root: Path, *, apply: bool) -> CleanupReport:
     safe_directory(root.absolute())
     root = root.resolve(strict=True)
@@ -112,6 +206,11 @@ def cleanup_legacy_records(root: Path, *, apply: bool) -> CleanupReport:
     candidates: list[Path] = []
     protected: set[Path] = set()
     unresolved = False
+    try:
+        protected.update(_sqlite_paths(root))
+    except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError):
+        report.unknown.append("conversations.sqlite3")
+        unresolved = True
     for candidate in sorted(root.iterdir()):
         if not JOB_ID.fullmatch(candidate.name):
             continue
@@ -151,7 +250,10 @@ def cleanup_legacy_records(root: Path, *, apply: bool) -> CleanupReport:
             unresolved = True
     if apply and not unresolved:
         for candidate in candidates:
-            if any(path.is_relative_to(candidate) for path in protected):
+            if any(
+                path.is_relative_to(candidate) or candidate.is_relative_to(path)
+                for path in protected
+            ):
                 continue
             if candidate.is_symlink() or not candidate.resolve(strict=True).is_relative_to(root):
                 report.unknown.append(candidate.name)

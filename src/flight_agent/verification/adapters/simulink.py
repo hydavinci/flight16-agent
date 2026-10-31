@@ -14,7 +14,12 @@ from ...runtime.capability_metadata import (
 )
 from ...runtime.observations import CapabilityOutcome, Finding, Observation, OutputArtifact
 from ...runtime.resources import AgentContract, ResourceReference
-from ..agent_runtime import AgentContext, ExecutionUncertain, ReconciledFailure
+from ..agent_runtime import (
+    AgentContext,
+    ExecutionUncertain,
+    PreDispatchBudgetExhausted,
+    ReconciledFailure,
+)
 from ..artifacts import artifact_path, describe_artifact, verify_artifact
 from ..backend import AnalysisBackend
 from ..contracts import AnalysisKind, AnalysisResult, AnalysisRunRequest, RunRecord
@@ -51,10 +56,13 @@ def _request(
     else:
         if saved is not None:
             raise ExecutionUncertain("Original Worker request must be reconciled, not dispatched")
-        context.budget.check_limits()
-        timeout = min(300, floor(context.budget.remaining_seconds()))
-        if timeout < 1:
-            raise BudgetExhausted("Less than one second remains for Worker execution")
+        try:
+            context.budget.check_limits()
+            timeout = min(300, floor(context.budget.remaining_seconds()))
+            if timeout < 1:
+                raise BudgetExhausted("Less than one second remains for Worker execution")
+        except BudgetExhausted as exc:
+            raise PreDispatchBudgetExhausted(str(exc)) from exc
         request = AnalysisRunRequest(
             id=context.call_id,
             project_root=resource.locator,

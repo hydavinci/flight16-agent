@@ -135,10 +135,22 @@ def connect_database(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _check_integrity(connection: sqlite3.Connection) -> None:
+    try:
+        results = [row[0] for row in connection.execute("PRAGMA integrity_check")]
+        if results != ["ok"]:
+            raise DatabaseStartupError(f"SQLite integrity check failed: {'; '.join(results)}")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise DatabaseStartupError("SQLite integrity check failed: invalid foreign key")
+    except sqlite3.Error as exc:
+        raise DatabaseStartupError(f"SQLite integrity check failed: {exc}") from exc
+
+
 def migrate_database(path: Path) -> None:
     connection: sqlite3.Connection | None = None
     try:
         connection = connect_database(path)
+        _check_integrity(connection)
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         supported = MIGRATIONS[-1].version
         if version > supported:
@@ -194,6 +206,7 @@ def migrate_database(path: Path) -> None:
                 ),
             )
             connection.execute(f"PRAGMA user_version={migration.version}")
+        _check_integrity(connection)
         connection.commit()
     except (sqlite3.Error, OSError) as exc:
         if connection is not None:

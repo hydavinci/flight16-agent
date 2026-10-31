@@ -523,12 +523,110 @@ def test_export_validates_artifact_free_current_and_archived_task_directories(
     record.task = agent_task(current_directory)
     archived = agent_task(archived_directory)
     archived.id = "b" * 32
+    for task in (record.task, archived):
+        task.baseline = task.baseline.model_copy(update={"confirmed": True, "confirmed_at": now()})
     record.archived_tasks = [archived]
     store.save(record)
     target = current_directory if missing_task == "current" else archived_directory
     target.rmdir()
 
     with pytest.raises(ValueError, match="directory is missing"):
+        store.export(record.id)
+
+
+@pytest.mark.parametrize("absent", ["current", "archived", "both"])
+def test_export_accepts_missing_unconfirmed_proposal_directories(tmp_path, absent):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    current = store.default_task_root(record.id) / ("a" * 32)
+    archived = store.default_task_root(record.id) / ("b" * 32)
+    record.task = agent_task(current)
+    previous = agent_task(archived).model_copy(update={"id": "b" * 32})
+    record.archived_tasks = [previous]
+    if absent == "current":
+        archived.mkdir(parents=True)
+    elif absent == "archived":
+        current.mkdir(parents=True)
+    store.save(record)
+
+    payload = json.loads(store.export(record.id))
+
+    assert payload["conversation"] == store.get(record.id).model_dump(mode="json")
+    assert payload["artifact_index"] == []
+    assert current.exists() == (absent == "archived")
+    assert archived.exists() == (absent == "current")
+
+
+def test_export_rejects_missing_unconfirmed_directory_with_published_evidence(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    evidence = directory / "metric.json"
+    evidence.write_text('{"rmse":1}')
+    record.task.artifacts.append(
+        OutputArtifact(**describe_evidence(directory, evidence.name).model_dump())
+    )
+    store.save(record)
+    evidence.unlink()
+    directory.rmdir()
+
+    with pytest.raises(ValueError, match="directory is missing|evidence"):
+        store.export(record.id)
+
+
+@pytest.mark.parametrize("slot", ["result", "output"])
+@pytest.mark.parametrize("missing", [False, True])
+def test_export_checks_unindexed_result_and_output_descriptors(tmp_path, slot, missing):
+    from flight_agent.runtime.observations import CapabilityOutcome, TaskResult
+
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    evidence = directory / "metric.json"
+    evidence.write_text('{"rmse":1}')
+    descriptor = OutputArtifact(**describe_evidence(directory, evidence.name).model_dump())
+    if slot == "result":
+        record.task.result = TaskResult(execution_status="partial", artifacts=[descriptor])
+    else:
+        record.task.outputs["compute"] = CapabilityOutcome(artifacts=[descriptor])
+    store.save(record)
+    if missing:
+        evidence.unlink()
+        directory.rmdir()
+    else:
+        evidence.write_text('{"rmse":2}')
+
+    with pytest.raises(ValueError, match="directory is missing|integrity"):
+        store.export(record.id)
+
+
+def test_export_rejects_mismatched_unconfirmed_proposal_directory(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    expected = store.default_task_root(record.id) / ("a" * 32)
+    record.task = agent_task(expected)
+    store.save(record)
+    with sqlite3.connect(store.database_path) as connection:
+        state = json.loads(connection.execute("SELECT state_json FROM tasks").fetchone()[0])
+        state["result_directory"] = str(tmp_path / "other")
+        connection.execute("UPDATE tasks SET state_json=?", (json.dumps(state),))
+
+    with pytest.raises(ValueError, match="directory|identity"):
+        store.export(record.id)
+
+
+def test_export_rejects_symlink_for_unconfirmed_proposal_directory(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.default_task_root(record.id) / ("a" * 32)
+    record.task = agent_task(directory)
+    store.save(record)
+    directory.parent.mkdir(parents=True)
+    directory.symlink_to(tmp_path, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
         store.export(record.id)
 
 

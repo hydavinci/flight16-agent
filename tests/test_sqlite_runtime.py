@@ -128,6 +128,135 @@ def test_handled_acceptance_failure_does_not_resave_rolled_back_progress(tmp_pat
     assert len(calls) == 1
 
 
+def test_budget_exhaustion_during_invocation_keeps_original_call_recoverable(tmp_path):
+    from flight_agent.runtime.budget import BudgetExhausted
+
+    invoked = []
+
+    def operation(context, inputs):
+        invoked.append(context.call_id)
+        raise BudgetExhausted("Budget exhausted during invocation")
+
+    executor, store, record, _ = setup(tmp_path, operation=operation)
+    interrupted = confirm(executor, propose(executor, record))
+    assert interrupted.status == "interrupted"
+    saved = store.get(record.id)
+    call = saved.task.calls[0]
+    assert call.status == "interrupted"
+    assert saved.task.nodes[0].status == "interrupted"
+    assert saved.task.stage == "interrupted"
+    assert saved.pending_decision.kind == "resume"
+    assert call.id in saved.task.pending_specs
+    with pytest.raises(ValueError, match="unknown|unresolved"):
+        executor.retry(record.id, 1, trusted=True)
+    recovery = type(executor)(
+        SQLiteConversationStore(store.root), executor.tools, executor.resources
+    )
+    resumed = recovery.resume(record.id)
+    assert resumed.status == "interrupted"
+    assert resumed.task.calls[0].id == call.id
+    assert invoked == [call.id]
+
+
+def test_budget_exhaustion_after_acceptance_keeps_committed_receipt_and_progress(tmp_path):
+    from tests.agent_helpers import analysis_plan_data
+
+    executor, store, record, _ = setup(
+        tmp_path, operation=lambda context, inputs: CapabilityOutcome()
+    )
+    data = analysis_plan_data()
+    data["budget"]["max_no_progress"] = 1
+    done = confirm(executor, propose(executor, record, data))
+    assert done.status == "failed"
+    saved = SQLiteConversationStore(store.root).get(record.id)
+    call = saved.task.calls[0]
+    assert call.status == "completed"
+    assert saved.task.nodes[0].status == "completed"
+    assert call.id not in saved.task.pending_specs
+    assert saved.task.analysis_runs[0].id == call.id
+    assert call.id in saved.task.progress_calls
+    assert saved.task.budget_state.no_progress == 1
+    assert saved.task.result.execution_status == "partial"
+
+
+def test_budget_subclass_after_acceptance_never_rewrites_terminal_call(tmp_path, monkeypatch):
+    from flight_agent.verification.agent_runtime import PreDispatchBudgetExhausted
+
+    executor, store, record, _ = setup(tmp_path)
+    progress = executor._progress
+
+    def exhaust_after_progress(task, run, budget):
+        progress(task, run, budget)
+        raise PreDispatchBudgetExhausted("Budget limit after terminal acceptance")
+
+    monkeypatch.setattr(executor, "_progress", exhaust_after_progress)
+    done = confirm(executor, propose(executor, record))
+    saved = store.get(record.id)
+    assert done.status == "failed"
+    assert saved.task.calls[0].status == "completed"
+    assert saved.task.nodes[0].status == "completed"
+    assert saved.task.calls[0].id not in saved.task.pending_specs
+    assert saved.task.calls[0].id in saved.task.progress_calls
+
+
+def test_budget_exhaustion_during_reconciliation_keeps_call_interrupted(tmp_path, monkeypatch):
+    from flight_agent.runtime.budget import BudgetExhausted
+    from flight_agent.verification.agent_runtime import ExecutionUncertain
+
+    def operation(context, inputs):
+        raise ExecutionUncertain("dispatch acknowledgement missing")
+
+    executor, store, record, _ = setup(tmp_path, operation=operation)
+    interrupted = confirm(executor, propose(executor, record))
+    original = interrupted.task.calls[0].id
+
+    def exhausted(*args):
+        raise BudgetExhausted("Budget exhausted during reconciliation")
+
+    monkeypatch.setattr(executor.tools, "reconcile", exhausted)
+    resumed = executor.resume(record.id)
+    assert resumed.status == "interrupted"
+    assert resumed.task.calls[0].status == "interrupted"
+    assert resumed.task.calls[0].id == original
+    assert original in resumed.task.pending_specs
+    assert store.get(record.id) == resumed
+
+
+def test_budget_exhaustion_after_recovery_acceptance_keeps_committed_receipt(tmp_path, monkeypatch):
+    from tests.agent_helpers import analysis_plan_data
+
+    invoked = []
+
+    def operation(context, inputs):
+        invoked.append(context.call_id)
+        return CapabilityOutcome()
+
+    executor, store, record, _ = setup(tmp_path, operation=operation)
+    data = analysis_plan_data()
+    data["budget"]["max_no_progress"] = 1
+    pending = propose(executor, record, data)
+
+    def crash(*args):
+        raise KeyboardInterrupt("after receipt publication")
+
+    monkeypatch.setattr(executor, "_accept", crash)
+    with pytest.raises(KeyboardInterrupt):
+        confirm(executor, pending)
+    recovery = type(executor)(
+        SQLiteConversationStore(store.root), executor.tools, executor.resources
+    )
+    result = recovery.resume(record.id)
+    saved = store.get(record.id)
+    assert result.status == "failed"
+    assert saved.task.calls[0].status == "completed"
+    assert saved.task.nodes[0].status == "completed"
+    assert saved.task.calls[0].id not in saved.task.pending_specs
+    assert saved.task.calls[0].id in saved.task.progress_calls
+    assert saved.task.analysis_runs[0].id == saved.task.calls[0].id
+    assert saved.task.budget_state.no_progress == 1
+    assert invoked == [saved.task.calls[0].id]
+
+
 @pytest.mark.parametrize("damage", ["future", "corrupt"])
 def test_web_startup_refuses_unusable_database_without_json_fallback(tmp_path, damage):
     from flight_agent.verification.sqlite_schema import DatabaseStartupError
@@ -141,6 +270,33 @@ def test_web_startup_refuses_unusable_database_without_json_fallback(tmp_path, d
         store.database_path.write_bytes(b"not a SQLite database")
     with pytest.raises(DatabaseStartupError):
         create_web_app(tmp_path)
+    assert not list(store.root.rglob("conversation.json"))
+
+
+def test_web_startup_rejects_corruption_in_unqueried_table_without_rewriting(tmp_path):
+    from flight_agent.verification.sqlite_schema import DatabaseStartupError
+    from flight_agent.web import create_web_app
+
+    store = SQLiteConversationStore(tmp_path / "runs" / "verification", require_empty=True)
+    store.create()
+    with sqlite3.connect(store.database_path) as connection:
+        page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+        root_page = connection.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name='task_events'"
+        ).fetchone()[0]
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    data = bytearray(store.database_path.read_bytes())
+    assert root_page > 1
+    data[(root_page - 1) * page_size] = 0
+    store.database_path.write_bytes(data)
+    damaged = store.database_path.read_bytes()
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM conversations").fetchone()[0] == 1
+
+    with pytest.raises(DatabaseStartupError, match="integrity|corrupt"):
+        create_web_app(tmp_path)
+
+    assert store.database_path.read_bytes() == damaged
     assert not list(store.root.rglob("conversation.json"))
 
 

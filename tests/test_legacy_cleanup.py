@@ -460,3 +460,133 @@ def test_sqlite_store_never_deserializes_or_deletes_raw_json_records(tmp_path, d
     assert raw.read_bytes() == before
     assert store.backup_path is not None
     assert (store.backup_path / raw.relative_to(tmp_path)).read_bytes() == before
+
+
+def test_cleanup_preserves_sqlite_owned_external_result_and_deletes_unrelated_v1(tmp_path):
+    from tests.agent_helpers import analysis_plan_data
+    from tests.test_agent_runtime import confirm, propose, setup
+
+    executor, store, record, _ = setup(tmp_path)
+    legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    unrelated = write_record(store.root / ("b" * 32), {"task": {"scenario": "d2"}})
+    record.output_root = str(legacy.parent / "output")
+    data = analysis_plan_data()
+    data["allowed_effects"].append("write_delivery")
+    done = confirm(executor, propose(executor, record, data))
+    assert done.status == "completed", done.error
+    evidence = next(path for path in (legacy.parent / "output").rglob("*") if path.is_file())
+    before = evidence.read_bytes()
+
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=True)
+
+    assert evidence.read_bytes() == before
+    assert legacy.exists()
+    assert not unrelated.exists()
+    assert report.deleted == ["b" * 32]
+    assert store.get(done.id).task.analysis_runs == done.task.analysis_runs
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "future"])
+def test_cleanup_fails_closed_when_sqlite_ownership_is_unreadable(tmp_path, damage):
+    import sqlite3
+
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    record = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    if damage == "future":
+        with sqlite3.connect(store.database_path) as connection:
+            connection.execute("PRAGMA user_version=999")
+    else:
+        store.database_path.write_bytes(b"not a database")
+    before = store.database_path.read_bytes()
+
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=True)
+
+    assert report.deleted == []
+    assert record.exists()
+    assert store.database_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("owner", ["conversation_source", "task_resource", "unconfirmed_output"])
+@pytest.mark.parametrize("archived", [False, True])
+def test_cleanup_protects_sqlite_source_and_unconfirmed_output_paths(tmp_path, owner, archived):
+    from flight_agent.runtime.resources import ResourceReference
+    from tests.test_agent_history import agent_task
+
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    source = legacy.parent / "source"
+    source.mkdir()
+    sentinel = source / "keep.txt"
+    sentinel.write_text("live source")
+    if owner == "conversation_source":
+        record.project_root = str(source)
+    else:
+        task_id = "b" * 32
+        output = source if owner == "unconfirmed_output" else None
+        directory = (
+            output / f"flight-agent-{task_id}"
+            if output
+            else store.default_task_root(record.id) / task_id
+        )
+        task = agent_task(directory, output_root=str(output) if output else None)
+        task.id = task_id
+        if owner == "task_resource":
+            task.baseline = task.baseline.model_copy(update={"resources": [
+                ResourceReference(
+                    id="source", kind="data", location="agent", locator=str(source),
+                    fingerprint="a" * 64,
+                )
+            ]})
+        if archived:
+            record.archived_tasks = [task]
+        else:
+            record.task = task
+    store.save(record)
+    database_before = store.database_path.read_bytes()
+
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=True)
+
+    assert report.deleted == []
+    assert sentinel.read_text() == "live source"
+    assert store.database_path.read_bytes() == database_before
+
+
+def test_cleanup_fails_closed_for_missing_sqlite_evidence_owner(tmp_path):
+    from flight_agent.runtime.evidence import describe_evidence
+    from flight_agent.runtime.observations import OutputArtifact
+    from tests.test_agent_history import agent_task
+
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    directory = store.task_directory(record.id, "b" * 32, create=True)
+    record.task = agent_task(directory).model_copy(update={"id": "b" * 32})
+    evidence = directory / "evidence.json"
+    evidence.write_text("{}")
+    record.task.artifacts.append(
+        OutputArtifact(**describe_evidence(directory, evidence.name).model_dump())
+    )
+    store.save(record)
+    evidence.unlink()
+    directory.rmdir()
+
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=True)
+
+    assert report.deleted == []
+    assert legacy.exists()
+
+
+def test_cleanup_preserves_candidate_inside_sqlite_owned_source(tmp_path):
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    evidence = legacy.parent / "model.slx"
+    evidence.write_text("model")
+    record.project_root = str(store.root)
+    store.save(record)
+
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=True)
+
+    assert report.deleted == []
+    assert evidence.read_text() == "model"

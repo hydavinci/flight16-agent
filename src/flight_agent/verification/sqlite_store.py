@@ -248,16 +248,6 @@ class SQLiteConversationStore:
             tasks = {
                 task.id: task for task in self._tasks(record)
             }
-            roots = {}
-            for task in tasks.values():
-                root = self.task_directory(
-                    record.id, task.id, task.output_root
-                )
-                if str(root) != task.result_directory:
-                    raise ValueError(
-                        "Task result directory does not match its persisted identity"
-                    )
-                roots[task.id] = root
             artifacts = [
                 dict(row)
                 for row in connection.execute(
@@ -267,11 +257,55 @@ class SQLiteConversationStore:
                     (conversation_id,),
                 )
             ]
+            roots = {}
+            for task in tasks.values():
+                if not JOB_ID.fullmatch(task.id):
+                    raise ValueError("Invalid task ID")
+                root = (
+                    Path(task.output_root) / f"flight-agent-{task.id}"
+                    if task.output_root
+                    else self.default_task_root(record.id) / task.id
+                )
+                safe_directory(root)
+                if str(root) != task.result_directory:
+                    raise ValueError(
+                        "Task result directory does not match its persisted identity"
+                    )
+                if (
+                    task.baseline.confirmed
+                    or task.calls
+                    or task.artifacts
+                    or task.analysis_runs
+                    or task.checkpoints
+                    or task.checkpoint_sha256
+                    or task.outputs
+                    or task.result is not None
+                    or any(row["task_id"] == task.id for row in artifacts)
+                    or root.exists()
+                ):
+                    self.task_directory(record.id, task.id, task.output_root)
+                roots[task.id] = root
             for row in artifacts:
                 verify_evidence(
                     roots[str(row["task_id"])],
                     OutputArtifact.model_validate_json(row["descriptor_json"]),
                 )
+            for task in tasks.values():
+                descriptors = [
+                    *(
+                        artifact
+                        for output in task.outputs.values()
+                        for artifact in output.artifacts
+                    ),
+                    *(
+                        artifact
+                        for run in task.analysis_runs
+                        for artifact in [*run.artifacts, *run.output.artifacts]
+                    ),
+                    *([*task.result.artifacts] if task.result is not None else []),
+                ]
+                for descriptor in descriptors:
+                    verify_evidence(roots[task.id], descriptor)
             events = [
                 dict(row)
                 for row in connection.execute(

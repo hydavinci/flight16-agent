@@ -75,6 +75,10 @@ class ReconciledFailure(RuntimeError):
     """A reconciliation handler has verified the original operation failed."""
 
 
+class PreDispatchBudgetExhausted(BudgetExhausted):
+    """The capability has verified that no external operation was submitted."""
+
+
 @dataclass(frozen=True)
 class AgentContext:
     directory: Path
@@ -754,8 +758,18 @@ class AgentExecutor:
                 task.pending_specs.pop(call.id, None)
                 self.store.save(conversation)
                 raise
-            except BudgetExhausted:
-                raise
+            except BudgetExhausted as exc:
+                if call.status == "completed":
+                    raise
+                call.status = "interrupted"
+                call.error = str(exc)[:4000]
+                if node is not None:
+                    node.status = "interrupted"
+                    node.error = call.error
+                self.store.save(conversation)
+                raise ExecutionUncertain(
+                    f"Original invocation state remains unknown: {exc}"
+                ) from exc
             except (OSError, ValueError, RuntimeError) as exc:
                 call.status = "interrupted"
                 call.error = str(exc)[:4000]
@@ -822,8 +836,26 @@ class AgentExecutor:
             node.error = call.error
             self.store.save(conversation)
             raise
-        except BudgetExhausted:
-            raise
+        except BudgetExhausted as exc:
+            if call.status == "completed":
+                raise
+            if isinstance(exc, PreDispatchBudgetExhausted) and not publishing:
+                call.status = "failed"
+                call.error = str(exc)[:4000]
+                call.finished_at = now()
+                node.status = "failed"
+                node.error = call.error
+                task.pending_specs.pop(call.id, None)
+                self.store.save(conversation)
+                raise
+            call.status = "interrupted"
+            call.error = str(exc)[:4000]
+            node.status = "interrupted"
+            node.error = call.error
+            self.store.save(conversation)
+            raise ExecutionUncertain(
+                f"Original invocation state remains unknown: {exc}"
+            ) from exc
         except (OSError, ValueError, RuntimeError) as exc:
             if publishing:
                 call.status = "interrupted"

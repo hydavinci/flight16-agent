@@ -189,6 +189,43 @@ def test_simulink_requires_effect_permission_even_with_confirmation(tmp_path):
     assert not backend.calls
 
 
+@pytest.mark.parametrize("elapsed", [59.5, 61])
+def test_simulink_budget_exhaustion_before_worker_checkpoint_is_known_failure(
+    tmp_path, monkeypatch, elapsed
+):
+    from datetime import UTC, datetime, timedelta
+
+    from flight_agent.runtime import budget
+
+    clock = [datetime(2026, 10, 31, tzinfo=UTC)]
+    monkeypatch.setattr(budget, "utc_now", lambda: clock[0])
+    backend = ControlledBackend()
+    runtime, store = assembled(tmp_path, backend)
+    resource = runtime.resources.inspect(
+        "simulink_project", str(project_tree(tmp_path / "project"))
+    )
+    pending = runtime.propose(store.create(), simulink_plan(resource))
+    invoke = runtime.tools.invoke
+
+    def before_invoke(*args, **kwargs):
+        clock[0] += timedelta(seconds=elapsed)
+        return invoke(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.tools, "invoke", before_invoke)
+    done = runtime.confirm(pending.id, 1, trusted=True)
+    saved = store.get(done.id)
+    assert done.status == "failed"
+    assert saved.task.calls[0].status == "failed"
+    assert saved.task.nodes[0].status == "failed"
+    assert saved.task.result.execution_status == "partial"
+    assert saved.pending_decision.kind == "retry"
+    assert saved.task.pending_specs == {}
+    assert saved.task.checkpoints == {}
+    assert backend.calls == []
+    next_proposal = runtime.propose(saved, simulink_plan(resource))
+    assert next_proposal.status == "waiting_for_user"
+
+
 def test_lost_worker_acknowledgement_reconciles_exact_original_request(tmp_path):
     backend = ControlledBackend()
     backend.fail_after_completion = True

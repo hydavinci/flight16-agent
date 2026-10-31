@@ -309,9 +309,11 @@ def test_nested_capability_cannot_reset_the_outer_call_budget(tmp_path):
     data = analysis_plan_data()
     data["budget"]["max_calls"] = 1
     done = confirm(runtime, propose(runtime, conversation, data))
-    assert done.status == "failed"
+    assert done.status == "interrupted"
     assert "call budget" in done.error
     assert done.task.budget_state.calls == 1
+    assert done.task.calls[0].status == "interrupted"
+    assert done.task.calls[0].id in done.task.pending_specs
 
 
 def test_resource_registry_requires_explicit_verifiers_and_rechecks_real_fingerprints(tmp_path):
