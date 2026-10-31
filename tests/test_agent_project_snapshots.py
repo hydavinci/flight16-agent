@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event, Thread
@@ -45,6 +46,11 @@ def project_executor(
     after_first=None,
     snapshot_root=None,
     secondary_state=None,
+    inspect_context=None,
+    cacheable=False,
+    reconcile=None,
+    interrupt_first=False,
+    use_snapshot_context=True,
 ):
     source = prepared_project(tmp_path / "source")
     project = discover_matlab_project(str(source))
@@ -109,17 +115,24 @@ def project_executor(
     calls = []
 
     def execute(context, inputs):
-        binding = context.project_snapshot("project")
-        tree = snapshots.verify(binding)
-        calls.append(
-            (
-                context.call_id,
-                binding.snapshot_id,
-                (tree / "initialize.m").read_bytes(),
+        if inspect_context is not None:
+            inspect_context(context)
+        if use_snapshot_context:
+            binding = context.project_snapshot("project")
+            tree = snapshots.verify(binding)
+            calls.append(
+                (
+                    context.call_id,
+                    binding.snapshot_id,
+                    (tree / "initialize.m").read_bytes(),
+                )
             )
-        )
+        else:
+            calls.append((context.call_id, None, b""))
         if inputs.tag == "first" and after_first is not None:
             after_first(source)
+        if inputs.tag == "first" and interrupt_first:
+            raise KeyboardInterrupt("Crash after the original snapshot call")
         return CapabilityOutcome(
             findings=[
                 Finding(
@@ -141,8 +154,12 @@ def project_executor(
             output_model=CapabilityOutcome,
             effect="execute_project",
             operation=execute,
+            reconcile=reconcile,
             scheduling=SchedulingMetadata(lane="local_matlab"),
-            metadata=CapabilityMetadata(resources=requirements),
+            metadata=CapabilityMetadata(
+                resources=requirements,
+                cacheable=cacheable,
+            ),
         )
     )
     executor = AgentExecutor(store, tools, resources, snapshots=snapshots)
@@ -738,4 +755,499 @@ def test_nonlocal_direct_confirm_creates_no_snapshot_root(tmp_path, resource_cas
     )
     assert confirmed.task.baseline.confirmed
     assert confirmed.task.baseline.project_snapshots == {}
+    assert not executor.snapshots.root.exists()
+
+
+def test_confirmation_creates_one_snapshot_for_two_dependent_calls(tmp_path):
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    pending = executor.propose(store.create(), plan)
+    done = executor.confirm(pending.id, pending.task.baseline.version, trusted=True)
+    assert done.status == "completed", done.error
+    binding = done.task.baseline.project_snapshots["local"]
+    assert binding.source_fingerprint == plan.resources[0].fingerprint
+    assert len(calls) == 2
+    assert {item[1] for item in calls} == {binding.snapshot_id}
+    assert len(list((executor.snapshots.root / "objects").glob("*/*"))) == 1
+    assert done.task.baseline.resources == plan.resources
+    assert store.get(done.id).task.baseline.project_snapshots["local"] == binding
+
+
+def test_second_call_uses_same_snapshot_after_source_disappears(tmp_path):
+    import shutil
+
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        after_first=shutil.rmtree,
+    )
+    pending = executor.propose(store.create(), plan)
+    done = executor.confirm(pending.id, pending.task.baseline.version, trusted=True)
+    assert done.status == "completed", done.error
+    assert len(calls) == 2
+    assert calls[0][1:] == calls[1][1:]
+    assert not source.exists()
+
+
+def test_snapshot_tamper_blocks_next_call_before_dispatch(tmp_path):
+    holder = {}
+
+    def tamper(source):
+        snapshots = holder["executor"].snapshots
+        obj = next((snapshots.root / "objects").glob("*/*"))
+        path = obj / "tree" / "initialize.m"
+        path.chmod(0o644)
+        path.write_text("tampered = 1;\n")
+        path.chmod(0o444)
+
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        after_first=tamper,
+    )
+    holder["executor"] = executor
+    pending = executor.propose(store.create(), plan)
+    done = executor.confirm(pending.id, pending.task.baseline.version, trusted=True)
+    assert done.status == "failed"
+    assert len(calls) == 1
+    assert len(done.task.calls) == 1
+    assert done.task.calls[0].status == "completed"
+    assert done.task.outputs["first"].findings[0].text == "first"
+
+
+def test_invocation_identity_includes_transitive_snapshot_lineage(tmp_path):
+    from flight_agent.runtime.agent_contracts import AgentNode
+    from flight_agent.verification.agent_runtime import build_invocation_spec
+
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    pending = executor.propose(store.create(), plan)
+    done = executor.confirm(pending.id, pending.task.baseline.version, trusted=True)
+    metric = AgentNode(
+        id="measure",
+        tool="snapshot_probe",
+        tool_version="1",
+        depends_on=["second"],
+        inputs={"tag": "metric"},
+    )
+    baseline = done.task.baseline.model_copy(update={"nodes": [*plan.nodes, metric]})
+    spec = build_invocation_spec(
+        baseline,
+        metric,
+        {"tag": "metric"},
+        done.task.outputs,
+    )
+    binding = baseline.project_snapshots["local"]
+    assert spec.numerics["project_snapshots"] == {
+        "local": binding.model_dump(mode="json")
+    }
+    assert spec.resource_fingerprints == {}
+
+
+def test_context_returns_isolated_snapshot_and_validates_role_and_work_root(
+    tmp_path,
+):
+    contexts = []
+
+    def inspect(context):
+        with pytest.raises(ValueError, match="outside.*bindings"):
+            context.project_snapshot("missing")
+        first = context.project_snapshot("project")
+        second = context.project_snapshot("project")
+        assert first == second
+        assert first is not second
+        contexts.append(context)
+
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        inspect_context=inspect,
+    )
+    pending = executor.propose(store.create(), plan)
+    done = executor.confirm(pending.id, pending.task.baseline.version, trusted=True)
+    assert done.status == "completed", done.error
+    assert len(contexts) == 2
+    for context in contexts:
+        assert context.work_directory == (
+            store.root
+            / "work"
+            / done.id
+            / done.task.id
+            / "calls"
+            / context.call_id
+        )
+        assert not context.work_directory.exists()
+
+
+def test_non_snapshot_resource_is_reverified_for_each_dispatch(tmp_path):
+    secondary_state = {"valid": True}
+
+    def invalidate_secondary(source):
+        secondary_state["valid"] = False
+
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        after_first=invalidate_secondary,
+        secondary_state=secondary_state,
+    )
+    pending = executor.propose(store.create(), plan)
+    done = executor.confirm(pending.id, pending.task.baseline.version, trusted=True)
+    assert done.status == "failed"
+    assert len(calls) == 1
+    assert verifications.count("local") == 3
+    assert verifications.count("secondary") == 5
+
+
+def test_archived_cache_reuse_rejects_snapshot_tamper_before_reuse(
+    tmp_path,
+    monkeypatch,
+):
+    from flight_agent.verification import agent_runtime as module
+
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        cacheable=True,
+    )
+    first_pending = executor.propose(store.create(), plan)
+    first = executor.confirm(
+        first_pending.id,
+        first_pending.task.baseline.version,
+        trusted=True,
+    )
+    second_pending = executor.propose(store.get(first.id), plan)
+    second = executor.confirm(
+        second_pending.id,
+        second_pending.task.baseline.version,
+        trusted=True,
+        _execute=False,
+    )
+    build = module.build_invocation_spec
+    tampered = False
+
+    def tamper_after_current_verification(*args, **kwargs):
+        nonlocal tampered
+        spec = build(*args, **kwargs)
+        if not tampered:
+            tampered = True
+            obj = next((executor.snapshots.root / "objects").glob("*/*"))
+            path = obj / "tree" / "initialize.m"
+            path.chmod(0o644)
+            path.write_text("tampered cache source = 1;\n")
+            path.chmod(0o444)
+        return spec
+
+    monkeypatch.setattr(module, "build_invocation_spec", tamper_after_current_verification)
+    failed = executor._run(second.id, "confirm", second.task.id)
+    assert failed.status == "failed"
+    assert failed.task.calls == []
+    assert len(calls) == 2
+
+
+def test_new_style_loaded_receipt_recovery_rejects_snapshot_tamper(
+    tmp_path,
+    monkeypatch,
+):
+    from flight_agent.verification import agent_runtime as module
+
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    publish = module.persist_agent_run
+
+    def crash_after_receipt(root, run):
+        publish(root, run)
+        raise KeyboardInterrupt("Crash after durable receipt publication")
+
+    monkeypatch.setattr(module, "persist_agent_run", crash_after_receipt)
+    pending = executor.propose(store.create(), plan)
+    with pytest.raises(KeyboardInterrupt):
+        executor.confirm(
+            pending.id,
+            pending.task.baseline.version,
+            trusted=True,
+        )
+    saved = store.get(pending.id)
+    spec = next(iter(saved.task.pending_specs.values()))
+    assert "project_snapshots" in spec.numerics
+    obj = next((executor.snapshots.root / "objects").glob("*/*"))
+    path = obj / "tree" / "initialize.m"
+    path.chmod(0o644)
+    path.write_text("tampered recovery object = 1;\n")
+    path.chmod(0o444)
+    monkeypatch.setattr(module, "persist_agent_run", publish)
+    recovery_store = ConversationStore(store.root)
+    recovery = AgentExecutor(
+        recovery_store,
+        executor.tools,
+        executor.resources,
+        snapshots=ProjectSnapshotStore(executor.snapshots.root),
+    )
+    recovered = recovery.resume(pending.id)
+    assert recovered.status == "interrupted"
+    assert recovered.task.analysis_runs == []
+    assert recovered.task.outputs == {}
+    assert len(calls) == 1
+
+
+def test_new_style_reconcile_verifies_after_lane_and_releases_guard(
+    tmp_path,
+    monkeypatch,
+):
+    reconciled = []
+    state = {"held": False, "entries": 0}
+
+    def reconcile(context, inputs):
+        assert state["entries"] > 0
+        assert not state["held"]
+        reconciled.append(context.call_id)
+        return CapabilityOutcome(
+            findings=[
+                Finding(
+                    id="seen",
+                    node_id=context.node_id,
+                    text=inputs.tag,
+                    status="observed",
+                )
+            ]
+        )
+
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        reconcile=reconcile,
+        interrupt_first=True,
+    )
+    pending = executor.propose(store.create(), plan)
+    with pytest.raises(KeyboardInterrupt):
+        executor.confirm(
+            pending.id,
+            pending.task.baseline.version,
+            trusted=True,
+        )
+    recovery_store = ConversationStore(store.root)
+    recovery = AgentExecutor(
+        recovery_store,
+        executor.tools,
+        executor.resources,
+        snapshots=ProjectSnapshotStore(executor.snapshots.root),
+    )
+    guard = recovery.snapshots.guard
+
+    @contextmanager
+    def tracked_guard(*, exclusive=False):
+        with guard(exclusive=exclusive):
+            state["entries"] += 1
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+    monkeypatch.setattr(recovery.snapshots, "guard", tracked_guard)
+    definition = recovery.tools.definition("snapshot_probe")
+    scheduling = recovery.tools.scheduling("snapshot_probe")
+    queued = Event()
+    save = recovery.store.save
+
+    def observe(record):
+        save(record)
+        if record.status == "queued" and record.task.stage.startswith("queued:"):
+            queued.set()
+
+    monkeypatch.setattr(recovery.store, "save", observe)
+    with ThreadPoolExecutor(1) as pool:
+        with recovery.scheduler.slot(definition, scheduling):
+            future = pool.submit(recovery.resume, pending.id)
+            assert queued.wait(5)
+            assert state == {"held": False, "entries": 0}
+        recovered = future.result(timeout=5)
+    assert recovered.status == "completed", recovered.error
+    assert reconciled == [calls[0][0]]
+    assert not state["held"]
+
+
+def test_new_dispatch_verifies_after_lane_and_releases_guard_before_backend(
+    tmp_path,
+    monkeypatch,
+):
+    state = {"held": False, "entries": 0}
+
+    def inspect(context):
+        assert state["entries"] > 0
+        assert not state["held"]
+
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        inspect_context=inspect,
+    )
+    pending = executor.propose(store.create(), plan)
+    confirmed = executor.confirm(
+        pending.id,
+        pending.task.baseline.version,
+        trusted=True,
+        _execute=False,
+    )
+    guard = executor.snapshots.guard
+
+    @contextmanager
+    def tracked_guard(*, exclusive=False):
+        with guard(exclusive=exclusive):
+            state["entries"] += 1
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+    monkeypatch.setattr(executor.snapshots, "guard", tracked_guard)
+    definition = executor.tools.definition("snapshot_probe")
+    scheduling = executor.tools.scheduling("snapshot_probe")
+    queued = Event()
+    save = executor.store.save
+
+    def observe(record):
+        save(record)
+        if record.status == "queued" and record.task.stage.startswith("queued:"):
+            queued.set()
+
+    monkeypatch.setattr(executor.store, "save", observe)
+    with ThreadPoolExecutor(1) as pool:
+        with executor.scheduler.slot(definition, scheduling):
+            future = pool.submit(
+                executor._run,
+                confirmed.id,
+                "confirm",
+                confirmed.task.id,
+            )
+            assert queued.wait(5)
+            assert state == {"held": False, "entries": 0}
+        done = future.result(timeout=5)
+    assert done.status == "completed", done.error
+    assert not state["held"]
+
+
+def test_legacy_loaded_receipt_recovery_is_not_upgraded_to_snapshots(
+    tmp_path,
+    monkeypatch,
+):
+    from flight_agent.verification import agent_runtime as module
+    from tests.test_agent_runtime import confirm, propose, setup
+
+    runtime, store, conversation, calls = setup(tmp_path)
+    publish = module.persist_agent_run
+
+    def crash_after_receipt(root, run):
+        publish(root, run)
+        raise KeyboardInterrupt("Crash after legacy receipt publication")
+
+    monkeypatch.setattr(module, "persist_agent_run", crash_after_receipt)
+    pending = propose(runtime, conversation)
+    with pytest.raises(KeyboardInterrupt):
+        confirm(runtime, pending)
+    saved = store.get(pending.id)
+    original_id = saved.task.calls[0].id
+    spec = saved.task.pending_specs[original_id]
+    assert "project_snapshots" not in spec.numerics
+    monkeypatch.setattr(module, "persist_agent_run", publish)
+    recovery_store = ConversationStore(store.root)
+    recovery = AgentExecutor(recovery_store, runtime.tools, runtime.resources)
+    recovered = recovery.resume(pending.id)
+    assert recovered.status == "completed", recovered.error
+    assert recovered.task.calls[0].id == original_id
+    assert recovered.task.analysis_runs[0].id == original_id
+    assert recovered.task.baseline.project_snapshots == {}
+    assert not recovery.snapshots.root.exists()
+    assert len(calls) == 1
+
+
+def test_legacy_project_reconcile_does_not_adopt_snapshot_lineage(
+    tmp_path,
+    monkeypatch,
+):
+    from flight_agent.runtime.agent_contracts import InvocationSpec
+    from flight_agent.verification import agent_runtime as module
+
+    def reconcile(context, inputs):
+        with pytest.raises(ValueError, match="confirmed managed snapshot"):
+            context.project_snapshot("project")
+        return CapabilityOutcome(
+            findings=[
+                Finding(
+                    id="seen",
+                    node_id=context.node_id,
+                    text=inputs.tag,
+                    status="observed",
+                )
+            ]
+        )
+
+    executor, store, source, plan, calls, verifications = project_executor(
+        tmp_path,
+        reconcile=reconcile,
+        interrupt_first=True,
+        use_snapshot_context=False,
+    )
+    data = plan.model_dump(mode="json")
+    data["nodes"] = data["nodes"][:1]
+    data["requirements"]["requested_outputs"] = data["requirements"][
+        "requested_outputs"
+    ][:1]
+    legacy_plan = AgentPlan.model_validate(data)
+    build = module.build_invocation_spec
+
+    def build_legacy_spec(*args, **kwargs):
+        spec = build(*args, **kwargs)
+        numerics = dict(spec.numerics)
+        numerics.pop("project_snapshots", None)
+        return InvocationSpec.model_validate(
+            {
+                **spec.model_dump(mode="json"),
+                "numerics": numerics,
+            }
+        )
+
+    monkeypatch.setattr(module, "build_invocation_spec", build_legacy_spec)
+    pending = executor.propose(store.create(), legacy_plan)
+    with pytest.raises(KeyboardInterrupt):
+        executor.confirm(
+            pending.id,
+            pending.task.baseline.version,
+            trusted=True,
+        )
+    saved = store.get(pending.id)
+    spec = next(iter(saved.task.pending_specs.values()))
+    assert "project_snapshots" not in spec.numerics
+    monkeypatch.setattr(module, "build_invocation_spec", build)
+    obj = next((executor.snapshots.root / "objects").glob("*/*"))
+    path = obj / "tree" / "initialize.m"
+    original = path.read_bytes()
+    path.chmod(0o644)
+    path.write_text("tampered legacy-only snapshot = 1;\n")
+    path.chmod(0o444)
+    recovery_store = ConversationStore(store.root)
+    recovery = AgentExecutor(
+        recovery_store,
+        executor.tools,
+        executor.resources,
+        snapshots=ProjectSnapshotStore(executor.snapshots.root),
+    )
+    try:
+        recovered = recovery.resume(pending.id)
+    finally:
+        path.chmod(0o644)
+        path.write_bytes(original)
+        path.chmod(0o444)
+    assert recovered.status == "completed", recovered.error
+    assert recovered.task.calls[0].id == calls[0][0]
+    assert len(calls) == 1
+
+
+def test_snapshot_and_work_roots_cannot_overlap_external_delivery(tmp_path):
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    record = store.create()
+    record.output_root = str(store.root)
+    store.save(record)
+    delivery_plan = plan.model_copy(
+        update={
+            "allowed_effects": (
+                "read_only",
+                "execute_project",
+                "write_delivery",
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        executor.propose(record, delivery_plan)
     assert not executor.snapshots.root.exists()

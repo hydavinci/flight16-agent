@@ -1,8 +1,9 @@
 from pathlib import Path
 
-from ..runtime.agent_contracts import AgentBaseline, AgentPlan
+from ..runtime.agent_contracts import AgentBaseline, AgentNode, AgentPlan
 from ..runtime.project_snapshots import ProjectSnapshot, SnapshotFile
 from ..runtime.resources import ResourceReference
+from ..runtime.tasks import plan_ancestors
 from .intake import safe_directory, validate_output_root
 from .matlab_contracts import MatlabProjectDescriptor
 from .project_snapshots import ProjectSnapshotStore
@@ -76,6 +77,53 @@ def prepare_project_snapshots(
         identifier: snapshots.ensure(_descriptor(resource))
         for identifier, resource in sorted(local_projects(baseline).items())
     }
+
+
+def snapshot_lineage(
+    baseline: AgentBaseline,
+    node: AgentNode,
+) -> dict[str, ProjectSnapshot]:
+    producers = {node.id, *plan_ancestors(baseline.nodes)[node.id]}
+    resource_ids = {
+        identifier
+        for candidate in baseline.nodes
+        if candidate.id in producers
+        for identifier in candidate.resource_bindings.values()
+    }
+    return {
+        identifier: binding
+        for identifier, binding in sorted(baseline.project_snapshots.items())
+        if identifier in resource_ids
+    }
+
+
+def verify_snapshot_lineage(
+    baseline: AgentBaseline,
+    node: AgentNode,
+    snapshots: ProjectSnapshotStore,
+) -> None:
+    validate_snapshot_bindings(
+        baseline,
+        require=bool(baseline.project_snapshots),
+    )
+    bindings = snapshot_lineage(baseline, node)
+    if bindings:
+        with snapshots.guard():
+            for binding in bindings.values():
+                snapshots.verify(binding)
+
+
+def verify_execution_resources(
+    baseline: AgentBaseline,
+    registry: ResourceRegistry,
+) -> None:
+    registry.verify(
+        [
+            resource
+            for resource in baseline.resources
+            if resource.id not in baseline.project_snapshots
+        ]
+    )
 
 
 def _overlap(left: Path, right: Path) -> bool:

@@ -4,6 +4,7 @@ import logging
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from uuid import uuid4
 
@@ -45,10 +46,12 @@ from ..runtime.observations import (
     TaskResult,
     combine_outcomes,
 )
+from ..runtime.project_snapshots import ProjectSnapshot
 from ..runtime.requirements import CapabilityGap
 from ..runtime.resources import ResourceReference, bounded_json
 from ..runtime.scheduling import ExecutionScheduler
 from ..runtime.scheduling_contracts import SchedulingMetadata
+from ..runtime.tasks import plan_ancestors
 from .contracts import (
     AgentExecutionNode,
     AgentTask,
@@ -60,14 +63,17 @@ from .contracts import (
     ToolCall,
 )
 from .conversation_repository import ConversationRepository
-from .intake import validate_output_root
+from .intake import safe_directory, validate_output_root
 from .project_snapshots import ProjectSnapshotStore
 from .resources import ResourceRegistry
 from .snapshot_binding import (
     local_projects,
     prepare_project_snapshots,
+    snapshot_lineage,
     validate_managed_boundaries,
     validate_snapshot_bindings,
+    verify_execution_resources,
+    verify_snapshot_lineage,
 )
 from .store import now
 
@@ -130,11 +136,24 @@ class AgentContext:
     load_checkpoint: Callable[[], dict[str, JsonValue] | None]
     save_checkpoint: Callable[[dict[str, JsonValue]], None]
     _resource_roles: dict[str, ResourceReference]
+    work_directory: Path | None = None
+    _project_snapshots: dict[str, ProjectSnapshot] = dataclass_field(
+        default_factory=dict
+    )
 
     def resource(self, role: str) -> ResourceReference:
         if role not in self._resource_roles:
             raise ValueError(f"Resource role is outside this node's bindings: {role}")
         return ResourceReference.model_validate(self._resource_roles[role])
+
+    def project_snapshot(self, role: str) -> ProjectSnapshot:
+        resource = self.resource(role)
+        if resource.id not in self._project_snapshots:
+            raise ValueError("Local project requires its confirmed managed snapshot")
+        binding = self._project_snapshots[resource.id]
+        if binding.source_fingerprint != resource.fingerprint:
+            raise ValueError("Snapshot differs from the bound resource fingerprint")
+        return ProjectSnapshot.model_validate(binding.model_dump(mode="json"))
 
 
 def _node(node: AgentNode) -> AgentNode:
@@ -164,6 +183,13 @@ def build_invocation_spec(
     snapshot = baseline.capability_snapshots[node.tool]
     by_id = {resource.id: resource for resource in baseline.resources}
     resources = {role: by_id[identifier] for role, identifier in node.resource_bindings.items()}
+    lineage = snapshot_lineage(baseline, node)
+    snapshot_numerics: dict[str, JsonValue] = {}
+    if lineage:
+        snapshot_numerics["project_snapshots"] = {
+            identifier: binding.model_dump(mode="json")
+            for identifier, binding in lineage.items()
+        }
     conditions = inputs.get("conditions", {})
     return InvocationSpec(
         capability=node.tool,
@@ -180,6 +206,7 @@ def build_invocation_spec(
             "resources": {
                 role: resource.model_dump(mode="json") for role, resource in resources.items()
             },
+            **snapshot_numerics,
         },
         dependency_output_sha256={
             name: fingerprint(outputs[name].model_dump(mode="json")) for name in node.depends_on
@@ -284,6 +311,7 @@ def build_context(
     action: str,
     queue_origin: ConversationState,
     operation: OperationReservation,
+    snapshots: ProjectSnapshotStore | None = None,
 ) -> AgentContext:
     conversation_id = conversation.id
     task_id = task.id
@@ -292,6 +320,15 @@ def build_context(
     directory = store.task_directory(conversation.id, task.id, task.output_root)
     if str(directory) != task.result_directory:
         raise ValueError("Task result directory does not match its persisted identity")
+    work_directory = (
+        store.root
+        / "work"
+        / conversation.id
+        / task.id
+        / "calls"
+        / call.id
+    )
+    safe_directory(work_directory)
     spec = task.pending_specs[call.id]
     checkpoint_root = f"agent/checkpoints/{call.id}"
 
@@ -397,6 +434,14 @@ def build_context(
         role: ResourceReference.model_validate(resources[identifier])
         for role, identifier in node.resource_bindings.items()
     }
+    new_style = "project_snapshots" in spec.numerics
+    lineage = (
+        snapshot_lineage(task.baseline, _node(node))
+        if new_style
+        else {}
+    )
+    if snapshots is not None and new_style:
+        verify_snapshot_lineage(task.baseline, _node(node), snapshots)
     return AgentContext(
         directory=directory,
         scope=_scope(task.baseline, node),
@@ -408,6 +453,8 @@ def build_context(
         load_checkpoint=load_checkpoint,
         save_checkpoint=save_checkpoint,
         _resource_roles=roles,
+        work_directory=work_directory,
+        _project_snapshots=lineage,
     )
 
 
@@ -524,7 +571,7 @@ class AgentExecutor:
                 if output_root
                 else str(self.store.default_task_root(conversation.id) / task_id)
             )
-            self._validate_resource_boundary(plan, effective)
+            self._validate_resource_boundary(plan, output_root or effective)
             baseline = AgentBaseline(
                 **plan.model_dump(),
                 version=max((task.baseline.version for task in tasks), default=0) + 1,
@@ -663,7 +710,10 @@ class AgentExecutor:
         task.baseline.check_dispatch_budget()
         validate_bindings(task.baseline, self.tools)
         self.resources.verify(task.baseline.resources)
-        self._validate_resource_boundary(task.baseline, task.result_directory)
+        self._validate_resource_boundary(
+            task.baseline,
+            task.output_root or task.result_directory,
+        )
         self._directory(conversation, task, create=True)
         return _PreparedDecision(task_id=task.id, save=True)
 
@@ -814,6 +864,30 @@ class AgentExecutor:
     def _spec(self, task: AgentTask, node: AgentExecutionNode, call: ToolCall) -> InvocationSpec:
         return build_invocation_spec(task.baseline, _node(node), call.inputs, task.outputs)
 
+    def _spec_matches(
+        self,
+        task: AgentTask,
+        node: AgentExecutionNode,
+        call: ToolCall,
+        spec: InvocationSpec | None,
+    ) -> bool:
+        if spec is None:
+            return False
+        expected = self._spec(task, node, call)
+        if spec == expected:
+            return True
+        if "project_snapshots" in spec.numerics:
+            return False
+        numerics = dict(expected.numerics)
+        numerics.pop("project_snapshots", None)
+        legacy = InvocationSpec.model_validate(
+            {
+                **expected.model_dump(mode="json"),
+                "numerics": numerics,
+            }
+        )
+        return spec == legacy
+
     def _verified_run(
         self,
         conversation: Conversation,
@@ -848,9 +922,16 @@ class AgentExecutor:
             )
             if call is None:
                 raise ValueError("Completed node has no matching recorded call")
-            spec = self._spec(task, node, call)
+            recorded = next(
+                (run for run in task.analysis_runs if run.id == call.id),
+                None,
+            )
+            if recorded is None:
+                raise ValueError("Completed call lacks its recorded invocation receipt")
+            spec = recorded.spec
             if (
-                call.inputs != spec.inputs
+                not self._spec_matches(task, node, call, spec)
+                or call.inputs != spec.inputs
                 or call.tool != node.tool
                 or call.tool_version != node.tool_version
                 or call.baseline_version != task.baseline.version
@@ -892,8 +973,14 @@ class AgentExecutor:
                 )
                 if call is None or call.status != "completed" or node is None:
                     raise ValueError("Cached receipt has no completed original call")
-                if self._spec(task, node, call) != spec:
+                if not self._spec_matches(task, node, call, spec):
                     raise ValueError("Cached receipt differs from its original confirmed scope")
+                if "project_snapshots" in spec.numerics:
+                    verify_snapshot_lineage(
+                        task.baseline,
+                        _node(node),
+                        self.snapshots,
+                    )
                 verified = self._verified_run(conversation, task, node, call, spec)
                 if verified != original or task.outputs.get(node.id) != verified.output:
                     raise ValueError("Cached evidence differs from its original receipt")
@@ -1041,8 +1128,12 @@ class AgentExecutor:
                     node_id = node.id if node is not None else None
                     if (
                         node is None
-                        or task.pending_specs.get(call.id)
-                        != self._spec(task, node, call)
+                        or not self._spec_matches(
+                            task,
+                            node,
+                            call,
+                            task.pending_specs.get(call.id),
+                        )
                     ):
                         raise ValueError(
                             "Pending invocation differs from the confirmed scope"
@@ -1053,6 +1144,12 @@ class AgentExecutor:
                         self._directory(conversation, task), call.id, spec
                     )
                     if run is None and call.id in task.reuse_sources:
+                        if "project_snapshots" in spec.numerics:
+                            verify_snapshot_lineage(
+                                task.baseline,
+                                _node(node),
+                                self.snapshots,
+                            )
                         source = self._source(
                             conversation,
                             spec,
@@ -1064,6 +1161,12 @@ class AgentExecutor:
                             conversation, task, node, call, spec, source
                         )
                     if run is not None:
+                        if "project_snapshots" in spec.numerics:
+                            verify_snapshot_lineage(
+                                task.baseline,
+                                _node(node),
+                                self.snapshots,
+                            )
                         self._accept(
                             conversation, task, node, call, run, budget
                         )
@@ -1101,8 +1204,12 @@ class AgentExecutor:
                             or conversation.queue_origin != queue_origin
                             or node.tool != node_tool
                             or call.node_id != node.id
-                            or task.pending_specs.get(call.id)
-                            != self._spec(task, node, call)
+                            or not self._spec_matches(
+                                task,
+                                node,
+                                call,
+                                task.pending_specs.get(call.id),
+                            )
                             or conversation.status != "queued"
                             or task.stage
                             != f"queued:{scheduling.lane}:{node.id}"
@@ -1159,7 +1266,14 @@ class AgentExecutor:
                             action=action,
                             queue_origin=queue_origin,
                             operation=operation,
+                            snapshots=self.snapshots,
                         )
+                        if "project_snapshots" in spec.numerics:
+                            verify_snapshot_lineage(
+                                task.baseline,
+                                _node(node),
+                                self.snapshots,
+                            )
                     output = self.tools.reconcile(
                         node_tool,
                         spec.inputs,
@@ -1380,7 +1494,7 @@ class AgentExecutor:
             or task.stage != operation.node_id
             or task.pending_specs.get(operation.call_id)
             != operation.spec
-            or self._spec(task, node, call) != operation.spec
+            or not self._spec_matches(task, node, call, operation.spec)
         ):
             raise ExecutionUncertain("Admitted call reservation changed")
         self._verify_saved(conversation, task)
@@ -1447,7 +1561,7 @@ class AgentExecutor:
             or call.error != operation.failure_error
             or node.error != operation.failure_error
             or task.stage != operation.node_id
-            or self._spec(task, node, call) != operation.spec
+            or not self._spec_matches(task, node, call, operation.spec)
         ):
             raise ExecutionUncertain(
                 "Recorded external failure reservation changed"
@@ -1561,15 +1675,40 @@ class AgentExecutor:
                         raise ExecutionUncertain(
                             "Capability definition or scheduling lane changed"
                         )
+                    ancestors = plan_ancestors(task.baseline.nodes)[node.id] | {
+                        node.id
+                    }
+                    local_ids = set(local_projects(task.baseline))
+                    needs_snapshot = any(
+                        local_ids.intersection(
+                            candidate.resource_bindings.values()
+                        )
+                        for candidate in task.baseline.nodes
+                        if candidate.id in ancestors
+                    )
+                    if needs_snapshot:
+                        validate_snapshot_bindings(
+                            task.baseline,
+                            require=True,
+                        )
+                    verify_snapshot_lineage(
+                        task.baseline,
+                        _node(node),
+                        self.snapshots,
+                    )
+                    verify_execution_resources(
+                        task.baseline,
+                        self.resources,
+                    )
+                    self._validate_resource_boundary(
+                        task.baseline,
+                        task.output_root or task.result_directory,
+                    )
                     budget = self._budget(conversation, task)
                     budget.check_limits()
                     conversation.status = "running"
                     task.stage = node.id
                     self.store.save(conversation)
-                    self.resources.verify(task.baseline.resources)
-                    self._validate_resource_boundary(
-                        task.baseline, task.result_directory
-                    )
                     inputs = self.tools.validate_inputs(
                         node.tool,
                         resolve_inputs(_node(node), task.outputs),
@@ -1630,6 +1769,7 @@ class AgentExecutor:
                         action=action,
                         queue_origin=queue_origin,
                         operation=operation,
+                        snapshots=self.snapshots,
                     )
                     call_id = call.id
                 try:
