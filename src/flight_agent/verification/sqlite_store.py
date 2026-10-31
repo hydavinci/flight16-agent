@@ -11,11 +11,11 @@ from uuid import uuid4
 from ..models import JOB_ID
 from ..runtime.evidence import load_agent_run, verify_evidence
 from ..runtime.observations import OutputArtifact
-from .contracts import Conversation
+from .contracts import Conversation, ConversationMessage, PendingDecision
 from .intake import safe_directory
 from .sqlite_codec import Row, canonical, decode, encode
 from .sqlite_cutover import prepare_cutover
-from .sqlite_schema import connect_database, migrate_database
+from .sqlite_schema import DatabaseStartupError, connect_database, migrate_database
 
 
 def _now() -> str:
@@ -30,6 +30,12 @@ class SQLiteConversationStore:
         self.database_path = self.root / "conversations.sqlite3"
         migrate_database(self.database_path)
         self._local = threading.local()
+        try:
+            self._recover_startup()
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            raise DatabaseStartupError(
+                f"SQLite startup recovery failed: {exc}"
+            ) from exc
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
@@ -134,6 +140,126 @@ class SQLiteConversationStore:
                 )
             ]
             return [decode(connection, identifier) for identifier in identifiers]
+
+    def _recover_startup(self) -> None:
+        with self.transaction():
+            connection = self._local.connection
+            identifiers = [
+                row[0]
+                for row in connection.execute(
+                    """SELECT DISTINCT conversations.id FROM conversations
+                       LEFT JOIN tasks ON tasks.conversation_id=conversations.id
+                       LEFT JOIN calls ON calls.task_id=tasks.id
+                       WHERE conversations.status IN ('planning','running')
+                          OR calls.status='running'
+                       ORDER BY conversations.id"""
+                )
+            ]
+            for identifier in identifiers:
+                record = decode(connection, identifier)
+                tasks = [
+                    *record.archived_tasks,
+                    *([record.task] if record.task else []),
+                ]
+                running = [
+                    call
+                    for task in tasks
+                    for call in task.calls
+                    if call.status == "running"
+                ]
+                if (
+                    record.status == "planning"
+                    and not running
+                    and record.restore_turn_origin()
+                ):
+                    record.messages.append(
+                        ConversationMessage(
+                            role="assistant",
+                            content=(
+                                "服务在处理追问时重启；原任务状态已保留，请重新发送问题或续接任务。"
+                            ),
+                            created_at=_now(),
+                        )
+                    )
+                    self.save(record)
+                    continue
+                error = (
+                    "Service restarted; resume saved work without resubmitting "
+                    "a worker run."
+                )
+                for task in tasks:
+                    interrupted_nodes = set()
+                    for call in task.calls:
+                        if call.status == "running":
+                            call.status = "interrupted"
+                            call.error = error
+                            call.finished_at = _now()
+                            interrupted_nodes.add(call.node_id)
+                    for node in task.nodes:
+                        if node.status == "running" or node.id in interrupted_nodes:
+                            node.status = "interrupted"
+                            node.error = error
+                    if interrupted_nodes:
+                        task.stage = "interrupted"
+                record.status = "interrupted"
+                record.error = error
+                record.pending_decision = PendingDecision(
+                    kind=(
+                        "resume"
+                        if record.task and record.task.baseline.confirmed
+                        else "clarify"
+                    ),
+                    message=error,
+                )
+                self.save(record)
+
+    def export(self, conversation_id: str) -> bytes:
+        self.directory(conversation_id)
+        with self._read() as connection:
+            record = decode(connection, conversation_id)
+            tasks = {
+                task.id: task
+                for task in [
+                    *record.archived_tasks,
+                    *([record.task] if record.task else []),
+                ]
+            }
+            artifacts = [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT artifacts.* FROM artifacts JOIN tasks ON tasks.id=artifacts.task_id
+                       WHERE tasks.conversation_id=?
+                       ORDER BY artifacts.task_id, artifacts.slot, artifacts.position""",
+                    (conversation_id,),
+                )
+            ]
+            for row in artifacts:
+                task = tasks[str(row["task_id"])]
+                root = self.task_directory(record.id, task.id, task.output_root)
+                if str(root) != task.result_directory:
+                    raise ValueError(
+                        "Task result directory does not match its persisted identity"
+                    )
+                verify_evidence(
+                    root,
+                    OutputArtifact.model_validate_json(row["descriptor_json"]),
+                )
+            events = [
+                dict(row)
+                for row in connection.execute(
+                    """SELECT task_events.* FROM task_events
+                       JOIN tasks ON tasks.id=task_events.task_id
+                       WHERE tasks.conversation_id=? ORDER BY task_events.sequence""",
+                    (conversation_id,),
+                )
+            ]
+            payload = {
+                "schema_version": 1,
+                "conversation": record.model_dump(mode="json"),
+                "artifact_index": artifacts,
+                "task_events": events,
+            }
+            return (canonical(payload) + "\n").encode("utf-8")
 
     @staticmethod
     def _upsert(connection: sqlite3.Connection, table: str, row: Row) -> None:

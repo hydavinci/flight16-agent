@@ -354,3 +354,82 @@ def test_oversize_state_preserves_last_committed_record(tmp_path):
     with pytest.raises(ValueError, match="8 MB"):
         store.save(record)
     assert store.get(record.id) == before
+
+
+def test_restart_interrupts_running_calls_even_under_nonrunning_header(tmp_path):
+    from flight_agent.runtime.agent_contracts import InvocationSpec
+    from flight_agent.verification.contracts import ToolCall
+
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    task = record.task
+    task.nodes[0].status = "running"
+    call = ToolCall(
+        id="1" * 32,
+        node_id="compute",
+        tool="offline_rmse",
+        tool_version="1",
+        baseline_version=1,
+        started_at=now(),
+        inputs={"observed": [0, 2], "reference": [0, 0]},
+    )
+    task.calls.append(call)
+    task.pending_specs[call.id] = InvocationSpec(
+        capability="offline_rmse", capability_version="1", inputs=call.inputs
+    )
+    record.status = "failed"
+    store.save(record)
+    saved = SQLiteConversationStore(store.root).get(record.id)
+    assert saved.status == "interrupted"
+    assert saved.task.calls[0].status == "interrupted"
+    assert saved.task.calls[0].id == call.id
+    assert saved.task.calls[0].inputs == call.inputs
+    assert saved.task.pending_specs == task.pending_specs
+    assert saved.task.budget_state == task.budget_state
+    assert saved.task.nodes[0].status == "interrupted"
+    assert SQLiteConversationStore(store.root).get(record.id) == saved
+
+
+def test_planning_restart_restores_followup_origin_without_touching_baseline(tmp_path):
+    from flight_agent.verification.contracts import ConversationState
+
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    record.turn_origin = ConversationState(status="waiting_for_user")
+    record.status = "planning"
+    store.save(record)
+    saved = SQLiteConversationStore(store.root).get(record.id)
+    assert saved.status == "waiting_for_user"
+    assert saved.turn_origin is None
+    assert saved.task.baseline == record.task.baseline
+    assert saved.messages[-1].role == "assistant"
+    assert len(SQLiteConversationStore(store.root).get(record.id).messages) == 1
+
+
+def test_export_is_stable_complete_and_does_not_change_live_state(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    (directory / "metric.json").write_text('{"rmse":1}')
+    record.task.artifacts.append(
+        OutputArtifact(**describe_evidence(directory, "metric.json").model_dump())
+    )
+    store.save(record)
+    before = store.get(record.id)
+    first = store.export(record.id)
+    assert first == store.export(record.id)
+    assert first.endswith(b"\n")
+    payload = json.loads(first)
+    assert payload["schema_version"] == 1
+    assert payload["conversation"] == before.model_dump(mode="json")
+    assert payload["artifact_index"][0]["relative_path"] == "metric.json"
+    assert payload["task_events"][0]["kind"] == "state_transition"
+    assert store.get(record.id) == before
+    (directory / "metric.json").write_text('{"rmse":2}')
+    with pytest.raises(ValueError, match="integrity"):
+        store.export(record.id)
