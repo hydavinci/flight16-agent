@@ -83,6 +83,27 @@ class PreDispatchBudgetExhausted(BudgetExhausted):
     """The capability has verified that no external operation was submitted."""
 
 
+@dataclass
+class OperationReservation:
+    action: str
+    task_id: str
+    queue_origin: ConversationState
+    stamp: str
+    node_id: str
+    node_tool: str
+    call_id: str
+    spec: InvocationSpec
+    definition: CapabilityDefinition
+    scheduling: SchedulingMetadata
+    failure_status: str | None = None
+    failure_error: str | None = None
+
+
+@dataclass
+class RunState:
+    operation: OperationReservation | None = None
+
+
 @dataclass(frozen=True)
 class AgentContext:
     directory: Path
@@ -248,6 +269,7 @@ def build_context(
     locks: ConversationLockRegistry,
     action: str,
     queue_origin: ConversationState,
+    operation: OperationReservation,
 ) -> AgentContext:
     conversation_id = conversation.id
     task_id = task.id
@@ -268,6 +290,7 @@ def build_context(
             or current.status != "running"
             or current.queued_action != action
             or current.queue_origin != queue_origin
+            or current.updated_at != operation.stamp
             or current_task.stage != node_id
         ):
             raise ValueError("Checkpoint access is outside the admitted action")
@@ -353,6 +376,7 @@ def build_context(
             current_task.checkpoints[call_id] = name
             current_task.checkpoint_sha256[call_id] = descriptor.sha256
             store.save(current)
+            operation.stamp = current.updated_at
 
     resources = {resource.id: resource for resource in task.baseline.resources}
     roles = {
@@ -865,6 +889,7 @@ class AgentExecutor:
         *,
         action: str,
         task_id: str,
+        run_state: RunState,
     ) -> Conversation:
         conversation_id = conversation.id
         if conversation.queue_origin is None:
@@ -881,6 +906,7 @@ class AgentExecutor:
             spec: InvocationSpec | None = None
             definition: CapabilityDefinition | None = None
             scheduling: SchedulingMetadata | None = None
+            operation: OperationReservation | None = None
             try:
                 with self.locks.hold(conversation_id):
                     conversation = self.store.get(conversation_id)
@@ -998,6 +1024,19 @@ class AgentExecutor:
                         conversation.status = "running"
                         task.stage = node.id
                         self.store.save(conversation)
+                        operation = OperationReservation(
+                            action=action,
+                            task_id=task_id,
+                            queue_origin=queue_origin,
+                            stamp=conversation.updated_at,
+                            node_id=node.id,
+                            node_tool=node_tool,
+                            call_id=call.id,
+                            spec=spec,
+                            definition=definition,
+                            scheduling=scheduling,
+                        )
+                        run_state.operation = operation
                         context = build_context(
                             conversation,
                             task,
@@ -1006,19 +1045,13 @@ class AgentExecutor:
                             self._external_budget(
                                 conversation,
                                 task,
-                                action=action,
-                                queue_origin=queue_origin,
-                                node_id=node.id,
-                                node_tool=node_tool,
-                                call_id=call.id,
-                                spec=spec,
-                                definition=definition,
-                                scheduling=scheduling,
+                                operation=operation,
                             ),
                             store=self.store,
                             locks=self.locks,
                             action=action,
                             queue_origin=queue_origin,
+                            operation=operation,
                         )
                     output = self.tools.reconcile(
                         node_tool,
@@ -1036,15 +1069,7 @@ class AgentExecutor:
                         node, call = self._validate_call_reservation(
                             conversation,
                             task,
-                            action=action,
-                            task_id=task_id,
-                            queue_origin=queue_origin,
-                            node_id=node_id,
-                            node_tool=node_tool,
-                            call_id=call_id,
-                            spec=spec,
-                            definition=definition,
-                            scheduling=scheduling,
+                            operation=operation,
                         )
                         budget = self._budget(conversation, task)
                         if output is None:
@@ -1057,28 +1082,15 @@ class AgentExecutor:
                         self._accept(
                             conversation, task, node, call, run, budget
                         )
+                        run_state.operation = None
             except ReconciledFailure as exc:
-                if (
-                    node_id is None
-                    or node_tool is None
-                    or spec is None
-                    or definition is None
-                    or scheduling is None
-                ):
+                if operation is None:
                     raise ExecutionUncertain(
                         "Reconciliation identity was not reserved"
                     ) from exc
                 self._record_external_failure(
                     conversation_id,
-                    task_id,
-                    action,
-                    queue_origin,
-                    node_id,
-                    node_tool,
-                    call_id,
-                    spec,
-                    definition,
-                    scheduling,
+                    operation,
                     exc,
                     interrupted=False,
                 )
@@ -1103,28 +1115,16 @@ class AgentExecutor:
                         current_call is not None
                         and current_call.status == "completed"
                     ):
+                        if operation is not None:
+                            run_state.operation = None
                         raise
-                if (
-                    node_id is None
-                    or node_tool is None
-                    or spec is None
-                    or definition is None
-                    or scheduling is None
-                ):
+                if operation is None:
                     raise ExecutionUncertain(
                         "Reconciliation identity was not reserved"
                     ) from exc
                 self._record_external_failure(
                     conversation_id,
-                    task_id,
-                    action,
-                    queue_origin,
-                    node_id,
-                    node_tool,
-                    call_id,
-                    spec,
-                    definition,
-                    scheduling,
+                    operation,
                     exc,
                     interrupted=True,
                 )
@@ -1132,27 +1132,13 @@ class AgentExecutor:
                     f"Original invocation state remains unknown: {exc}"
                 ) from exc
             except (OSError, ValueError, RuntimeError) as exc:
-                if (
-                    node_id is None
-                    or node_tool is None
-                    or spec is None
-                    or definition is None
-                    or scheduling is None
-                ):
+                if operation is None:
                     raise ExecutionUncertain(
                         "Reconciliation identity was not reserved"
                     ) from exc
                 self._record_external_failure(
                     conversation_id,
-                    task_id,
-                    action,
-                    queue_origin,
-                    node_id,
-                    node_tool,
-                    call_id,
-                    spec,
-                    definition,
-                    scheduling,
+                    operation,
                     exc,
                     interrupted=True,
                 )
@@ -1189,17 +1175,10 @@ class AgentExecutor:
         conversation: Conversation,
         task: AgentTask,
         *,
-        action: str,
-        queue_origin: ConversationState,
-        node_id: str,
-        node_tool: str,
-        call_id: str,
-        spec: InvocationSpec,
-        definition: CapabilityDefinition,
-        scheduling: SchedulingMetadata,
+        operation: OperationReservation,
     ) -> BudgetAccount:
         conversation_id = conversation.id
-        task_id = task.id
+        task_id = operation.task_id
         last_state = task.budget_state.model_copy(deep=True)
 
         def checkpoint(state: BudgetState) -> None:
@@ -1214,15 +1193,7 @@ class AgentExecutor:
                 self._validate_call_reservation(
                     current,
                     current_task,
-                    action=action,
-                    task_id=task_id,
-                    queue_origin=queue_origin,
-                    node_id=node_id,
-                    node_tool=node_tool,
-                    call_id=call_id,
-                    spec=spec,
-                    definition=definition,
-                    scheduling=scheduling,
+                    operation=operation,
                 )
                 if current_task.budget_state != last_state:
                     raise ExecutionUncertain(
@@ -1231,6 +1202,7 @@ class AgentExecutor:
                 current_task.budget_state = state
                 task.budget_state = state
                 self.store.save(current)
+                operation.stamp = current.updated_at
                 last_state = state.model_copy(deep=True)
 
         return BudgetAccount(task.baseline.budget, task.budget_state, checkpoint)
@@ -1265,39 +1237,43 @@ class AgentExecutor:
         conversation: Conversation,
         task: AgentTask,
         *,
-        action: str,
-        task_id: str,
-        queue_origin: ConversationState,
-        node_id: str,
-        node_tool: str,
-        call_id: str,
-        spec: InvocationSpec,
-        definition: CapabilityDefinition,
-        scheduling: SchedulingMetadata,
+        operation: OperationReservation,
     ) -> tuple[AgentExecutionNode, ToolCall]:
         self._validate_action_reservation(
             conversation,
             task,
-            action=action,
-            task_id=task_id,
+            action=operation.action,
+            task_id=operation.task_id,
             statuses=("running",),
         )
         node = next(
-            (item for item in task.nodes if item.id == node_id), None
+            (
+                item
+                for item in task.nodes
+                if item.id == operation.node_id
+            ),
+            None,
         )
         call = next(
-            (item for item in task.calls if item.id == call_id), None
+            (
+                item
+                for item in task.calls
+                if item.id == operation.call_id
+            ),
+            None,
         )
         if (
-            conversation.queue_origin != queue_origin
+            conversation.queue_origin != operation.queue_origin
+            or conversation.updated_at != operation.stamp
             or node is None
             or call is None
-            or node.tool != node_tool
-            or call.node_id != node_id
+            or node.tool != operation.node_tool
+            or call.node_id != operation.node_id
             or call.status not in ("running", "interrupted")
-            or task.stage != node_id
-            or task.pending_specs.get(call_id) != spec
-            or self._spec(task, node, call) != spec
+            or task.stage != operation.node_id
+            or task.pending_specs.get(operation.call_id)
+            != operation.spec
+            or self._spec(task, node, call) != operation.spec
         ):
             raise ExecutionUncertain("Admitted call reservation changed")
         self._verify_saved(conversation, task)
@@ -1311,13 +1287,95 @@ class AgentExecutor:
                 "Admitted call dependencies changed"
             )
         if (
-            self.tools.definition(node_tool) != definition
-            or self.tools.scheduling(node_tool) != scheduling
+            self.tools.definition(operation.node_tool)
+            != operation.definition
+            or self.tools.scheduling(operation.node_tool)
+            != operation.scheduling
         ):
             raise ExecutionUncertain(
                 "Capability definition or scheduling lane changed"
             )
         return node, call
+
+    def _validate_recorded_failure(
+        self,
+        conversation: Conversation,
+        task: AgentTask,
+        operation: OperationReservation,
+    ) -> None:
+        self._validate_action_reservation(
+            conversation,
+            task,
+            action=operation.action,
+            task_id=operation.task_id,
+            statuses=("running",),
+        )
+        node = next(
+            (
+                item
+                for item in task.nodes
+                if item.id == operation.node_id
+            ),
+            None,
+        )
+        call = next(
+            (
+                item
+                for item in task.calls
+                if item.id == operation.call_id
+            ),
+            None,
+        )
+        if (
+            operation.failure_status not in ("failed", "interrupted")
+            or operation.failure_error is None
+            or conversation.queue_origin != operation.queue_origin
+            or conversation.updated_at != operation.stamp
+            or node is None
+            or call is None
+            or node.tool != operation.node_tool
+            or call.node_id != operation.node_id
+            or call.status != operation.failure_status
+            or node.status != operation.failure_status
+            or call.error != operation.failure_error
+            or node.error != operation.failure_error
+            or task.stage != operation.node_id
+            or self._spec(task, node, call) != operation.spec
+        ):
+            raise ExecutionUncertain(
+                "Recorded external failure reservation changed"
+            )
+        if operation.failure_status == "interrupted":
+            if (
+                task.pending_specs.get(operation.call_id)
+                != operation.spec
+            ):
+                raise ExecutionUncertain(
+                    "Interrupted invocation specification changed"
+                )
+        elif operation.call_id in task.pending_specs:
+            raise ExecutionUncertain(
+                "Failed invocation retained a pending specification"
+            )
+        self._verify_saved(conversation, task)
+        self._live_node(task, node)
+        if not set(node.depends_on) <= {
+            item.id
+            for item in task.nodes
+            if item.status == "completed"
+        }:
+            raise ExecutionUncertain(
+                "Recorded failure dependencies changed"
+            )
+        if (
+            self.tools.definition(operation.node_tool)
+            != operation.definition
+            or self.tools.scheduling(operation.node_tool)
+            != operation.scheduling
+        ):
+            raise ExecutionUncertain(
+                "Recorded failure capability reservation changed"
+            )
 
     def _dispatch(
         self,
@@ -1328,6 +1386,7 @@ class AgentExecutor:
         *,
         action: str,
         task_id: str,
+        run_state: RunState,
     ) -> Conversation:
         conversation_id = conversation.id
         node_id = node.id
@@ -1436,6 +1495,19 @@ class AgentExecutor:
                             self._finish(conversation, task)
                             self.store.save(conversation)
                         return conversation
+                    operation = OperationReservation(
+                        action=action,
+                        task_id=task_id,
+                        queue_origin=queue_origin,
+                        stamp=conversation.updated_at,
+                        node_id=node.id,
+                        node_tool=node_tool,
+                        call_id=call.id,
+                        spec=spec,
+                        definition=definition,
+                        scheduling=scheduling,
+                    )
+                    run_state.operation = operation
                     context = build_context(
                         conversation,
                         task,
@@ -1444,19 +1516,13 @@ class AgentExecutor:
                         self._external_budget(
                             conversation,
                             task,
-                            action=action,
-                            queue_origin=queue_origin,
-                            node_id=node.id,
-                            node_tool=node_tool,
-                            call_id=call.id,
-                            spec=spec,
-                            definition=definition,
-                            scheduling=scheduling,
+                            operation=operation,
                         ),
                         store=self.store,
                         locks=self.locks,
                         action=action,
                         queue_origin=queue_origin,
+                        operation=operation,
                     )
                     call_id = call.id
                 try:
@@ -1466,15 +1532,7 @@ class AgentExecutor:
                 except ExecutionUncertain as exc:
                     self._record_external_failure(
                         conversation_id,
-                        task_id,
-                        action,
-                        queue_origin,
-                        node_id,
-                        node_tool,
-                        call_id,
-                        spec,
-                        definition,
-                        scheduling,
+                        operation,
                         exc,
                         interrupted=True,
                     )
@@ -1485,15 +1543,7 @@ class AgentExecutor:
                     )
                     self._record_external_failure(
                         conversation_id,
-                        task_id,
-                        action,
-                        queue_origin,
-                        node_id,
-                        node_tool,
-                        call_id,
-                        spec,
-                        definition,
-                        scheduling,
+                        operation,
                         exc,
                         interrupted=not pre_dispatch,
                     )
@@ -1505,15 +1555,7 @@ class AgentExecutor:
                 except (OSError, ValueError, RuntimeError) as exc:
                     self._record_external_failure(
                         conversation_id,
-                        task_id,
-                        action,
-                        queue_origin,
-                        node_id,
-                        node_tool,
-                        call_id,
-                        spec,
-                        definition,
-                        scheduling,
+                        operation,
                         exc,
                         interrupted=False,
                     )
@@ -1524,15 +1566,7 @@ class AgentExecutor:
                     node, call = self._validate_call_reservation(
                         conversation,
                         task,
-                        action=action,
-                        task_id=task_id,
-                        queue_origin=queue_origin,
-                        node_id=node_id,
-                        node_tool=node_tool,
-                        call_id=call_id,
-                        spec=spec,
-                        definition=definition,
-                        scheduling=scheduling,
+                        operation=operation,
                     )
                     if call.status != "running":
                         raise ExecutionUncertain(
@@ -1550,19 +1584,36 @@ class AgentExecutor:
                         self._accept(
                             conversation, task, node, call, run, budget
                         )
+                        run_state.operation = None
                     except BudgetExhausted as exc:
+                        node = next(
+                            item for item in task.nodes if item.id == node_id
+                        )
+                        call = next(
+                            item for item in task.calls if item.id == call_id
+                        )
                         if call.status == "completed":
+                            run_state.operation = None
                             raise
                         call.status = "interrupted"
                         call.error = str(exc)[:4000]
                         node.status = "interrupted"
                         node.error = call.error
                         self.store.save(conversation)
+                        operation.stamp = conversation.updated_at
+                        operation.failure_status = call.status
+                        operation.failure_error = call.error
                         raise ExecutionUncertain(
                             "Original receipt publication or acceptance "
                             f"is uncertain: {exc}"
                         ) from exc
                     except (OSError, ValueError, RuntimeError) as exc:
+                        node = next(
+                            item for item in task.nodes if item.id == node_id
+                        )
+                        call = next(
+                            item for item in task.calls if item.id == call_id
+                        )
                         if publishing:
                             call.status = "interrupted"
                             call.error = str(exc)[:4000]
@@ -1576,6 +1627,9 @@ class AgentExecutor:
                                 if run.id != call.id
                             ]
                             self.store.save(conversation)
+                            operation.stamp = conversation.updated_at
+                            operation.failure_status = call.status
+                            operation.failure_error = call.error
                             raise ExecutionUncertain(
                                 "Original receipt publication or acceptance "
                                 f"is uncertain: {exc}"
@@ -1587,6 +1641,9 @@ class AgentExecutor:
                         node.error = call.error
                         task.pending_specs.pop(call.id, None)
                         self.store.save(conversation)
+                        operation.stamp = conversation.updated_at
+                        operation.failure_status = call.status
+                        operation.failure_error = call.error
                         raise
                     if all(
                         item.status == "completed" for item in task.nodes
@@ -1617,15 +1674,7 @@ class AgentExecutor:
     def _record_external_failure(
         self,
         conversation_id: str,
-        task_id: str,
-        action: str,
-        queue_origin: ConversationState,
-        node_id: str,
-        node_tool: str,
-        call_id: str,
-        spec: InvocationSpec,
-        definition: CapabilityDefinition,
-        scheduling: SchedulingMetadata,
+        operation: OperationReservation,
         error: BaseException,
         *,
         interrupted: bool,
@@ -1641,15 +1690,7 @@ class AgentExecutor:
                 node, call = self._validate_call_reservation(
                     conversation,
                     task,
-                    action=action,
-                    task_id=task_id,
-                    queue_origin=queue_origin,
-                    node_id=node_id,
-                    node_tool=node_tool,
-                    call_id=call_id,
-                    spec=spec,
-                    definition=definition,
-                    scheduling=scheduling,
+                    operation=operation,
                 )
             except ExecutionUncertain as stale:
                 raise stale from error
@@ -1661,6 +1702,9 @@ class AgentExecutor:
                 call.finished_at = now()
                 task.pending_specs.pop(call.id, None)
             self.store.save(conversation)
+            operation.stamp = conversation.updated_at
+            operation.failure_status = call.status
+            operation.failure_error = call.error
 
     @staticmethod
     def _result(task: AgentTask, status: str) -> TaskResult:
@@ -1715,6 +1759,7 @@ class AgentExecutor:
     ) -> Conversation:
         verified = False
         reservation_origin: ConversationState | None = None
+        run_state = RunState()
         try:
             with self.locks.hold(conversation_id):
                 conversation = self.store.get(conversation_id)
@@ -1749,6 +1794,7 @@ class AgentExecutor:
                 budget,
                 action=action,
                 task_id=task_id,
+                run_state=run_state,
             )
             with self.locks.hold(conversation_id):
                 conversation = self.store.get(conversation_id)
@@ -1866,6 +1912,7 @@ class AgentExecutor:
                     budget,
                     action=action,
                     task_id=task_id,
+                    run_state=run_state,
                 )
 
             run_loop(
@@ -1911,6 +1958,23 @@ class AgentExecutor:
                     or conversation.queue_origin != reservation_origin
                 ):
                     return conversation
+                operation = run_state.operation
+                if operation is not None:
+                    try:
+                        if operation.failure_status is None:
+                            self._validate_call_reservation(
+                                conversation,
+                                failed_task,
+                                operation=operation,
+                            )
+                        else:
+                            self._validate_recorded_failure(
+                                conversation,
+                                failed_task,
+                                operation,
+                            )
+                    except (OSError, ValueError, RuntimeError):
+                        return conversation
                 uncertain = isinstance(exc, ExecutionUncertain)
                 conversation.status = (
                     "interrupted" if uncertain else "failed"

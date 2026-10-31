@@ -7,7 +7,7 @@ import pytest
 
 from flight_agent.runtime.observations import CapabilityOutcome
 from flight_agent.verification.agent_planner import AgentDecision
-from flight_agent.verification.contracts import ConversationState, PendingDecision
+from flight_agent.verification.contracts import PendingDecision
 from flight_agent.verification.coordinator import ConversationActive
 from tests.agent_helpers import analysis_plan_data
 from tests.scheduling_helpers import make_runtime, propose_fake
@@ -313,23 +313,33 @@ def test_stale_capability_result_cannot_overwrite_newer_record(tmp_path):
         assert entered.wait(5)
         with runtime.locks.hold(pending.id):
             newer = runtime.store.get(pending.id)
-            call = newer.task.calls[0].model_copy(deep=True)
             budget = newer.task.budget_state.model_copy(deep=True)
+            pending_specs = newer.task.pending_specs.copy()
             newer.error = "newer capability state"
-            newer.queue_origin = ConversationState(
-                status="waiting_for_user",
-                pending_decision=None,
-                error="newer capability state",
+            newer.pending_decision = PendingDecision(
+                kind="clarify", message="Newer capability follow-up"
             )
+            newer.task.calls[0].error = "newer call state"
+            newer.task.nodes[0].error = "newer node state"
+            stage = newer.task.stage
             runtime.store.save(newer)
+            call = newer.task.calls[0].model_copy(deep=True)
+            node = newer.task.nodes[0].model_copy(deep=True)
         release.set()
         result = future.result(timeout=5)
     saved = runtime.store.get(pending.id)
+    assert result.status == saved.status == "running"
+    assert saved.queued_action == "confirm"
     assert result.error == saved.error == "newer capability state"
+    assert saved.pending_decision.message == "Newer capability follow-up"
     assert saved.task.calls[0] == call
+    assert saved.task.nodes[0] == node
+    assert saved.task.stage == stage
     assert saved.task.budget_state == budget
+    assert saved.task.pending_specs == pending_specs
     assert saved.task.analysis_runs == []
     assert saved.task.outputs == {}
+    assert saved.task.result is None
 
 
 def test_stale_capability_exception_cannot_apply_failure_or_budget(tmp_path):
@@ -350,22 +360,33 @@ def test_stale_capability_exception_cannot_apply_failure_or_budget(tmp_path):
         assert entered.wait(5)
         with runtime.locks.hold(pending.id):
             newer = runtime.store.get(pending.id)
-            call = newer.task.calls[0].model_copy(deep=True)
             budget = newer.task.budget_state.model_copy(deep=True)
+            pending_specs = newer.task.pending_specs.copy()
             newer.error = "newer capability state"
-            newer.queue_origin = ConversationState(
-                status="waiting_for_user",
-                pending_decision=None,
-                error="newer capability state",
+            newer.pending_decision = PendingDecision(
+                kind="clarify", message="Newer capability follow-up"
             )
+            newer.task.calls[0].error = "newer call state"
+            newer.task.nodes[0].error = "newer node state"
+            stage = newer.task.stage
             runtime.store.save(newer)
+            call = newer.task.calls[0].model_copy(deep=True)
+            node = newer.task.nodes[0].model_copy(deep=True)
         release.set()
         result = future.result(timeout=5)
     saved = runtime.store.get(pending.id)
+    assert result.status == saved.status == "running"
+    assert saved.queued_action == "confirm"
     assert result.error == saved.error == "newer capability state"
+    assert saved.pending_decision.message == "Newer capability follow-up"
     assert saved.task.calls[0] == call
+    assert saved.task.nodes[0] == node
+    assert saved.task.stage == stage
     assert saved.task.budget_state == budget
+    assert saved.task.pending_specs == pending_specs
     assert saved.task.analysis_runs == []
+    assert saved.task.outputs == {}
+    assert saved.task.result is None
 
 
 @pytest.mark.parametrize("kind", ["clarify", "capability_gap"])

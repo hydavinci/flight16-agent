@@ -484,9 +484,13 @@ def test_tool_declaration_is_rechecked_before_each_dispatch(tmp_path):
     )
     data["budget"]["max_no_progress"] = 3
     done = confirm(runtime, propose(runtime, conversation, data))
-    assert done.status == "failed"
-    assert "snapshot" in done.error or "declaration" in done.error
+    assert done.status == "running"
+    assert done.error is None
+    assert done.queued_action == "confirm"
     assert len(done.task.calls) == 1
+    assert done.task.calls[0].status == "running"
+    assert done.task.analysis_runs == []
+    assert done.task.outputs == {}
     assert calls == []
 
 
@@ -516,8 +520,19 @@ def test_dependency_receipts_are_reverified_before_exposing_the_next_context(tmp
     )
     pending = propose(runtime, conversation, data)
     done = confirm(runtime, pending)
-    assert done.status == "failed"
+    assert done.status == "running"
+    assert done.error is None
+    assert done.queued_action == "confirm"
     assert calls == ["compute", "unrelated"]
+    assert [call.status for call in done.task.calls] == [
+        "completed",
+        "running",
+    ]
+    assert [node.status for node in done.task.nodes] == [
+        "completed",
+        "running",
+        "pending",
+    ]
 
 
 def test_evaluation_cannot_replace_the_confirmed_threshold(tmp_path):

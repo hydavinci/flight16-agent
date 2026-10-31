@@ -9,7 +9,7 @@ from flight_agent.runtime.agent_contracts import AgentPlan
 from flight_agent.runtime.capabilities import CapabilityRegistry
 from flight_agent.runtime.evidence import agent_receipt_name
 from flight_agent.runtime.scheduling_contracts import SchedulingMetadata
-from flight_agent.verification.contracts import ConversationState
+from flight_agent.verification.contracts import ConversationState, PendingDecision
 from flight_agent.verification.store import ConversationStore
 from tests.agent_helpers import analysis_plan_data, register_rmse
 from tests.test_agent_runtime import confirm, propose, runtime_module, setup
@@ -386,7 +386,57 @@ def test_reconciliation_rejects_state_changed_during_callback(
     if mutation == "origin":
         assert result.error == saved.error == "newer reconciliation state"
     else:
-        assert result.status == "interrupted"
+        assert result.status == saved.status == "running"
+        assert result.queued_action == saved.queued_action == "resume"
+        assert saved.task.stage == call.node_id
+
+
+def test_stale_reconciliation_exception_cannot_apply_failure_cleanup(
+    tmp_path,
+):
+    entered, release = Event(), Event()
+
+    def reconcile(context, inputs):
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError("Stale reconciliation failure")
+
+    recovery, identifier, calls = reconciliation_case(tmp_path, reconcile)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(recovery.resume, identifier)
+        assert entered.wait(5)
+        with recovery.locks.hold(identifier):
+            newer = recovery.store.get(identifier)
+            budget = newer.task.budget_state.model_copy(deep=True)
+            outputs = newer.task.outputs.copy()
+            runs = list(newer.task.analysis_runs)
+            pending_specs = newer.task.pending_specs.copy()
+            newer.error = "newer reconciliation state"
+            newer.pending_decision = PendingDecision(
+                kind="clarify", message="Newer reconciliation follow-up"
+            )
+            newer.task.calls[0].error = "newer call state"
+            newer.task.nodes[0].error = "newer node state"
+            stage = newer.task.stage
+            recovery.store.save(newer)
+            call = newer.task.calls[0].model_copy(deep=True)
+            node = newer.task.nodes[0].model_copy(deep=True)
+        release.set()
+        result = future.result(timeout=5)
+    saved = recovery.store.get(identifier)
+    assert result.status == saved.status == "running"
+    assert saved.queued_action == "resume"
+    assert result.error == saved.error == "newer reconciliation state"
+    assert saved.pending_decision.message == "Newer reconciliation follow-up"
+    assert saved.task.calls[0] == call
+    assert saved.task.nodes[0] == node
+    assert saved.task.stage == stage
+    assert saved.task.budget_state == budget
+    assert saved.task.outputs == outputs
+    assert saved.task.analysis_runs == runs
+    assert saved.task.pending_specs == pending_specs
+    assert saved.task.result is None
+    assert calls == [call.id]
 
 
 def test_receipt_publication_error_stays_unknown_until_original_id_is_reconciled(
