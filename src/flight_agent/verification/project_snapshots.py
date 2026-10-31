@@ -303,21 +303,40 @@ def _copy_inventory(
     _verify_tree(destination, manifest, readonly=False)
 
 
+def _seal_inventory(directory: Path) -> tuple[list[Path], list[Path]]:
+    files: list[Path] = []
+    directories: list[Path] = []
+
+    def collect(root: Path) -> None:
+        if not stat.S_ISDIR(_managed_lstat(root).st_mode):
+            raise ValueError("Snapshot seal encountered a special directory")
+        with os.scandir(root) as entries:
+            for entry in entries:
+                child = root / entry.name
+                info = _managed_lstat(child)
+                if stat.S_ISDIR(info.st_mode):
+                    collect(child)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                    files.append(child)
+                else:
+                    raise ValueError(
+                        "Snapshot seal encountered a special or linked file"
+                    )
+        directories.append(root)
+
+    collect(directory)
+    return files, directories
+
+
 def _seal(directory: Path) -> None:
-    _directory_identity(directory)
-    for current, directories, names in os.walk(directory, topdown=False):
-        root = Path(current)
-        for name in names:
-            child = root / name
-            info = _managed_lstat(child)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise ValueError("Snapshot seal encountered a special or linked file")
-            child.chmod(0o444)
-            _sync_regular_file(child)
-        for name in directories:
-            child = root / name
-            if not stat.S_ISDIR(_managed_lstat(child).st_mode):
-                raise ValueError("Snapshot seal encountered a special directory")
+    files, directories = _seal_inventory(directory)
+    for child in files:
+        info = _managed_lstat(child)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("Snapshot seal encountered a special or linked file")
+        child.chmod(0o444)
+        _sync_regular_file(child)
+    for root in directories:
         if not stat.S_ISDIR(_managed_lstat(root).st_mode):
             raise ValueError("Snapshot seal encountered a special directory")
         root.chmod(0o555)

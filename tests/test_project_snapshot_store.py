@@ -1,5 +1,6 @@
 import os
 import shutil
+import stat
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -101,6 +102,36 @@ def test_seal_rejects_reparse_top_before_directory_walk(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="reparse"):
         module._seal(directory)
     assert not walked
+
+
+def test_seal_validates_nested_reparse_before_touching_children(tmp_path, monkeypatch):
+    from flight_agent.verification import project_snapshots as module
+
+    directory = tmp_path / "object"
+    nested = directory / "nested"
+    nested.mkdir(parents=True)
+    marker = nested / "external-marker.txt"
+    marker.write_bytes(b"external")
+    original_mode = stat.S_IMODE(marker.stat().st_mode)
+    original_lstat = Path.lstat
+    original_sync = module._sync_regular_file
+    synced = []
+
+    def reparse_lstat(path):
+        info = original_lstat(path)
+        return ReparseStat(info) if path == nested else info
+
+    def record_sync(path):
+        synced.append(Path(path))
+        original_sync(path)
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    monkeypatch.setattr(module, "_sync_regular_file", record_sync)
+    with pytest.raises(ValueError, match="reparse"):
+        module._seal(directory)
+    assert synced == []
+    assert marker.read_bytes() == b"external"
+    assert stat.S_IMODE(marker.stat().st_mode) == original_mode
 
 
 @pytest.mark.parametrize("boundary", ["root", "objects", "staging", "locks"])
@@ -216,6 +247,36 @@ def test_windows_junction_is_rejected_without_touching_external(tmp_path):
             store.verify(binding)
         assert marker.read_bytes() == b"external"
     finally:
+        os.rmdir(junction)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows junction support")
+def test_windows_junction_is_rejected_before_sealing_external_children(tmp_path):
+    from flight_agent.verification import project_snapshots as module
+
+    directory = tmp_path / "object"
+    directory.mkdir()
+    junction = directory / "nested"
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "keep.txt"
+    marker.write_bytes(b"external")
+    original_mode = stat.S_IMODE(marker.stat().st_mode)
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {result.stderr}")
+    try:
+        with pytest.raises(ValueError, match="reparse"):
+            module._seal(directory)
+        assert marker.read_bytes() == b"external"
+        assert stat.S_IMODE(marker.stat().st_mode) == original_mode
+    finally:
+        marker.chmod(0o600)
         os.rmdir(junction)
 
 
