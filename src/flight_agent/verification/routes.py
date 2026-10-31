@@ -134,7 +134,13 @@ class ConversationManager:
             self._draining = False
             self._close_condition.notify_all()
 
-    def _fail(self, conversation_id: str, error: Exception) -> None:
+    def _fail(
+        self,
+        conversation_id: str,
+        error: Exception,
+        *,
+        restore_unstarted: bool = True,
+    ) -> None:
         logger.exception("Conversation %s failed", conversation_id)
         with self.runtime.locks.hold(conversation_id):
             record = self.runtime.store.get(conversation_id)
@@ -169,9 +175,14 @@ class ConversationManager:
                     unresolved=unresolved,
                 )
             else:
-                restored = record.restore_turn_origin()
+                may_restore = (
+                    restore_unstarted
+                    or action not in ("confirm", "resume", "retry")
+                )
+                restored = record.restore_turn_origin() if may_restore else False
                 if (
-                    not restored
+                    may_restore
+                    and not restored
                     and origin is not None
                     and (action != "message" or len(record.messages) > 1)
                 ):
@@ -212,7 +223,7 @@ class ConversationManager:
                     state,
                 )
             except Exception as exc:
-                self._fail(conversation_id, exc)
+                self._fail(conversation_id, exc, restore_unstarted=False)
 
     def _schedule(
         self,

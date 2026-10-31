@@ -11,6 +11,7 @@ from flight_agent.verification.agent_planner import AgentDecision
 from flight_agent.verification.contracts import PendingDecision
 from flight_agent.verification.coordinator import ConversationActive
 from flight_agent.verification.routes import (
+    ConfirmationRequest,
     ConversationManager,
     MessageRequest,
 )
@@ -353,6 +354,36 @@ def test_manager_failure_fallback_checks_archived_unresolved_calls(tmp_path):
     assert saved.pending_decision.kind == "clarify"
     assert "reconcil" in saved.pending_decision.message.lower()
     assert saved.task is None
+
+
+def test_started_confirm_validation_failure_is_durable(tmp_path):
+    runtime = make_runtime(
+        tmp_path, None, lambda context, inputs: CapabilityOutcome()
+    )
+    pending = propose_fake(runtime)
+
+    def reject(resources):
+        raise ValueError("Resource changed before confirmation")
+
+    runtime.resources.verify = reject
+    manager = conversation_manager(runtime)
+    try:
+        queued = manager.decide(
+            pending.id,
+            "confirm",
+            ConfirmationRequest(version=1, trusted=True),
+        )
+        assert queued.status == "queued"
+    finally:
+        manager.close()
+    saved = runtime.store.get(pending.id)
+
+    assert saved.status == "failed"
+    assert saved.error == "Resource changed before confirmation"
+    assert saved.task.baseline.confirmed is False
+    assert saved.task.calls == []
+    assert saved.queued_action is None
+    assert saved.queue_origin is None
 
 
 def test_planner_failure_is_one_atomic_coherent_transition(

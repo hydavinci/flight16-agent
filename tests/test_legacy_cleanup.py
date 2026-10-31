@@ -470,6 +470,7 @@ def test_cleanup_preserves_sqlite_owned_external_result_and_deletes_unrelated_v1
     legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
     unrelated = write_record(store.root / ("b" * 32), {"task": {"scenario": "d2"}})
     record.output_root = str(legacy.parent / "output")
+    store.save(record)
     data = analysis_plan_data()
     data["allowed_effects"].append("write_delivery")
     done = confirm(executor, propose(executor, record, data))
