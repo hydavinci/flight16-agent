@@ -1,4 +1,5 @@
 import hashlib
+import json
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -171,19 +172,45 @@ class SQLiteConversationStore:
                 *([record.task] if record.task else []),
             ]
         }
-        for row in rows["artifacts"]:
-            task = tasks[str(row["task_id"])]
-            previous = connection.execute(
-                "SELECT * FROM artifacts WHERE task_id=? AND slot=? AND position=?",
-                (row["task_id"], row["slot"], row["position"]),
-            ).fetchone()
-            if previous is not None and dict(previous) == row:
-                continue
+        for task in tasks.values():
             directory = self.task_directory(record.id, task.id, task.output_root)
             if str(directory) != task.result_directory:
                 raise ValueError(
                     "Task result directory does not match its persisted identity"
                 )
+            previous_task = connection.execute(
+                "SELECT conversation_id, state_json FROM tasks WHERE id=?", (task.id,)
+            ).fetchone()
+            if previous_task is None:
+                continue
+            if previous_task["conversation_id"] != record.id:
+                raise ValueError("Stored ledger identity belongs to another owner")
+            previous_state = json.loads(previous_task["state_json"])
+            if (
+                previous_state["result_directory"] != task.result_directory
+                or previous_state["output_root"] != task.output_root
+            ):
+                raise ValueError("Task result directory identity is immutable")
+        for row in rows["artifacts"]:
+            task = tasks[str(row["task_id"])]
+            if row["slot"] in ("receipt", "checkpoint"):
+                previous = connection.execute(
+                    "SELECT * FROM artifacts WHERE task_id=? AND slot=? AND call_id=?",
+                    (row["task_id"], row["slot"], row["call_id"]),
+                ).fetchone()
+            else:
+                previous = connection.execute(
+                    "SELECT * FROM artifacts WHERE task_id=? AND slot=? AND position=?",
+                    (row["task_id"], row["slot"], row["position"]),
+                ).fetchone()
+            if previous is not None and dict(previous) == row:
+                continue
+            if previous is not None and row["slot"] in ("receipt", "checkpoint"):
+                stable = dict(previous)
+                stable["position"] = row["position"]
+                if stable == row:
+                    continue
+            directory = self.task_directory(record.id, task.id, task.output_root)
             verify_evidence(
                 directory,
                 OutputArtifact.model_validate_json(str(row["descriptor_json"])),
@@ -258,7 +285,6 @@ class SQLiteConversationStore:
                 )
             ]
             rows = encode(validated, previous_artifacts)
-            self._check_artifacts(connection, validated, rows)
             old_messages = [
                 dict(row)
                 for row in connection.execute(
@@ -289,6 +315,47 @@ class SQLiteConversationStore:
                 row["id"] for row in rows["calls"]
             }:
                 raise ValueError("Recorded calls cannot be dropped")
+            new_calls = {row["id"]: row for row in rows["calls"]}
+            immutable_call_fields = (
+                "task_id",
+                "position",
+                "node_id",
+                "capability",
+                "capability_version",
+                "baseline_version",
+                "inputs_json",
+                "spec_json",
+                "started_at",
+            )
+            for old_call in old_calls:
+                new_call = new_calls[old_call["id"]]
+                if (
+                    new_call["status"] == "failed"
+                    and new_call["spec_json"] == "null"
+                    and old_call["spec_json"] != "null"
+                ):
+                    new_call["spec_json"] = old_call["spec_json"]
+                if any(
+                    old_call[field] != new_call[field]
+                    for field in immutable_call_fields
+                ):
+                    raise ValueError("Recorded call identity fields are immutable")
+                if (
+                    old_call["status"] in ("completed", "failed")
+                    and old_call != new_call
+                ):
+                    raise ValueError("Terminal call records are immutable")
+            old_artifact_keys = {
+                (row["task_id"], row["slot"], row["position"])
+                for row in previous_artifacts
+            }
+            new_artifact_keys = {
+                (row["task_id"], row["slot"], row["position"])
+                for row in rows["artifacts"]
+            }
+            if not old_artifact_keys <= new_artifact_keys:
+                raise ValueError("Persisted artifact evidence cannot be dropped")
+            self._check_artifacts(connection, validated, rows)
             for row in rows["tasks"]:
                 previous = old_tasks.get(str(row["id"]))
                 if previous is not None:

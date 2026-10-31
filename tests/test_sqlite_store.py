@@ -1,13 +1,21 @@
+import hashlib
 import json
 import sqlite3
 
 import pytest
 
-from flight_agent.runtime.evidence import describe_evidence
+from flight_agent.runtime.evidence import describe_evidence, persist_agent_run
 from flight_agent.runtime.observations import OutputArtifact
-from flight_agent.verification.contracts import ConversationMessage, PendingDecision
+from flight_agent.verification.agent_runtime import accept_verified_run
+from flight_agent.verification.contracts import (
+    ConversationMessage,
+    PendingDecision,
+    ToolCall,
+)
+from flight_agent.verification.sqlite_codec import encode
 from flight_agent.verification.sqlite_store import SQLiteConversationStore
 from flight_agent.verification.store import now
+from tests.test_agent_evidence import run as invocation_run
 from tests.test_agent_history import agent_task
 
 
@@ -54,6 +62,25 @@ def test_transaction_rolls_back_message_and_state_and_event_together(tmp_path):
     assert store.get(record.id) == before
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM task_events").fetchone()[0] == event_count
+
+
+def test_nested_savepoint_rollback_preserves_outer_transaction(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    with store.transaction():
+        record.messages.append(
+            ConversationMessage(role="user", content="outer", created_at=now())
+        )
+        store.save(record)
+        with pytest.raises(RuntimeError, match="nested failure"):
+            with store.transaction():
+                record.messages.append(
+                    ConversationMessage(role="user", content="inner", created_at=now())
+                )
+                store.save(record)
+                raise RuntimeError("nested failure")
+        assert [message.content for message in store.get(record.id).messages] == ["outer"]
+    assert [message.content for message in store.get(record.id).messages] == ["outer"]
 
 
 @pytest.mark.parametrize("damage", ["missing", "digest"])
@@ -103,6 +130,205 @@ def test_artifact_index_is_metadata_and_task_events_are_append_only(tmp_path):
         assert connection.execute("SELECT count(*) FROM task_events").fetchone()[0] == 1
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             connection.execute("DELETE FROM task_events")
+
+
+def test_completed_call_rejects_stale_regression_and_preserves_receipt(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    run = invocation_run()
+    call = ToolCall(
+        id=run.id,
+        node_id="compute",
+        tool=run.spec.capability,
+        tool_version=run.spec.capability_version,
+        baseline_version=record.task.baseline.version,
+        status="running",
+        inputs=run.spec.inputs,
+        started_at=run.started_at,
+    )
+    record.task.calls.append(call)
+    record.task.pending_specs[call.id] = run.spec
+    record.task.nodes[0].status = "running"
+    store.save(record)
+    stale = store.get(record.id)
+    current = store.get(record.id)
+    persist_agent_run(directory, run)
+    accept_verified_run(current.task, current.task.nodes[0], current.task.calls[0], run)
+    store.save(current)
+
+    with pytest.raises(ValueError, match="terminal|immutable"):
+        store.save(stale)
+
+    saved = store.get(record.id)
+    assert saved.task.calls[0].status == "completed"
+    assert saved.task.analysis_runs == [run]
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT status, receipt_json FROM calls WHERE id=?", (run.id,)
+        ).fetchone()
+        assert row[0] == "completed"
+        assert json.loads(row[1]) == run.model_dump(mode="json")
+
+
+def test_recorded_call_identity_fields_are_immutable(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    run = invocation_run()
+    record.task.calls.append(
+        ToolCall(
+            id=run.id,
+            node_id="compute",
+            tool=run.spec.capability,
+            tool_version=run.spec.capability_version,
+            baseline_version=record.task.baseline.version,
+            status="running",
+            inputs=run.spec.inputs,
+            started_at=run.started_at,
+        )
+    )
+    record.task.pending_specs[run.id] = run.spec
+    store.save(record)
+    changed = store.get(record.id)
+    changed.task.calls[0].inputs = {"observed": [9.0], "reference": [0.0]}
+
+    with pytest.raises(ValueError, match="immutable"):
+        store.save(changed)
+
+    assert store.get(record.id).task.calls[0].inputs == run.spec.inputs
+
+
+def test_failed_call_retains_immutable_spec_after_pending_state_is_cleared(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    run = invocation_run()
+    record.task.calls.append(
+        ToolCall(
+            id=run.id,
+            node_id="compute",
+            tool=run.spec.capability,
+            tool_version=run.spec.capability_version,
+            baseline_version=record.task.baseline.version,
+            status="running",
+            inputs=run.spec.inputs,
+            started_at=run.started_at,
+        )
+    )
+    record.task.pending_specs[run.id] = run.spec
+    store.save(record)
+    failed = store.get(record.id)
+    failed.task.calls[0].status = "failed"
+    failed.task.calls[0].error = "controlled failure"
+    failed.task.calls[0].finished_at = now()
+    failed.task.nodes[0].status = "failed"
+    failed.task.pending_specs.pop(run.id)
+
+    store.save(failed)
+
+    assert store.get(record.id).task.pending_specs == {}
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            "SELECT status, spec_pending, spec_json FROM calls WHERE id=?", (run.id,)
+        ).fetchone()
+        assert row[:2] == ("failed", 0)
+        assert json.loads(row[2]) == run.spec.model_dump(mode="json")
+
+
+def test_removing_persisted_artifact_is_rejected_atomically(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    path = directory / "metric.json"
+    path.write_text('{"rmse":1}')
+    record.task.artifacts.append(
+        OutputArtifact(**describe_evidence(directory, "metric.json").model_dump())
+    )
+    store.save(record)
+    before = store.get(record.id)
+    changed = store.get(record.id)
+    changed.task.artifacts.clear()
+
+    with pytest.raises(ValueError, match="artifact|evidence"):
+        store.save(changed)
+
+    assert store.get(record.id) == before
+
+
+def test_checkpoint_order_does_not_reverify_accepted_damaged_evidence(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    for call_id in ("2" * 32, "1" * 32):
+        path = directory / f"{call_id}.json"
+        path.write_text(f'{{"call":"{call_id}"}}')
+        record.task.calls.append(
+            ToolCall(
+                id=call_id,
+                node_id="compute",
+                tool="offline_rmse",
+                tool_version="1",
+                baseline_version=1,
+                started_at=now(),
+            )
+        )
+        record.task.checkpoints[call_id] = path.name
+        record.task.checkpoint_sha256[call_id] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    store.save(record)
+    reloaded = store.get(record.id)
+    for path in directory.glob("*.json"):
+        path.write_text('{"damaged":true}')
+    reloaded.task.stage = "planning"
+
+    store.save(reloaded)
+
+    assert store.get(record.id) == reloaded
+
+
+def test_persisted_task_directory_identity_is_immutable_without_artifacts(tmp_path):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    store.save(record)
+    before = store.get(record.id)
+    changed = store.get(record.id)
+    output_root = tmp_path / "alternate"
+    result_directory = output_root / f"flight-agent-{changed.task.id}"
+    result_directory.mkdir(parents=True)
+    changed.task.output_root = str(output_root)
+    changed.task.result_directory = str(result_directory)
+
+    with pytest.raises(ValueError, match="directory|identity"):
+        store.save(changed)
+
+    assert store.get(record.id) == before
+
+
+def test_codec_rejects_unrecognized_task_state_fields(tmp_path, monkeypatch):
+    store = SQLiteConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    directory = store.task_directory(record.id, "a" * 32, create=True)
+    record.task = agent_task(directory)
+    task_type = type(record.task)
+    model_dump = task_type.model_dump
+
+    def dump_with_future_field(task, *args, **kwargs):
+        value = model_dump(task, *args, **kwargs)
+        value["future_field"] = "unsupported"
+        return value
+
+    monkeypatch.setattr(task_type, "model_dump", dump_with_future_field)
+    with pytest.raises(ValueError, match="Unsupported task state fields"):
+        encode(record)
 
 
 def test_recent_uses_timestamp_then_id_and_bad_ids_do_not_resolve_paths(tmp_path):

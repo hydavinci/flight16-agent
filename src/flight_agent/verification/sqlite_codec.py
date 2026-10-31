@@ -10,6 +10,35 @@ from .contracts import Conversation
 
 Row: TypeAlias = dict[str, str | int | None]
 
+_TASK_STATE_FIELDS = (
+    "schema_version",
+    "baseline_sha256",
+    "nodes",
+    "decisions",
+    "outputs",
+    "budget_state",
+    "progress_calls",
+    "checkpoints",
+    "checkpoint_sha256",
+    "reuse_sources",
+    "reuse_mappings",
+    "result_directory",
+    "output_root",
+)
+_TASK_FIELDS = frozenset(
+    (
+        "id",
+        "baseline",
+        "stage",
+        "result",
+        "calls",
+        "pending_specs",
+        "analysis_runs",
+        "artifacts",
+        *_TASK_STATE_FIELDS,
+    )
+)
+
 
 def canonical(value: object) -> str:
     return json.dumps(
@@ -74,16 +103,8 @@ def encode(
         raise ValueError("Current and archived task identities must be unique")
     for task, archive_position in tasks:
         value = task.model_dump(mode="json")
-        excluded = {
-            "id",
-            "baseline",
-            "stage",
-            "result",
-            "calls",
-            "pending_specs",
-            "analysis_runs",
-            "artifacts",
-        }
+        if set(value) != _TASK_FIELDS:
+            raise ValueError("Unsupported task state fields require an explicit codec update")
         status = (
             task.result.execution_status
             if task.result is not None
@@ -106,9 +127,7 @@ def encode(
                 "stage": task.stage,
                 "status": status,
                 "baseline_json": canonical(value["baseline"]),
-                "state_json": canonical(
-                    {key: item for key, item in value.items() if key not in excluded}
-                ),
+                "state_json": canonical({key: value[key] for key in _TASK_STATE_FIELDS}),
                 "result_json": canonical(value["result"]),
                 "created_at": record.updated_at,
                 "updated_at": record.updated_at,
@@ -220,7 +239,7 @@ def encode(
             for item in run.output.artifacts:
                 artifact("output", output_position, item, run.id)
                 output_position += 1
-        for position, (call_id, path) in enumerate(task.checkpoints.items()):
+        for position, (call_id, path) in enumerate(sorted(task.checkpoints.items())):
             descriptor = disk_descriptor("checkpoint", call_id, path)
             if descriptor.sha256 != task.checkpoint_sha256.get(call_id):
                 raise ValueError("Checkpoint digest does not match the recorded state")
