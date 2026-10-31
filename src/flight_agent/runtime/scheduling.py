@@ -2,7 +2,7 @@ import math
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from threading import BoundedSemaphore, Condition, Lock
+from threading import BoundedSemaphore, Condition, Thread, current_thread
 
 from ..config import SchedulerSettings
 from .budget import BudgetExhausted
@@ -45,6 +45,8 @@ class Submission:
             return future
 
     def _run(self, operation: Callable[[], None]) -> None:
+        with self._owner._condition:
+            self._owner._worker_threads.add(current_thread())
         try:
             operation()
         finally:
@@ -56,10 +58,12 @@ class BoundedRunner:
         if workers < 1 or capacity < workers:
             raise ValueError("Runner capacity must cover positive worker count")
         self._condition = Condition()
-        self._close_lock = Lock()
+        self._worker_threads: set[Thread] = set()
         self._in_use = 0
         self._capacity = capacity
         self._closing = False
+        self._shutdown_started = False
+        self._closed = False
         self._pool = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix=prefix
         )
@@ -80,12 +84,29 @@ class BoundedRunner:
                 reservation._release()
 
     def close(self) -> None:
-        with self._close_lock:
-            with self._condition:
-                self._closing = True
-                while self._in_use:
-                    self._condition.wait()
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+            if self._closed or current_thread() in self._worker_threads:
+                return
+            while self._shutdown_started and not self._closed:
+                self._condition.wait()
+            if self._closed:
+                return
+            self._shutdown_started = True
+            while self._in_use:
+                self._condition.wait()
+        try:
             self._pool.shutdown(wait=True, cancel_futures=False)
+        except BaseException:
+            with self._condition:
+                self._shutdown_started = False
+                self._condition.notify_all()
+            raise
+        with self._condition:
+            self._closed = True
+            self._shutdown_started = False
+            self._condition.notify_all()
 
 
 class PlanningScheduler(BoundedRunner):

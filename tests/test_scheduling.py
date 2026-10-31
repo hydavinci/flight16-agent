@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from multiprocessing import get_context
+from threading import Barrier, Event, Thread
 
 import pytest
 
@@ -19,6 +20,67 @@ def definition(effect="execute_project"):
     return CapabilityDefinition(
         name="synthetic", version="1", description="Test.", effect=effect
     )
+
+
+def _assert_runner_closed(runner):
+    try:
+        with runner.reserve():
+            raise AssertionError("closed scheduler admitted work")
+    except SchedulerClosed:
+        pass
+
+
+def _close_from_operation(completed):
+    runner = PlanningScheduler(1, 0)
+
+    def operation():
+        runner.close()
+        completed.set()
+
+    with runner.reserve() as reservation:
+        future = reservation.submit(operation)
+    future.result(timeout=5)
+    _assert_runner_closed(runner)
+    runner.close()
+
+
+def _close_from_completion_callback(completed):
+    runner = PlanningScheduler(1, 0)
+    entered, release = Event(), Event()
+
+    def operation():
+        entered.set()
+        assert release.wait(5)
+
+    def close_runner(_future):
+        runner.close()
+        completed.set()
+
+    with runner.reserve() as reservation:
+        future = reservation.submit(operation)
+    assert entered.wait(5)
+    future.add_done_callback(close_runner)
+    release.set()
+    future.result(timeout=5)
+    assert completed.wait(5)
+    _assert_runner_closed(runner)
+    runner.close()
+
+
+def _assert_process_completes(target, message):
+    context = get_context("spawn")
+    completed = context.Event()
+    process = context.Process(target=target, args=(completed,))
+    process.start()
+    try:
+        assert completed.wait(5), message
+        process.join(5)
+        assert not process.is_alive(), "scheduler child process did not exit"
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
 
 
 def test_planning_queue_accepts_waiting_work_without_global_busy():
@@ -49,6 +111,20 @@ def test_planning_queue_accepts_waiting_work_without_global_busy():
     with pytest.raises(SchedulerClosed):
         with runner.reserve():
             pytest.fail("closed scheduler admitted work")
+
+
+def test_close_from_operation_stops_admission_without_self_deadlock():
+    _assert_process_completes(
+        _close_from_operation,
+        "close() did not return when invoked by an admitted operation",
+    )
+
+
+def test_close_from_completion_callback_stops_admission_without_self_join():
+    _assert_process_completes(
+        _close_from_completion_callback,
+        "close() did not return when invoked by a completion callback",
+    )
 
 
 def test_unused_and_failed_reservations_release_capacity():
@@ -93,6 +169,56 @@ def test_cancelled_queued_submission_releases_capacity():
     finally:
         release.set()
         runner.close()
+    assert third.is_set()
+
+
+def test_concurrent_close_submit_and_cancel_drains_admitted_work_once():
+    runner = PlanningScheduler(1, 2)
+    entered, release, third = Event(), Event(), Event()
+    close_barrier = Barrier(3)
+    closed = (Event(), Event())
+
+    def first():
+        entered.set()
+        release.wait()
+
+    def close_runner(done):
+        close_barrier.wait()
+        runner.close()
+        done.set()
+
+    try:
+        with runner.reserve() as reservation:
+            first_future = reservation.submit(first)
+        assert entered.wait(5)
+        with runner.reserve() as reservation:
+            cancelled = reservation.submit(lambda: None)
+        with runner.reserve() as delayed:
+            threads = [
+                Thread(target=close_runner, args=(done,), daemon=True)
+                for done in closed
+            ]
+            for thread in threads:
+                thread.start()
+            close_barrier.wait()
+            with runner._condition:
+                assert runner._condition.wait_for(lambda: runner._closing, timeout=5)
+            assert cancelled.cancel()
+            third_future = delayed.submit(third.set)
+            with pytest.raises(SchedulerClosed):
+                with runner.reserve():
+                    pytest.fail("stopped scheduler admitted work")
+    finally:
+        release.set()
+    first_future.result(timeout=5)
+    third_future.result(timeout=5)
+    for done in closed:
+        assert done.wait(5)
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+    with runner._condition:
+        assert runner._in_use == 0
     assert third.is_set()
 
 
