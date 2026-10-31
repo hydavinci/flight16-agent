@@ -917,3 +917,135 @@ def test_queued_dependency_mutation_is_rejected_before_dispatch(tmp_path):
     assert saved.task.calls == []
     assert saved.task.budget_state.calls == 0
     assert saved.task.budget_state.rounds == 0
+
+
+def test_budget_expiry_in_lane_queue_does_not_create_or_charge_a_call(tmp_path):
+    from flight_agent.runtime.budget import BudgetExhausted
+
+    calls = []
+    runtime = make_runtime(
+        tmp_path, None,
+        lambda context, inputs: (calls.append(context.call_id), CapabilityOutcome())[1],
+        lane="local_matlab",
+    )
+    pending = propose_fake(runtime, lane="local_matlab")
+    scheduler = runtime.executor.scheduler
+    original_slot = scheduler.slot
+    from contextlib import contextmanager
+
+    @contextmanager
+    def expired(definition, metadata, *, timeout=None):
+        raise BudgetExhausted("Budget expired while queued")
+        yield
+
+    scheduler.slot = expired
+    try:
+        failed = runtime.executor.confirm(pending.id, 1, trusted=True)
+    finally:
+        scheduler.slot = original_slot
+    assert failed.status == "failed"
+    assert failed.task.nodes[0].status == "pending"
+    assert failed.task.calls == []
+    assert failed.task.budget_state.calls == 0
+    assert failed.task.budget_state.rounds == 0
+    assert calls == []
+
+
+def test_source_changed_during_lane_wait_is_revalidated_before_dispatch(tmp_path):
+    calls = []
+    runtime = make_runtime(
+        tmp_path, None,
+        lambda context, inputs: (calls.append(context.call_id), CapabilityOutcome())[1],
+        lane="local_matlab",
+    )
+    pending = propose_fake(runtime, lane="local_matlab")
+    original_save = runtime.store.save
+    verify = runtime.resources.verify
+
+    def save_and_change_source(record):
+        original_save(record)
+        if record.status == "queued" and record.task.nodes[0].status == "queued":
+            def reject(resources):
+                raise ValueError("Resource changed while queued")
+            runtime.resources.verify = reject
+
+    runtime.store.save = save_and_change_source
+    try:
+        failed = runtime.executor.confirm(pending.id, 1, trusted=True)
+    finally:
+        runtime.resources.verify = verify
+    assert failed.status == "failed"
+    assert failed.task.calls == []
+    assert failed.task.budget_state.calls == 0
+    assert calls == []
+
+
+def test_admitted_remote_and_readonly_turns_progress_while_local_is_queued(tmp_path):
+    from flight_agent.runtime.agent_contracts import AgentPlan
+    from flight_agent.runtime.capabilities import Capability
+    from flight_agent.runtime.capability_metadata import CapabilityMetadata, MetricDefinition
+    from flight_agent.runtime.scheduling import ExecutionTurnScheduler
+    from flight_agent.runtime.scheduling_contracts import SchedulingMetadata
+    from tests.agent_helpers import RmseInput, analysis_plan_data
+
+    local_queued = Event()
+    runtime = make_runtime(
+        tmp_path, None, lambda context, inputs: CapabilityOutcome(), lane="local_matlab",
+    )
+    scheduler = runtime.executor.scheduler
+    runner = ExecutionTurnScheduler(scheduler.settings.execution_turns)
+    original_save = runtime.store.save
+
+    def confirm(identifier):
+        runtime.executor.confirm(identifier, 1, trusted=True)
+
+    def observe(record):
+        original_save(record)
+        if record.status == "queued" and record.task.nodes[0].tool == "offline_rmse":
+            local_queued.set()
+
+    runtime.store.save = observe
+    local = propose_fake(runtime, lane="local_matlab")
+    others = []
+    for name, lane, effect in (
+        ("remote_fake", "remote_worker", "execute_project"),
+        ("readonly_fake", "read_only", "read_only"),
+    ):
+        runtime.executor.tools.register(Capability(
+            name=name, version="1", description="Cross-lane fake.",
+            input_model=RmseInput, output_model=CapabilityOutcome, effect=effect,
+            operation=lambda context, inputs: CapabilityOutcome(),
+            scheduling=SchedulingMetadata(lane),
+            metadata=CapabilityMetadata(metrics=[
+                MetricDefinition(id="rmse", label="RMSE", unit="m"),
+            ]),
+        ))
+        data = analysis_plan_data()
+        data["nodes"][0]["tool"] = name
+        data["allowed_effects"] = [effect]
+        others.append(runtime.executor.propose(
+            runtime.store.create(), AgentPlan.model_validate(data),
+        ))
+    try:
+        with scheduler.slot(
+            runtime.executor.tools.definition("offline_rmse"),
+            runtime.executor.tools.scheduling("offline_rmse"),
+        ):
+            with runner.reserve() as reservation:
+                waiting = reservation.submit(
+                    lambda: confirm(local.id),
+                )
+            assert local_queued.wait(5)
+            futures = []
+            for record in others:
+                with runner.reserve() as reservation:
+                    futures.append(reservation.submit(
+                        lambda identifier=record.id: confirm(identifier),
+                    ))
+            for future in futures:
+                future.result(timeout=5)
+            assert all(runtime.store.get(record.id).status == "completed" for record in others)
+            assert not waiting.done()
+        waiting.result(timeout=5)
+    finally:
+        runner.close()

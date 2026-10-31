@@ -385,3 +385,52 @@ def test_failed_pool_publication_is_visible_and_reservation_can_be_reused(
         assert all(record.status == "failed" for record in records)
         assert all(record.queued_action is None for record in records)
         assert all(record.error == "Pool publication failed" for record in records)
+
+
+def test_request_cannot_supply_a_lane_to_bypass_server_metadata(tmp_path):
+    entered, release = Event(), Event()
+    release.set()
+    app, runtime = build(tmp_path, entered, release)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = {"x-flight-token": client.get("/api/bootstrap").json()["token"]}
+        response = client.post(
+            API, headers=headers, json={"message": "Run this", "lane": "read_only"},
+        )
+        assert response.status_code == 422
+        assert runtime.store.recent() == []
+
+
+def test_planning_progresses_while_another_conversation_executes_local_matlab(tmp_path):
+    from tests.scheduling_helpers import propose_fake
+
+    entered, release = Event(), Event()
+
+    class Planner(AgentPlanner):
+        def propose(self, message, conversation, **kwargs):
+            return AgentDecision(action="answer", text="Independent planning completed.")
+
+    def local_operation(context, inputs):
+        entered.set()
+        assert release.wait(5)
+        return CapabilityOutcome()
+
+    runtime = make_runtime(tmp_path, Planner(), local_operation, lane="local_matlab")
+    pending = propose_fake(runtime, lane="local_matlab")
+    app = create_web_app(tmp_path, engineering_runtime=runtime)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = {"x-flight-token": client.get("/api/bootstrap").json()["token"]}
+        try:
+            response = client.post(
+                f"{API}/{pending.id}/confirm", headers=headers,
+                json={"version": 1, "trusted": True},
+            )
+            assert response.status_code == 202
+            assert entered.wait(5)
+            question = client.post(API, headers=headers, json={"message": "Explain RMSE."})
+            assert question.status_code == 202
+            wait_for_conversation(
+                client, question.json()["id"], headers,
+                lambda record: record["status"] == "completed",
+            )
+        finally:
+            release.set()

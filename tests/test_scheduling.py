@@ -310,3 +310,29 @@ def test_lane_permit_is_released_after_exception():
             raise RuntimeError("known failure")
     with scheduler.slot(definition(), SchedulingMetadata("local_matlab"), timeout=0):
         pass
+
+
+@pytest.mark.parametrize("lane,effect,field", [
+    ("local_matlab", "execute_project", "local_matlab_slots"),
+    ("remote_worker", "execute_project", "remote_worker_slots"),
+    ("read_only", "read_only", "read_only_slots"),
+])
+def test_every_lane_enforces_its_configured_two_slots(lane, effect, field):
+    from dataclasses import replace
+
+    scheduler = ExecutionScheduler(replace(SchedulerSettings(), **{field: 2}))
+    declared = SchedulingMetadata(lane)
+    with scheduler.slot(definition(effect), declared, timeout=0):
+        with scheduler.slot(definition(effect), declared, timeout=0):
+            with pytest.raises(BudgetExhausted):
+                with scheduler.slot(definition(effect), declared, timeout=0):
+                    pytest.fail("third invocation exceeded configured two slots")
+        with scheduler.slot(definition(effect), declared, timeout=0):
+            pass
+
+
+def test_scheduler_revalidates_effect_instead_of_trusting_callers_lane():
+    scheduler = ExecutionScheduler(SchedulerSettings())
+    with pytest.raises(ValueError, match="scheduling"):
+        with scheduler.slot(definition("execute_project"), SchedulingMetadata("read_only")):
+            pytest.fail("execute_project ran in the general pool")
