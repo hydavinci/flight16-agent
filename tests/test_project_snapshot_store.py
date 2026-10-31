@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -11,6 +12,35 @@ from flight_agent.verification.matlab_projects import discover_matlab_project
 from flight_agent.verification.project_snapshots import ProjectSnapshotStore
 from tests.matlab_project_helpers import prepared_project
 from tests.snapshot_helpers import manifest_for, snapshot_case
+
+
+class ReparseStat:
+    def __init__(self, base):
+        self._base = base
+        self.st_file_attributes = 0x00000400
+
+    def __getattr__(self, name):
+        return getattr(self._base, name)
+
+
+class FakeWindowsFunction:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self.result
+
+
+class FakeWindowsKernel:
+    def __init__(self, *, create=123, flush=1, close=1, move=1):
+        self.CreateFileW = FakeWindowsFunction(create)
+        self.FlushFileBuffers = FakeWindowsFunction(flush)
+        self.CloseHandle = FakeWindowsFunction(close)
+        self.MoveFileExW = FakeWindowsFunction(move)
 
 
 def unpublished_case(tmp_path):
@@ -39,6 +69,250 @@ def assert_sealed_object(store, binding):
                 assert (root / name).stat().st_mode & 0o777 == 0o555
             for name in names:
                 assert (root / name).stat().st_mode & 0o777 == 0o444
+
+
+def test_reparse_metadata_detection_is_python_311_compatible():
+    from flight_agent.verification.snapshot_lock import is_reparse_point
+
+    assert is_reparse_point(ReparseStat(os.stat(".")))
+    assert not is_reparse_point(os.stat("."))
+
+
+def test_seal_rejects_reparse_top_before_directory_walk(tmp_path, monkeypatch):
+    from flight_agent.verification import project_snapshots as module
+
+    directory = tmp_path / "object"
+    directory.mkdir()
+    original_lstat = Path.lstat
+    original_walk = module.os.walk
+    walked = False
+
+    def reparse_lstat(path):
+        info = original_lstat(path)
+        return ReparseStat(info) if path == directory else info
+
+    def record_walk(*args, **kwargs):
+        nonlocal walked
+        walked = True
+        yield from original_walk(*args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    monkeypatch.setattr(module.os, "walk", record_walk)
+    with pytest.raises(ValueError, match="reparse"):
+        module._seal(directory)
+    assert not walked
+
+
+@pytest.mark.parametrize("boundary", ["root", "objects", "staging", "locks"])
+def test_guard_rejects_reparse_storage_directories(tmp_path, monkeypatch, boundary):
+    root = tmp_path / "managed" / "snapshots"
+    root.mkdir(parents=True)
+    target = root
+    if boundary != "root":
+        target = root / boundary
+        target.mkdir()
+    original_lstat = Path.lstat
+
+    def reparse_lstat(path):
+        info = original_lstat(path)
+        return ReparseStat(info) if path == target else info
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    store = ProjectSnapshotStore(root)
+    with pytest.raises(ValueError, match="reparse"):
+        with store.guard():
+            pass
+
+
+@pytest.mark.parametrize("boundary", ["parent", "file"])
+def test_lifecycle_lock_rejects_reparse_boundaries(tmp_path, monkeypatch, boundary):
+    from flight_agent.verification.snapshot_lock import lifecycle_lock
+
+    parent = tmp_path / "locks"
+    parent.mkdir()
+    path = parent / "snapshot.lock"
+    target = parent
+    if boundary == "file":
+        path.write_bytes(b"")
+        target = path
+    original_lstat = Path.lstat
+
+    def reparse_lstat(candidate):
+        info = original_lstat(candidate)
+        return ReparseStat(info) if candidate == target else info
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    with pytest.raises(ValueError, match="reparse"):
+        with lifecycle_lock(path, exclusive=True):
+            pass
+
+
+@pytest.mark.parametrize("boundary", ["object", "directory", "file"])
+def test_reparse_managed_members_fail_closed_without_touching_external(
+    tmp_path, monkeypatch, boundary
+):
+    source, project, store, binding = snapshot_case(tmp_path)
+    obj = store.object_directory(binding.snapshot_id)
+    tree = obj / "tree"
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "keep.txt"
+    marker.write_bytes((tree / "initialize.m").read_bytes())
+    target = obj
+    fake_info = obj.lstat()
+    if boundary == "directory":
+        target = tree / "data"
+        tree.chmod(0o755)
+        target.chmod(0o755)
+        for item in target.iterdir():
+            item.chmod(0o600)
+            item.unlink()
+        target.rmdir()
+        target.symlink_to(external, target_is_directory=True)
+        tree.chmod(0o555)
+        fake_info = external.stat()
+    elif boundary == "file":
+        target = tree / "initialize.m"
+        tree.chmod(0o755)
+        target.chmod(0o600)
+        target.unlink()
+        target.symlink_to(marker)
+        tree.chmod(0o555)
+        fake_info = marker.stat()
+    original_lstat = Path.lstat
+
+    def reparse_lstat(path):
+        return ReparseStat(fake_info) if path == target else original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    with pytest.raises(ValueError, match="reparse"):
+        store.verify(binding)
+    assert marker.read_bytes() == (source / "initialize.m").read_bytes()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows junction support")
+def test_windows_junction_is_rejected_without_touching_external(tmp_path):
+    source, project, store, binding = snapshot_case(tmp_path)
+    tree = store.object_directory(binding.snapshot_id) / "tree"
+    junction = tree / "data"
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "keep.txt"
+    marker.write_bytes(b"external")
+    for item in junction.iterdir():
+        item.chmod(0o600)
+        item.unlink()
+    junction.rmdir()
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"junction creation unavailable: {result.stderr}")
+    try:
+        with pytest.raises(ValueError, match="reparse"):
+            store.verify(binding)
+        assert marker.read_bytes() == b"external"
+    finally:
+        os.rmdir(junction)
+
+
+def test_fresh_store_syncs_managed_entries_once_in_root(tmp_path, monkeypatch):
+    from flight_agent.verification import project_snapshots as module
+
+    store = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    original_sync = module._sync_directory
+    root_syncs = []
+
+    def record_sync(path):
+        path = Path(path)
+        if path == store.root:
+            assert {"objects", "staging", "locks"} <= {
+                item.name for item in store.root.iterdir()
+            }
+            root_syncs.append(path)
+        original_sync(path)
+
+    monkeypatch.setattr(module, "_sync_directory", record_sync)
+    with store.guard():
+        pass
+    assert root_syncs == [store.root]
+    root_syncs.clear()
+    with store.guard():
+        pass
+    assert root_syncs == []
+
+
+def windows_api(monkeypatch, module, kernel, error=5):
+    monkeypatch.setattr(
+        module,
+        "_windows_api",
+        lambda: (kernel, lambda: error, lambda code: OSError(code, "windows failure")),
+    )
+
+
+def test_windows_directory_flush_uses_backup_semantics_and_closes_handle(
+    tmp_path, monkeypatch
+):
+    from flight_agent.verification import project_snapshots as module
+
+    kernel = FakeWindowsKernel()
+    windows_api(monkeypatch, module, kernel)
+    module._windows_flush_directory(tmp_path)
+    create = kernel.CreateFileW.calls
+    assert len(create) == 1
+    assert create[0][1] == 0x40000000
+    assert create[0][2] == 0x00000007
+    assert create[0][4] == 3
+    assert create[0][5] & 0x02000000
+    assert create[0][5] & 0x00200000
+    assert kernel.FlushFileBuffers.calls == [(123,)]
+    assert kernel.CloseHandle.calls == [(123,)]
+
+
+@pytest.mark.parametrize(
+    ("failure", "kernel"),
+    [
+        ("open", FakeWindowsKernel(create=-1)),
+        ("flush", FakeWindowsKernel(flush=0)),
+        ("close", FakeWindowsKernel(close=0)),
+    ],
+)
+def test_windows_directory_flush_propagates_api_errors(
+    tmp_path, monkeypatch, failure, kernel
+):
+    from flight_agent.verification import project_snapshots as module
+
+    windows_api(monkeypatch, module, kernel)
+    with pytest.raises(OSError, match="windows failure"):
+        module._windows_flush_directory(tmp_path)
+    if failure == "open":
+        assert kernel.FlushFileBuffers.calls == []
+        assert kernel.CloseHandle.calls == []
+    else:
+        assert kernel.CloseHandle.calls == [(123,)]
+
+
+def test_windows_move_is_no_replace_and_write_through(tmp_path, monkeypatch):
+    from flight_agent.verification import project_snapshots as module
+
+    kernel = FakeWindowsKernel()
+    windows_api(monkeypatch, module, kernel)
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    module._windows_move_no_replace(source, destination)
+    assert kernel.MoveFileExW.calls == [(str(source), str(destination), 0x00000008)]
+
+
+def test_windows_move_propagates_api_errors(tmp_path, monkeypatch):
+    from flight_agent.verification import project_snapshots as module
+
+    kernel = FakeWindowsKernel(move=0)
+    windows_api(monkeypatch, module, kernel)
+    with pytest.raises(OSError, match="windows failure"):
+        module._windows_move_no_replace(tmp_path / "source", tmp_path / "destination")
 
 
 def test_verified_reuse_does_not_replace_object(tmp_path):

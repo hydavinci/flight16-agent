@@ -9,20 +9,95 @@ import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
+from typing import Any
 from uuid import uuid4
 
 from ..runtime.project_snapshots import ProjectSnapshot, SnapshotFile, SnapshotManifest
 from .intake import safe_directory
 from .matlab_contracts import MatlabProjectDescriptor
 from .matlab_projects import discover_matlab_project
-from .snapshot_lock import lifecycle_lock
+from .snapshot_lock import is_reparse_point, lifecycle_lock
 
 _DIGEST = re.compile(r"[a-f0-9]{64}")
 MAX_MANIFEST_BYTES = 4_000_000
+_WINDOWS = os.name == "nt"
+
+
+def _managed_lstat(path: Path) -> os.stat_result:
+    info = path.lstat()
+    if is_reparse_point(info):
+        raise ValueError(f"Managed snapshot path cannot be a reparse point: {path.name}")
+    return info
+
+
+def _windows_api() -> tuple[Any, Any, Any]:
+    from ctypes import wintypes
+
+    win_dll = getattr(ctypes, "WinDLL")
+    get_last_error = getattr(ctypes, "get_last_error")
+    win_error = getattr(ctypes, "WinError")
+    kernel = win_dll("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel.FlushFileBuffers.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.MoveFileExW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+    ]
+    kernel.MoveFileExW.restype = wintypes.BOOL
+    return kernel, get_last_error, win_error
+
+
+def _windows_flush_directory(path: Path) -> None:
+    kernel, get_last_error, win_error = _windows_api()
+    handle = kernel.CreateFileW(
+        str(path),
+        0x40000000,
+        0x00000007,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle in (-1, ctypes.c_void_p(-1).value):
+        raise win_error(get_last_error())
+    flush_error = None
+    if not kernel.FlushFileBuffers(handle):
+        flush_error = get_last_error()
+    close_error = None
+    if not kernel.CloseHandle(handle):
+        close_error = get_last_error()
+    if flush_error is not None:
+        raise win_error(flush_error)
+    if close_error is not None:
+        raise win_error(close_error)
+
+
+def _windows_move_no_replace(source: Path, destination: Path) -> None:
+    kernel, get_last_error, win_error = _windows_api()
+    if not kernel.MoveFileExW(str(source), str(destination), 0x00000008):
+        raise win_error(get_last_error())
 
 
 def _sync_directory(path: Path) -> None:
-    if os.name == "posix":
+    info = _managed_lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("Snapshot sync requires a real directory")
+    if _WINDOWS:
+        _windows_flush_directory(path)
+    elif os.name == "posix":
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(descriptor)
@@ -31,10 +106,17 @@ def _sync_directory(path: Path) -> None:
 
 
 def _sync_regular_file(path: Path) -> None:
+    before = _managed_lstat(path)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError("Snapshot seal requires an independent regular file")
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        if (
+            is_reparse_point(info)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+        ):
             raise ValueError("Snapshot seal requires an independent regular file")
         os.fsync(descriptor)
     finally:
@@ -42,6 +124,8 @@ def _sync_regular_file(path: Path) -> None:
 
 
 def _rename_no_replace(source: Path, destination: Path) -> None:
+    _directory_identity(source.parent)
+    _directory_identity(destination.parent)
     if sys.platform == "darwin":
         library = ctypes.CDLL(None, use_errno=True)
         renamex = library.renamex_np
@@ -52,8 +136,8 @@ def _rename_no_replace(source: Path, destination: Path) -> None:
         error = ctypes.get_errno()
         if error not in (errno.ENOTSUP, errno.EINVAL):
             raise OSError(error, os.strerror(error), str(destination))
-    elif os.name == "nt":
-        os.rename(source, destination)
+    elif _WINDOWS:
+        _windows_move_no_replace(source, destination)
         return
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(errno.EEXIST, "Destination already exists", str(destination))
@@ -67,14 +151,14 @@ def _publish_no_replace(source: Path, destination: Path) -> None:
 
 
 def _directory_identity(path: Path) -> tuple[int, int]:
-    info = path.lstat()
+    info = _managed_lstat(path)
     if not stat.S_ISDIR(info.st_mode):
         raise ValueError("Managed directory must be a real directory")
     return info.st_dev, info.st_ino
 
 
 def _verify_sealed_mode(path: Path, expected: int) -> None:
-    mode = stat.S_IMODE(path.lstat().st_mode)
+    mode = stat.S_IMODE(_managed_lstat(path).st_mode)
     if os.name == "posix":
         if mode != expected:
             raise ValueError(f"Immutable snapshot has unexpected mode: {path.name}")
@@ -84,13 +168,17 @@ def _verify_sealed_mode(path: Path, expected: int) -> None:
 
 def _read_regular(path: Path, limit: int) -> bytes:
     safe_directory(path.parent)
-    before = path.lstat()
+    _directory_identity(path.parent)
+    before = _managed_lstat(path)
     if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise ValueError(f"Snapshot is not an independent regular file: {path.name}")
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        if is_reparse_point(opened) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
             raise ValueError("Snapshot file changed while opening")
         content = stream.read(limit + 1)
     if len(content) > limit:
@@ -100,7 +188,8 @@ def _read_regular(path: Path, limit: int) -> bytes:
 
 def _file_sha256(path: Path, expected: SnapshotFile) -> None:
     safe_directory(path.parent)
-    before = path.lstat()
+    _directory_identity(path.parent)
+    before = _managed_lstat(path)
     if (
         not stat.S_ISREG(before.st_mode)
         or before.st_nlink != 1
@@ -112,7 +201,10 @@ def _file_sha256(path: Path, expected: SnapshotFile) -> None:
     size = 0
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
-        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+        if is_reparse_point(opened) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
             raise ValueError("Snapshot file changed while opening")
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             size += len(chunk)
@@ -125,7 +217,7 @@ def _file_sha256(path: Path, expected: SnapshotFile) -> None:
 
 def _verify_tree(root: Path, manifest: SnapshotManifest, *, readonly: bool) -> None:
     safe_directory(root)
-    if not stat.S_ISDIR(root.lstat().st_mode):
+    if not stat.S_ISDIR(_managed_lstat(root).st_mode):
         raise ValueError("Snapshot tree is missing")
     expected_files = {item.path: item for item in manifest.files}
     expected_dirs = {
@@ -138,13 +230,13 @@ def _verify_tree(root: Path, manifest: SnapshotManifest, *, readonly: bool) -> N
     actual_dirs: set[str] = set()
     for current, directories, names in os.walk(root, followlinks=False):
         directory = Path(current)
-        if not stat.S_ISDIR(directory.lstat().st_mode):
+        if not stat.S_ISDIR(_managed_lstat(directory).st_mode):
             raise ValueError("Snapshot contains a special directory")
         if readonly:
             _verify_sealed_mode(directory, 0o555)
         for name in directories:
             child = directory / name
-            if not stat.S_ISDIR(child.lstat().st_mode):
+            if not stat.S_ISDIR(_managed_lstat(child).st_mode):
                 raise ValueError("Snapshot contains a symlink or special directory")
             if readonly:
                 _verify_sealed_mode(child, 0o555)
@@ -173,15 +265,18 @@ def _copy_inventory(
     safe_directory(destination)
     if create:
         destination.mkdir(parents=True, exist_ok=False)
-    elif not stat.S_ISDIR(destination.lstat().st_mode):
+    elif not stat.S_ISDIR(_managed_lstat(destination).st_mode):
         raise ValueError("Mutable work destination changed type")
+    _directory_identity(destination)
     for item in manifest.files:
         original = source / item.path
         target = destination / item.path
         safe_directory(original.parent)
         safe_directory(target.parent)
+        _directory_identity(original.parent)
         target.parent.mkdir(parents=True, exist_ok=True)
-        before = original.lstat()
+        _directory_identity(target.parent)
+        before = _managed_lstat(original)
         if not stat.S_ISREG(before.st_mode) or before.st_size != item.size:
             raise ValueError(f"Project changed type/size: {item.path}")
         descriptor = os.open(original, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
@@ -189,7 +284,10 @@ def _copy_inventory(
         size = 0
         with os.fdopen(descriptor, "rb") as reader, target.open("xb") as writer:
             opened = os.fstat(reader.fileno())
-            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            if is_reparse_point(opened) or (opened.st_dev, opened.st_ino) != (
+                before.st_dev,
+                before.st_ino,
+            ):
                 raise ValueError("Project changed while opening")
             for chunk in iter(lambda: reader.read(1024 * 1024), b""):
                 size += len(chunk)
@@ -206,20 +304,21 @@ def _copy_inventory(
 
 
 def _seal(directory: Path) -> None:
+    _directory_identity(directory)
     for current, directories, names in os.walk(directory, topdown=False):
         root = Path(current)
         for name in names:
             child = root / name
-            info = child.lstat()
+            info = _managed_lstat(child)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ValueError("Snapshot seal encountered a special or linked file")
             child.chmod(0o444)
             _sync_regular_file(child)
         for name in directories:
             child = root / name
-            if not stat.S_ISDIR(child.lstat().st_mode):
+            if not stat.S_ISDIR(_managed_lstat(child).st_mode):
                 raise ValueError("Snapshot seal encountered a special directory")
-        if not stat.S_ISDIR(root.lstat().st_mode):
+        if not stat.S_ISDIR(_managed_lstat(root).st_mode):
             raise ValueError("Snapshot seal encountered a special directory")
         root.chmod(0o555)
         _sync_directory(root)
@@ -232,15 +331,15 @@ def _remove_quarantined_directory(
         raise ValueError("Quarantined directory identity changed")
     for current, directories, names in os.walk(directory, followlinks=False):
         root = Path(current)
-        if not stat.S_ISDIR(root.lstat().st_mode):
+        if not stat.S_ISDIR(_managed_lstat(root).st_mode):
             raise ValueError("Refusing to remove a special managed directory")
         for name in directories:
             child = root / name
-            if not stat.S_ISDIR(child.lstat().st_mode):
+            if not stat.S_ISDIR(_managed_lstat(child).st_mode):
                 raise ValueError("Refusing to remove a symlinked managed directory")
         for name in names:
             child = root / name
-            info = child.lstat()
+            info = _managed_lstat(child)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ValueError("Refusing to remove a special managed file")
             child.chmod(0o600)
@@ -284,7 +383,7 @@ def _verify_object(
     if validate_binding:
         binding = ProjectSnapshot.model_validate(binding.model_dump(mode="json"))
     safe_directory(obj)
-    if not stat.S_ISDIR(obj.lstat().st_mode) or {
+    if not stat.S_ISDIR(_managed_lstat(obj).st_mode) or {
         item.name for item in obj.iterdir()
     } != {"manifest.json", "tree"}:
         raise ValueError("Snapshot object is missing or has unexpected members")
@@ -311,11 +410,21 @@ class ProjectSnapshotStore:
     def guard(self, *, exclusive: bool = False) -> Iterator[None]:
         safe_directory(self.root)
         self.root.mkdir(parents=True, exist_ok=True)
+        _directory_identity(self.root)
         with lifecycle_lock(self.root / "lifecycle.lock", exclusive=exclusive):
+            created = False
             for name in ("objects", "staging", "locks"):
                 child = self.root / name
                 safe_directory(child)
-                child.mkdir(exist_ok=True)
+                try:
+                    child.mkdir()
+                except FileExistsError:
+                    pass
+                else:
+                    created = True
+                _directory_identity(child)
+            if created:
+                _sync_directory(self.root)
             yield
 
     def object_directory(self, snapshot_id: str) -> Path:
@@ -371,6 +480,7 @@ class ProjectSnapshotStore:
         shard = final.parent
         safe_directory(shard)
         shard.mkdir(exist_ok=True)
+        _directory_identity(shard)
         _sync_directory(objects)
         temporary = self.root / "staging" / f"snap-{uuid4().hex}"
         temporary.mkdir()

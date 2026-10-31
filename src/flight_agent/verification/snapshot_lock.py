@@ -6,17 +6,37 @@ from pathlib import Path
 
 from .intake import safe_directory
 
+FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+
+
+def is_reparse_point(info: object) -> bool:
+    return bool(
+        getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
 
 @contextmanager
 def lifecycle_lock(path: Path, *, exclusive: bool) -> Iterator[None]:
     safe_directory(path.parent)
-    if path.is_symlink():
-        raise ValueError("Snapshot lock cannot be a symlink")
+    parent_info = path.parent.lstat()
+    if is_reparse_point(parent_info) or not stat.S_ISDIR(parent_info.st_mode):
+        raise ValueError("Snapshot lock directory cannot be a reparse point")
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if is_reparse_point(path_info) or not stat.S_ISREG(path_info.st_mode):
+            raise ValueError("Snapshot lock cannot be a reparse point or special file")
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
     with os.fdopen(descriptor, "r+b", buffering=0) as stream:
         info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        if (
+            is_reparse_point(info)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+        ):
             raise ValueError("Snapshot lock must be an independent regular file")
         if os.name == "nt":
             import ctypes
