@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .snapshot_references import SNAPSHOT_STATEMENTS
 from .sqlite_snapshot import SnapshotState, sqlite_snapshot, verify_sqlite_source
 
 
@@ -140,6 +141,11 @@ MIGRATIONS = (
        ON conversations(scheduling_status, status, updated_at, id)""",
         ),
     ),
+)
+
+MIGRATIONS = (
+    *MIGRATIONS,
+    Migration(3, "project-snapshots", SNAPSHOT_STATEMENTS),
 )
 
 

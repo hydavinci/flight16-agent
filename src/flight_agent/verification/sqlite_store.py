@@ -11,11 +11,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from ..models import JOB_ID
+from ..runtime.agent_contracts import AgentBaseline
 from ..runtime.evidence import load_agent_run, verify_evidence
 from ..runtime.observations import OutputArtifact
 from .contracts import AgentTask, Conversation
 from .intake import safe_directory
 from .scheduling_recovery import recover_scheduling
+from .snapshot_references import replace_snapshot_references
 from .sqlite_codec import Row, canonical, decode, encode
 from .sqlite_cutover import prepare_cutover
 from .sqlite_schema import DatabaseStartupError, connect_database, migrate_database
@@ -615,6 +617,20 @@ class SQLiteConversationStore:
                 previous = old_tasks.get(str(row["id"]))
                 if previous is None:
                     continue
+                old_baseline = AgentBaseline.model_validate_json(
+                    str(previous["baseline_json"])
+                )
+                new_baseline = AgentBaseline.model_validate_json(
+                    str(row["baseline_json"])
+                )
+                if (
+                    old_baseline.confirmed
+                    and old_baseline.project_snapshots
+                    != new_baseline.project_snapshots
+                ):
+                    raise ValueError(
+                        "Confirmed snapshot references are immutable"
+                    )
                 row["created_at"] = previous["created_at"]
                 result = json.loads(previous["result_json"])
                 terminal = (
@@ -726,6 +742,7 @@ class SQLiteConversationStore:
                     if previous is not None and dict(previous) == row:
                         continue
                     self._upsert(connection, table, row)
+            replace_snapshot_references(connection, validated)
             for row in rows["tasks"]:
                 task_id = str(row["id"])
                 old_task = old_tasks.get(task_id)

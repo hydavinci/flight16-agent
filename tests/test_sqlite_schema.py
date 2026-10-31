@@ -5,6 +5,16 @@ import pytest
 from flight_agent.verification import sqlite_schema as schema
 
 
+def test_snapshot_reference_table_is_installed_at_current_tip(tmp_path):
+    path = tmp_path / "conversations.sqlite3"
+    schema.migrate_database(path)
+    with schema.connect_database(path) as connection:
+        assert connection.execute(
+            """SELECT name FROM sqlite_master
+               WHERE type='table' AND name='project_snapshot_references'"""
+        ).fetchone() is not None
+
+
 def test_schema_is_versioned_idempotent_and_wal(tmp_path):
     path = tmp_path / "conversations.sqlite3"
     schema.migrate_database(path)
@@ -18,6 +28,8 @@ def test_schema_is_versioned_idempotent_and_wal(tmp_path):
             connection.execute("PRAGMA user_version").fetchone()[0]
             == schema.MIGRATIONS[-1].version
         )
+        assert schema.MIGRATIONS[-1].version == 3
+        assert len(before) == len(schema.MIGRATIONS)
         names = {
             row[0]
             for row in connection.execute(
@@ -31,6 +43,7 @@ def test_schema_is_versioned_idempotent_and_wal(tmp_path):
             "task_events",
             "calls",
             "artifacts",
+            "project_snapshot_references",
             "schema_migrations",
         } <= names
     schema.migrate_database(path)
@@ -57,9 +70,10 @@ def test_future_schema_is_refused_without_rewriting_it(tmp_path):
 def test_failed_upgrade_rolls_back_ddl_and_version(tmp_path, monkeypatch):
     path = tmp_path / "conversations.sqlite3"
     schema.migrate_database(path)
-    before = schema.MIGRATIONS[-1].version
+    version = schema.MIGRATIONS[-1].version
+    ledger_count = len(schema.MIGRATIONS)
     broken = schema.Migration(
-        before + 1,
+        version + 1,
         "failure-probe",
         (
             "CREATE TABLE migration_probe (value TEXT)",
@@ -70,7 +84,7 @@ def test_failed_upgrade_rolls_back_ddl_and_version(tmp_path, monkeypatch):
     with pytest.raises(schema.DatabaseStartupError, match="migration"):
         schema.migrate_database(path)
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == before
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == version
         assert (
             connection.execute(
                 "SELECT name FROM sqlite_master WHERE name='migration_probe'"
@@ -79,7 +93,7 @@ def test_failed_upgrade_rolls_back_ddl_and_version(tmp_path, monkeypatch):
         )
         assert (
             connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
-            == before
+            == ledger_count
         )
 
 
@@ -98,9 +112,9 @@ def test_next_migration_preserves_existing_data(tmp_path, monkeypatch):
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE retained_probe (value TEXT)")
         connection.execute("INSERT INTO retained_probe VALUES ('keep')")
-    before = schema.MIGRATIONS[-1].version
+    version = schema.MIGRATIONS[-1].version
     upgrade = schema.Migration(
-        before + 1,
+        version + 1,
         "upgrade-probe",
         ("CREATE TABLE upgraded_probe (value TEXT)",),
     )
@@ -108,10 +122,10 @@ def test_next_migration_preserves_existing_data(tmp_path, monkeypatch):
     schema.migrate_database(path)
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT value FROM retained_probe").fetchone()[0] == "keep"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == before + 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == version + 1
         assert (
             connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0]
-            == before + 1
+            == len(schema.MIGRATIONS)
         )
 
 
