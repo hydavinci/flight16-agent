@@ -218,11 +218,16 @@ def test_simulink_budget_exhaustion_before_worker_checkpoint_is_known_failure(
     assert saved.task.calls[0].status == "failed"
     assert saved.task.nodes[0].status == "failed"
     assert saved.task.result.execution_status == "partial"
-    assert saved.pending_decision.kind == "retry"
+    assert saved.pending_decision.kind == "clarify"
     assert saved.task.pending_specs == {}
     assert saved.task.checkpoints == {}
     assert backend.calls == []
-    next_proposal = runtime.propose(saved, simulink_plan(resource))
+    from flight_agent.verification.coordinator import EngineeringRuntime
+
+    coordinator = EngineeringRuntime(store, None, runtime, runtime.resources)
+    queued = coordinator.queue_message(saved.id, "Prepare a new plan with a revised budget")
+    assert queued.status == "planning"
+    next_proposal = runtime.propose(queued, simulink_plan(resource))
     assert next_proposal.status == "waiting_for_user"
 
 

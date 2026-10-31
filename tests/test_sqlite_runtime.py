@@ -177,6 +177,16 @@ def test_budget_exhaustion_after_acceptance_keeps_committed_receipt_and_progress
     assert call.id in saved.task.progress_calls
     assert saved.task.budget_state.no_progress == 1
     assert saved.task.result.execution_status == "partial"
+    assert saved.pending_decision.kind == "clarify"
+    from flight_agent.verification.coordinator import EngineeringRuntime
+
+    coordinator = EngineeringRuntime(store, None, executor, executor.resources)
+    queued = coordinator.queue_message(record.id, "Prepare a new plan with a revised budget")
+    assert queued.status == "planning"
+    assert queued.task.calls[0].status == "completed"
+    replacement = propose(executor, queued, data)
+    assert replacement.status == "waiting_for_user"
+    assert replacement.archived_tasks[-1].calls[0].id == call.id
 
 
 def test_budget_subclass_after_acceptance_never_rewrites_terminal_call(tmp_path, monkeypatch):
@@ -298,6 +308,66 @@ def test_web_startup_rejects_corruption_in_unqueried_table_without_rewriting(tmp
 
     assert store.database_path.read_bytes() == damaged
     assert not list(store.root.rglob("conversation.json"))
+
+
+@pytest.mark.parametrize("damage", ["future", "corrupt"])
+def test_web_startup_refusal_does_not_recover_live_hot_journal(tmp_path, damage):
+    import os
+    import subprocess
+    import sys
+
+    from flight_agent.verification.sqlite_schema import DatabaseStartupError
+    from flight_agent.web import create_web_app
+
+    store = SQLiteConversationStore(tmp_path / "runs" / "verification", require_empty=True)
+    store.create()
+    connection = sqlite3.connect(store.database_path)
+    assert connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    connection.execute("CREATE TABLE pressure (id INTEGER PRIMARY KEY, payload BLOB)")
+    connection.executemany(
+        "INSERT INTO pressure (payload) VALUES (?)", [(b"a" * 2000,)] * 300
+    )
+    if damage == "future":
+        connection.execute("PRAGMA user_version=999")
+    connection.commit()
+    page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+    root_page = connection.execute(
+        "SELECT rootpage FROM sqlite_master WHERE name='task_events'"
+    ).fetchone()[0]
+    connection.close()
+
+    script = """
+import os
+import sqlite3
+connection = sqlite3.connect(os.environ["DATABASE"], isolation_level=None)
+connection.execute("PRAGMA cache_size=8")
+connection.execute("PRAGMA cache_spill=ON")
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("UPDATE pressure SET payload=?", (b"b" * 2000,))
+os._exit(73)
+"""
+    environment = dict(os.environ, DATABASE=str(store.database_path))
+    process = subprocess.run(
+        [sys.executable, "-c", script], env=environment, timeout=15, capture_output=True
+    )
+    assert process.returncode == 73, process.stderr
+    journal = store.root / "conversations.sqlite3-journal"
+    assert journal.read_bytes()[:8] == bytes.fromhex("d9d505f920a163d7")
+    if damage == "corrupt":
+        data = bytearray(store.database_path.read_bytes())
+        data[(root_page - 1) * page_size] = 0
+        store.database_path.write_bytes(data)
+
+    def inventory():
+        return {
+            str(path.relative_to(store.root)): path.read_bytes() if path.is_file() else None
+            for path in store.root.rglob("*")
+        }
+
+    before = inventory()
+    with pytest.raises(DatabaseStartupError, match="newer|integrity|corrupt"):
+        create_web_app(tmp_path)
+    assert inventory() == before
 
 
 def test_process_exit_after_dispatch_keeps_original_unretryable_call(tmp_path):

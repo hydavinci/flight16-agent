@@ -1,8 +1,11 @@
 import hashlib
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from .sqlite_snapshot import sqlite_snapshot
 
 
 class DatabaseStartupError(RuntimeError):
@@ -146,40 +149,61 @@ def _check_integrity(connection: sqlite3.Connection) -> None:
         raise DatabaseStartupError(f"SQLite integrity check failed: {exc}") from exc
 
 
+def _validate_database(connection: sqlite3.Connection) -> int:
+    _check_integrity(connection)
+    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    supported = MIGRATIONS[-1].version
+    if version > supported:
+        raise DatabaseStartupError(
+            f"Database schema {version} is newer than supported schema {supported}"
+        )
+    has_ledger = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+    ).fetchone()
+    applied = (
+        list(
+            connection.execute(
+                "SELECT version, name, sha256 FROM schema_migrations ORDER BY version"
+            )
+        )
+        if has_ledger
+        else []
+    )
+    if any(row["version"] > supported for row in applied):
+        raise DatabaseStartupError("Database migration ledger contains a newer schema")
+    expected = [
+        (item.version, item.name, item.sha256)
+        for item in MIGRATIONS
+        if item.version <= version
+    ]
+    if [tuple(row) for row in applied] != expected:
+        raise DatabaseStartupError("Database migration ledger disagrees with schema version")
+    if [item.version for item in MIGRATIONS] != list(range(1, supported + 1)):
+        raise DatabaseStartupError("Database migration versions must be contiguous")
+    return version
+
+
 def migrate_database(path: Path) -> None:
     connection: sqlite3.Connection | None = None
     try:
+        if path.exists() or path.is_symlink():
+            with sqlite_snapshot(path) as snapshot:
+                probe = connect_database(snapshot)
+                try:
+                    _validate_database(probe)
+                finally:
+                    probe.close()
+        else:
+            if any(
+                path.with_name(path.name + suffix).exists()
+                or path.with_name(path.name + suffix).is_symlink()
+                for suffix in ("-journal", "-wal", "-shm")
+            ):
+                raise DatabaseStartupError("SQLite database is missing but sidecars exist")
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
         connection = connect_database(path)
-        _check_integrity(connection)
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        supported = MIGRATIONS[-1].version
-        if version > supported:
-            raise DatabaseStartupError(
-                f"Database schema {version} is newer than supported schema {supported}"
-            )
-        has_ledger = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
-        ).fetchone()
-        applied = (
-            list(
-                connection.execute(
-                    "SELECT version, name, sha256 FROM schema_migrations ORDER BY version"
-                )
-            )
-            if has_ledger
-            else []
-        )
-        if any(row["version"] > supported for row in applied):
-            raise DatabaseStartupError("Database migration ledger contains a newer schema")
-        expected = [
-            (item.version, item.name, item.sha256)
-            for item in MIGRATIONS
-            if item.version <= version
-        ]
-        if [tuple(row) for row in applied] != expected:
-            raise DatabaseStartupError("Database migration ledger disagrees with schema version")
-        if [item.version for item in MIGRATIONS] != list(range(1, supported + 1)):
-            raise DatabaseStartupError("Database migration versions must be contiguous")
+        version = _validate_database(connection)
         if connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
             raise DatabaseStartupError("SQLite WAL mode is unavailable")
         connection.execute("BEGIN IMMEDIATE")
@@ -208,7 +232,7 @@ def migrate_database(path: Path) -> None:
             connection.execute(f"PRAGMA user_version={migration.version}")
         _check_integrity(connection)
         connection.commit()
-    except (sqlite3.Error, OSError) as exc:
+    except (sqlite3.Error, OSError, ValueError) as exc:
         if connection is not None:
             connection.rollback()
         raise DatabaseStartupError(f"SQLite migration failed: {exc}") from exc

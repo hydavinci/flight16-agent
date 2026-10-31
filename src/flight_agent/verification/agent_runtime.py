@@ -1006,7 +1006,13 @@ class AgentExecutor:
                 else None
             )
             conversation.pending_decision = PendingDecision(
-                kind="resume" if uncertain else "retry", message=conversation.error
+                kind="resume" if uncertain else "clarify" if isinstance(exc, BudgetExhausted)
+                else "retry",
+                message=(
+                    conversation.error + " Submit a new plan with a revised budget."
+                    if isinstance(exc, BudgetExhausted)
+                    else conversation.error
+                ),
             )
         self.store.save(conversation)
         return conversation

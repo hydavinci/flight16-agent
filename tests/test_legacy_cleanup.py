@@ -590,3 +590,169 @@ def test_cleanup_preserves_candidate_inside_sqlite_owned_source(tmp_path):
 
     assert report.deleted == []
     assert evidence.read_text() == "model"
+
+
+@pytest.mark.parametrize("owner", ["conversation_source", "task_resource"])
+def test_cleanup_preserves_lexical_symlink_locator_inside_v1_candidate(tmp_path, owner):
+    from flight_agent.runtime.resources import ResourceReference
+    from tests.test_agent_history import agent_task
+
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    target = tmp_path / "external"
+    target.mkdir()
+    sentinel = target / "model.slx"
+    sentinel.write_bytes(b"source")
+    locator = legacy.parent / "source-link"
+    locator.symlink_to(target, target_is_directory=True)
+    if owner == "conversation_source":
+        record.project_root = str(locator)
+    else:
+        task = agent_task(store.default_task_root(record.id) / ("b" * 32))
+        task.id = "b" * 32
+        task.baseline = task.baseline.model_copy(update={"resources": [
+            ResourceReference(
+                id="source", kind="data", location="agent", locator=str(locator),
+                fingerprint="a" * 64,
+            )
+        ]})
+        record.task = task
+    store.save(record)
+
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=True)
+
+    assert report.deleted == []
+    assert legacy.exists()
+    assert locator.is_symlink()
+    assert sentinel.read_bytes() == b"source"
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_cleanup_inventory_does_not_create_live_wal_shared_memory(tmp_path, apply):
+    import os
+    import subprocess
+    import sys
+
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    script = """
+import os
+import sqlite3
+connection = sqlite3.connect(os.environ["DATABASE"])
+connection.execute("PRAGMA wal_autocheckpoint=0")
+connection.execute("UPDATE conversations SET error='wal-only'")
+connection.commit()
+os._exit(73)
+"""
+    environment = dict(os.environ, DATABASE=str(store.database_path))
+    process = subprocess.run(
+        [sys.executable, "-c", script], env=environment, timeout=15, capture_output=True
+    )
+    assert process.returncode == 73, process.stderr
+    wal = store.root / "conversations.sqlite3-wal"
+    shm = store.root / "conversations.sqlite3-shm"
+    assert wal.is_file() and wal.stat().st_size > 32
+    if shm.exists():
+        shm.unlink()
+
+    def inventory():
+        return {
+            str(path.relative_to(store.root)): path.read_bytes() if path.is_file() else None
+            for path in store.root.rglob("*")
+        }
+
+    before = inventory()
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=apply)
+    assert report.deleted == []
+    assert report.unknown == []
+    assert inventory() == before
+    assert not shm.exists()
+    assert record.id in {path.name for path in store.root.iterdir()}
+
+
+def test_cleanup_preserves_json_source_locator_inside_v1_candidate(tmp_path):
+    root = tmp_path / "state"
+    root.mkdir()
+    legacy = write_record(root / ("a" * 32), {"task": {"scenario": "d1"}})
+    external = tmp_path / "source"
+    external.mkdir()
+    locator = legacy.parent / "source-link"
+    locator.symlink_to(external, target_is_directory=True)
+    write_record(root / ("b" * 32), {"schema_version": "2.0", "project_root": str(locator)})
+
+    report = cleanup_module().cleanup_legacy_records(root, apply=True)
+
+    assert report.deleted == []
+    assert legacy.exists()
+    assert locator.is_symlink()
+
+
+@pytest.mark.parametrize("change", ["database", "sidecar"])
+def test_cleanup_refuses_deletion_when_sqlite_changes_during_inventory(
+    tmp_path, monkeypatch, change
+):
+    module = cleanup_module()
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    inspect = module._sqlite_snapshot_paths
+
+    def change_after_inspection(root, snapshot):
+        result = inspect(root, snapshot)
+        if change == "database":
+            store.database_path.write_bytes(store.database_path.read_bytes() + b"change")
+        else:
+            (store.root / "conversations.sqlite3-journal").write_bytes(b"new sidecar")
+        return result
+
+    monkeypatch.setattr(module, "_sqlite_snapshot_paths", change_after_inspection)
+    report = module.cleanup_legacy_records(store.root, apply=True)
+
+    assert report.deleted == []
+    assert report.unknown == ["conversations.sqlite3"]
+    assert legacy.exists()
+
+
+def test_cleanup_inventories_hot_journal_without_recovering_live_files(tmp_path):
+    import os
+    import sqlite3
+    import subprocess
+    import sys
+
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    store.create()
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+        connection.execute("CREATE TABLE pressure (id INTEGER PRIMARY KEY, payload BLOB)")
+        connection.executemany("INSERT INTO pressure (payload) VALUES (?)", [(b"a" * 2000,)] * 300)
+    script = """
+import os
+import sqlite3
+connection = sqlite3.connect(os.environ["DATABASE"], isolation_level=None)
+connection.execute("PRAGMA cache_size=8")
+connection.execute("PRAGMA cache_spill=ON")
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("UPDATE pressure SET payload=?", (b"b" * 2000,))
+os._exit(73)
+"""
+    process = subprocess.run(
+        [sys.executable, "-c", script],
+        env=dict(os.environ, DATABASE=str(store.database_path)),
+        timeout=15,
+        capture_output=True,
+    )
+    assert process.returncode == 73, process.stderr
+    journal = store.root / "conversations.sqlite3-journal"
+    assert journal.read_bytes()[:8] == bytes.fromhex("d9d505f920a163d7")
+
+    def inventory():
+        return {
+            str(path.relative_to(store.root)): path.read_bytes() if path.is_file() else None
+            for path in store.root.rglob("*")
+        }
+
+    before = inventory()
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=True)
+    assert report.unknown == []
+    assert report.deleted == []
+    assert inventory() == before

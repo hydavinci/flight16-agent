@@ -10,6 +10,7 @@ from ..runtime.resources import ResourceReference
 from .intake import safe_directory
 from .sqlite_codec import decode
 from .sqlite_schema import MIGRATIONS
+from .sqlite_snapshot import sqlite_snapshot
 
 RecordKind = Literal["v1", "v2", "unknown"]
 
@@ -92,19 +93,23 @@ def _record_paths(data: Any, *, legacy_directory: Path | None) -> list[Path]:
                 if resource.location not in ("agent", "worker"):
                     raise ValueError("Resource location ownership is unknown")
                 sources.append(resource.locator)
-    paths = []
+    paths: list[Path] = []
     for source in [*sources, *outputs]:
         if source is None:
             continue
         if not isinstance(source, str) or not source or not Path(source).is_absolute():
             raise ValueError("Recorded path ownership is unresolved")
-        path = Path(source).resolve(strict=True)
+        locator = Path(source)
+        if ".." in locator.parts:
+            raise ValueError("Recorded path ownership contains traversal")
+        path = locator.resolve(strict=True)
         if (
             source in sources
             or legacy_directory is None
+            or not locator.is_relative_to(legacy_directory)
             or not path.is_relative_to(legacy_directory)
         ):
-            paths.append(path)
+            paths.extend((locator, path))
     return paths
 
 
@@ -125,7 +130,12 @@ def _sqlite_paths(root: Path) -> set[Path]:
         return set()
     if not database.is_file():
         raise ValueError("SQLite ownership database is not a file")
-    connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    with sqlite_snapshot(database) as snapshot:
+        return _sqlite_snapshot_paths(root, snapshot)
+
+
+def _sqlite_snapshot_paths(root: Path, snapshot: Path) -> set[Path]:
+    connection = sqlite3.connect(snapshot, isolation_level=None)
     connection.row_factory = sqlite3.Row
     try:
         connection.execute("PRAGMA query_only=ON")
@@ -155,6 +165,9 @@ def _sqlite_paths(root: Path) -> set[Path]:
                 project = Path(record.project_root)
                 if not project.is_absolute():
                     raise ValueError("SQLite project ownership is unresolved")
+                if ".." in project.parts:
+                    raise ValueError("SQLite project ownership contains traversal")
+                protected.add(project)
                 protected.add(project.resolve(strict=True))
             if record.output_root is not None:
                 path = Path(record.output_root)
@@ -165,6 +178,9 @@ def _sqlite_paths(root: Path) -> set[Path]:
                     path = Path(resource.locator)
                     if not path.is_absolute():
                         raise ValueError("SQLite resource ownership is unresolved")
+                    if ".." in path.parts:
+                        raise ValueError("SQLite resource ownership contains traversal")
+                    protected.add(path)
                     protected.add(path.resolve(strict=True))
                 expected = (
                     Path(task.output_root) / f"flight-agent-{task.id}"
