@@ -73,7 +73,10 @@ def test_stage_two_database_upgrades_without_changing_migration_one(
     assert restored.queued_action_committed is False
     assert restored.queue_origin is None
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute("PRAGMA user_version").fetchone()[0]
+            == migrations[-1].version
+        )
         assert (
             connection.execute(
                 "SELECT sha256 FROM schema_migrations WHERE version=1"
