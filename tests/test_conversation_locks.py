@@ -1,8 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier, Event
+from threading import Barrier, Event, RLock
 
 import pytest
 
+from flight_agent.runtime import conversation_locks
 from flight_agent.runtime.conversation_locks import ConversationLockRegistry
 
 A, B = "a" * 32, "b" * 32
@@ -23,25 +24,57 @@ def test_different_conversations_overlap():
     assert locks.entry_count == 0
 
 
-def test_same_conversation_waiter_keeps_entry_alive():
+def test_same_conversation_waiter_keeps_entry_alive(monkeypatch):
+    class ObservableRLock:
+        def __init__(self):
+            self._lock = RLock()
+            self.blocked = Event()
+
+        def acquire(self):
+            if self._lock.acquire(blocking=False):
+                return True
+            self.blocked.set()
+            return self._lock.acquire()
+
+        def release(self):
+            self._lock.release()
+
+    class ObservableEntry:
+        def __init__(self):
+            self.lock = ObservableRLock()
+            self.references = 0
+
+    monkeypatch.setattr(conversation_locks, "_Entry", ObservableEntry)
     locks = ConversationLockRegistry()
-    attempted, entered = Event(), Event()
+    entered, release_waiter = Event(), Event()
 
     def waiter():
-        attempted.set()
         with locks.hold(A):
             entered.set()
+            assert release_waiter.wait(5)
 
     with ThreadPoolExecutor(1) as pool:
         with locks.hold(A):
+            entry = locks._entries[A]
             future = pool.submit(waiter)
-            assert attempted.wait(5)
+            assert entry.lock.blocked.wait(5)
             assert not entered.is_set()
-            assert locks.entry_count == 1
+            with locks._guard:
+                assert locks._entries[A] is entry
+                assert entry.references == 2
             with locks.hold(A):
-                assert locks.entry_count == 1
+                with locks._guard:
+                    assert locks._entries[A] is entry
+                    assert entry.references == 3
+            with locks._guard:
+                assert locks._entries[A] is entry
+                assert entry.references == 2
+        assert entered.wait(5)
+        with locks._guard:
+            assert locks._entries[A] is entry
+            assert entry.references == 1
+        release_waiter.set()
         future.result(timeout=5)
-    assert entered.is_set()
     assert locks.entry_count == 0
 
 
