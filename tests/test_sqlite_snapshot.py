@@ -1,3 +1,7 @@
+import os
+import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -84,3 +88,105 @@ def test_startup_refuses_unstable_preflight_without_opening_live_database(tmp_pa
 
     assert validations == [1]
     assert database.read_bytes() == before
+
+
+@pytest.mark.parametrize("cwd_location", ["unwritable", "database_root"])
+def test_snapshot_scratch_is_independent_of_current_working_directory(
+    tmp_path, monkeypatch, cwd_location
+):
+    root = tmp_path / "state"
+    root.mkdir()
+    database = root / "conversations.sqlite3"
+    migrate_database(database)
+    cwd = root if cwd_location == "database_root" else tmp_path / "unwritable"
+    if cwd_location == "unwritable":
+        cwd.mkdir()
+        cwd.chmod(0o500)
+    monkeypatch.chdir(cwd)
+    try:
+        migrate_database(database)
+    finally:
+        if cwd_location == "unwritable":
+            cwd.chmod(0o700)
+
+
+def _hot_database(path: Path, *, damage: str) -> None:
+    migrate_database(path)
+    connection = sqlite3.connect(path)
+    assert connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0] == "delete"
+    connection.execute("CREATE TABLE pressure (id INTEGER PRIMARY KEY, payload BLOB)")
+    connection.executemany(
+        "INSERT INTO pressure (payload) VALUES (?)", [(b"a" * 2000,)] * 300
+    )
+    if damage == "future":
+        connection.execute("PRAGMA user_version=999")
+    connection.commit()
+    page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+    root_page = connection.execute(
+        "SELECT rootpage FROM sqlite_master WHERE name='task_events'"
+    ).fetchone()[0]
+    connection.close()
+    script = """
+import os
+import sqlite3
+connection = sqlite3.connect(os.environ["DATABASE"], isolation_level=None)
+connection.execute("PRAGMA cache_size=8")
+connection.execute("PRAGMA cache_spill=ON")
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("UPDATE pressure SET payload=?", (b"b" * 2000,))
+os._exit(73)
+"""
+    process = subprocess.run(
+        [sys.executable, "-c", script],
+        env=dict(os.environ, DATABASE=str(path)),
+        timeout=15,
+        capture_output=True,
+    )
+    assert process.returncode == 73, process.stderr
+    journal = path.with_name(path.name + "-journal")
+    assert journal.read_bytes()[:8] == bytes.fromhex("d9d505f920a163d7")
+    if damage == "corrupt":
+        data = bytearray(path.read_bytes())
+        data[(root_page - 1) * page_size] = 0
+        path.write_bytes(data)
+
+
+@pytest.mark.parametrize("damage", ["future", "corrupt"])
+def test_startup_refuses_raced_database_before_recovery_or_writes(
+    tmp_path, monkeypatch, damage
+):
+    live = tmp_path / "live" / "conversations.sqlite3"
+    live.parent.mkdir()
+    migrate_database(live)
+    replacement = tmp_path / "replacement" / "conversations.sqlite3"
+    replacement.parent.mkdir()
+    _hot_database(replacement, damage=damage)
+    replacement_journal = replacement.with_name(replacement.name + "-journal")
+    expected_main = replacement.read_bytes()
+    expected_journal = replacement_journal.read_bytes()
+    expected_inventory = {
+        path.name: path.read_bytes() for path in live.parent.iterdir()
+    }
+    expected_inventory[live.name] = expected_main
+    expected_inventory[live.name + "-journal"] = expected_journal
+    connect = sqlite_schema.connect_database
+    calls = 0
+
+    def race(path, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            os.replace(replacement, live)
+            os.replace(
+                replacement_journal,
+                live.with_name(live.name + "-journal"),
+            )
+        return connect(path, **kwargs)
+
+    monkeypatch.setattr(sqlite_schema, "connect_database", race)
+    with pytest.raises(DatabaseStartupError, match="changed|newer|integrity|corrupt"):
+        migrate_database(live)
+
+    assert {
+        path.name: path.read_bytes() for path in live.parent.iterdir()
+    } == expected_inventory

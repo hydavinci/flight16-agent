@@ -1,11 +1,15 @@
+import fcntl
 import hashlib
 import os
 import sqlite3
+import stat
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .sqlite_snapshot import sqlite_snapshot
+from .sqlite_snapshot import SnapshotState, sqlite_snapshot, verify_sqlite_source
 
 
 class DatabaseStartupError(RuntimeError):
@@ -125,10 +129,16 @@ MIGRATIONS = (
 )
 
 
-def connect_database(path: Path) -> sqlite3.Connection:
+def connect_database(
+    path: Path,
+    *,
+    before_first_sql: Callable[[], None] | None = None,
+) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=5.0, isolation_level=None)
     connection.row_factory = sqlite3.Row
     try:
+        if before_first_sql is not None:
+            before_first_sql()
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA synchronous=FULL")
@@ -136,6 +146,39 @@ def connect_database(path: Path) -> sqlite3.Connection:
         connection.close()
         raise
     return connection
+
+
+@contextmanager
+def _startup_identity_guard(path: Path) -> Iterator[None]:
+    descriptors: list[int] = []
+    try:
+        parent = os.open(path.parent, os.O_RDONLY)
+        descriptors.append(parent)
+        fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            entry = path.with_name(path.name + suffix)
+            try:
+                info = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("SQLite startup requires regular files without symlinks")
+            descriptor = os.open(
+                entry,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            descriptors.append(descriptor)
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("SQLite startup source changed while acquiring identity guard")
+        yield
+    except BlockingIOError as exc:
+        raise ValueError("SQLite startup identity guard is already held") from exc
+    finally:
+        if descriptors:
+            fcntl.flock(descriptors[0], fcntl.LOCK_UN)
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _check_integrity(connection: sqlite3.Connection) -> None:
@@ -185,53 +228,67 @@ def _validate_database(connection: sqlite3.Connection) -> int:
 
 def migrate_database(path: Path) -> None:
     connection: sqlite3.Connection | None = None
+    expected: SnapshotState | None = None
     try:
-        if path.exists() or path.is_symlink():
-            with sqlite_snapshot(path) as snapshot:
-                probe = connect_database(snapshot)
-                try:
-                    _validate_database(probe)
-                finally:
-                    probe.close()
-        else:
-            if any(
-                path.with_name(path.name + suffix).exists()
-                or path.with_name(path.name + suffix).is_symlink()
-                for suffix in ("-journal", "-wal", "-shm")
-            ):
-                raise DatabaseStartupError("SQLite database is missing but sidecars exist")
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.close(descriptor)
-        connection = connect_database(path)
-        version = _validate_database(connection)
-        if connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
-            raise DatabaseStartupError("SQLite WAL mode is unavailable")
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                sha256 TEXT NOT NULL,
-                applied_at TEXT NOT NULL
-            )"""
-        )
-        for migration in MIGRATIONS:
-            if migration.version <= version:
-                continue
-            for statement in migration.statements:
-                connection.execute(statement)
-            connection.execute(
-                "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
-                (
-                    migration.version,
-                    migration.name,
-                    migration.sha256,
-                    datetime.now(UTC).isoformat(),
+        with _startup_identity_guard(path):
+            if path.exists() or path.is_symlink():
+                with sqlite_snapshot(path) as snapshot:
+                    probe = connect_database(snapshot.database)
+                    try:
+                        _validate_database(probe)
+                    finally:
+                        probe.close()
+                    expected = snapshot.source_state
+            else:
+                if any(
+                    path.with_name(path.name + suffix).exists()
+                    or path.with_name(path.name + suffix).is_symlink()
+                    for suffix in ("-journal", "-wal", "-shm")
+                ):
+                    raise DatabaseStartupError("SQLite database is missing but sidecars exist")
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(descriptor)
+            if expected is not None:
+                verify_sqlite_source(path, expected)
+            # sqlite3 exposes no descriptor/VFS hook; the callback repeats this check
+            # after pathname open and before SQLite can recover or write.
+            connection = connect_database(
+                path,
+                before_first_sql=(
+                    None
+                    if expected is None
+                    else lambda: verify_sqlite_source(path, expected)
                 ),
             )
-            connection.execute(f"PRAGMA user_version={migration.version}")
-        _check_integrity(connection)
-        connection.commit()
+            version = _validate_database(connection)
+            if connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] != "wal":
+                raise DatabaseStartupError("SQLite WAL mode is unavailable")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                )"""
+            )
+            for migration in MIGRATIONS:
+                if migration.version <= version:
+                    continue
+                for statement in migration.statements:
+                    connection.execute(statement)
+                connection.execute(
+                    "INSERT INTO schema_migrations VALUES (?, ?, ?, ?)",
+                    (
+                        migration.version,
+                        migration.name,
+                        migration.sha256,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+                connection.execute(f"PRAGMA user_version={migration.version}")
+            _check_integrity(connection)
+            connection.commit()
     except (sqlite3.Error, OSError, ValueError) as exc:
         if connection is not None:
             connection.rollback()

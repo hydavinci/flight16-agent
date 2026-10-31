@@ -178,6 +178,9 @@ def test_budget_exhaustion_after_acceptance_keeps_committed_receipt_and_progress
     assert saved.task.budget_state.no_progress == 1
     assert saved.task.result.execution_status == "partial"
     assert saved.pending_decision.kind == "clarify"
+    assert saved.pending_decision.message != saved.error
+    assert "revised budget" in saved.pending_decision.message
+    assert len(saved.pending_decision.message) <= 4096
     from flight_agent.verification.coordinator import EngineeringRuntime
 
     coordinator = EngineeringRuntime(store, None, executor, executor.resources)

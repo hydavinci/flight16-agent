@@ -1,13 +1,20 @@
 import hashlib
 import os
-import shutil
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from uuid import uuid4
+from tempfile import TemporaryDirectory
 
 _SUFFIXES = ("", "-journal", "-wal", "-shm")
+SnapshotState = dict[str, tuple[tuple[int, ...], str]]
+
+
+@dataclass(frozen=True)
+class SQLiteSnapshot:
+    database: Path
+    source_state: SnapshotState
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:
@@ -17,8 +24,8 @@ def _identity(info: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _capture(database: Path, destination: Path | None) -> dict[str, tuple[tuple[int, ...], str]]:
-    result: dict[str, tuple[tuple[int, ...], str]] = {}
+def _capture(database: Path, destination: Path | None) -> SnapshotState:
+    result: SnapshotState = {}
     for suffix in _SUFFIXES:
         source = database.with_name(database.name + suffix)
         try:
@@ -54,15 +61,19 @@ def _capture(database: Path, destination: Path | None) -> dict[str, tuple[tuple[
     return result
 
 
+def verify_sqlite_source(database: Path, expected: SnapshotState) -> None:
+    if _capture(database.absolute(), None) != expected:
+        raise ValueError("SQLite snapshot source changed")
+
+
 @contextmanager
-def sqlite_snapshot(database: Path) -> Iterator[Path]:
+def sqlite_snapshot(database: Path) -> Iterator[SQLiteSnapshot]:
     database = database.absolute()
-    workspace = Path.cwd().resolve()
-    if workspace.is_relative_to(database.parent.resolve()):
-        raise ValueError("SQLite snapshot workspace overlaps the live database directory")
-    scratch = workspace / f".flight-agent-sqlite-snapshot-{uuid4().hex}"
-    scratch.mkdir(mode=0o700)
-    try:
+    live_root = database.parent.resolve()
+    with TemporaryDirectory(prefix="flight-agent-sqlite-snapshot-") as name:
+        scratch = Path(name).resolve()
+        if scratch == live_root or scratch.is_relative_to(live_root):
+            raise ValueError("SQLite snapshot temporary directory overlaps the live database")
         copied = scratch / database.name
         initial = _capture(database, copied)
         copied_state = _capture(copied, None)
@@ -74,10 +85,6 @@ def sqlite_snapshot(database: Path) -> Iterator[Path]:
             for suffix, (identity, digest) in initial.items()
         }:
             raise ValueError("SQLite snapshot copy verification failed")
-        if _capture(database, None) != initial:
-            raise ValueError("SQLite snapshot source changed")
-        yield copied
-        if _capture(database, None) != initial:
-            raise ValueError("SQLite snapshot source changed")
-    finally:
-        shutil.rmtree(scratch)
+        verify_sqlite_source(database, initial)
+        yield SQLiteSnapshot(copied, initial)
+        verify_sqlite_source(database, initial)

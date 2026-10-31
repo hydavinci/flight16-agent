@@ -688,6 +688,99 @@ def test_cleanup_preserves_json_source_locator_inside_v1_candidate(tmp_path):
     assert locator.is_symlink()
 
 
+@pytest.mark.parametrize("owner", ["conversation_source", "task_resource"])
+def test_cleanup_preserves_candidate_traversed_by_external_symlink_chain(tmp_path, owner):
+    from flight_agent.runtime.resources import ResourceReference
+    from tests.test_agent_history import agent_task
+
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    endpoint = outside / "endpoint"
+    endpoint.mkdir()
+    sentinel = endpoint / "model.slx"
+    sentinel.write_bytes(b"source")
+    bridge = legacy.parent / "bridge"
+    bridge.symlink_to(endpoint, target_is_directory=True)
+    locator = outside / "locator"
+    locator.symlink_to(
+        f"../state/{legacy.parent.name}/{bridge.name}",
+        target_is_directory=True,
+    )
+    assert locator.resolve() == endpoint
+    if owner == "conversation_source":
+        record.project_root = str(locator)
+    else:
+        task = agent_task(store.default_task_root(record.id) / ("b" * 32))
+        task.id = "b" * 32
+        task.baseline = task.baseline.model_copy(update={"resources": [
+            ResourceReference(
+                id="source", kind="data", location="agent", locator=str(locator),
+                fingerprint="a" * 64,
+            )
+        ]})
+        record.task = task
+    store.save(record)
+
+    report = cleanup_module().cleanup_legacy_records(store.root, apply=True)
+
+    assert report.deleted == []
+    assert legacy.exists()
+    assert locator.resolve() == endpoint
+    assert sentinel.read_bytes() == b"source"
+
+
+@pytest.mark.parametrize("damage", ["cycle", "missing", "nonregular", "ambiguous"])
+def test_cleanup_fails_closed_for_unresolvable_owned_symlink_traversal(
+    tmp_path, monkeypatch, damage
+):
+    module = cleanup_module()
+    store = ConversationStore(tmp_path / "state", require_empty=True)
+    record = store.create()
+    legacy = write_record(store.root / ("a" * 32), {"task": {"scenario": "d1"}})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    locator = outside / "locator"
+    if damage == "cycle":
+        other = outside / "other"
+        locator.symlink_to(other)
+        other.symlink_to(locator)
+    elif damage == "missing":
+        locator.symlink_to(outside / "missing")
+    elif damage == "nonregular":
+        file = outside / "file"
+        file.write_text("not a directory")
+        locator = file / "child"
+    else:
+        first = outside / "first"
+        second = outside / "second"
+        first.mkdir()
+        second.mkdir()
+        locator.symlink_to(first)
+    record.project_root = str(locator)
+    store.save(record)
+    if damage == "ambiguous":
+        readlink = module.os.readlink
+        reads = 0
+
+        def changing_target(path):
+            nonlocal reads
+            target = readlink(path)
+            if str(path) == str(locator):
+                reads += 1
+                return target if reads == 1 else str(outside / "second")
+            return target
+
+        monkeypatch.setattr(module.os, "readlink", changing_target)
+
+    report = module.cleanup_legacy_records(store.root, apply=True)
+
+    assert report.deleted == []
+    assert legacy.exists()
+
+
 @pytest.mark.parametrize("change", ["database", "sidecar"])
 def test_cleanup_refuses_deletion_when_sqlite_changes_during_inventory(
     tmp_path, monkeypatch, change

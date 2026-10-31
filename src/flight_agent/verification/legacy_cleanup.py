@@ -1,6 +1,8 @@
 import json
+import os
 import shutil
 import sqlite3
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -57,6 +59,77 @@ def normalize_v2_record(data: dict[str, object]) -> dict[str, object]:
     return normalized
 
 
+def _path_identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _owned_path_components(locator: Path) -> tuple[set[Path], Path]:
+    if not locator.is_absolute() or ".." in locator.parts:
+        raise ValueError("Recorded path ownership is unresolved")
+    current = Path(locator.anchor)
+    remaining = list(locator.parts[1:])
+    protected: set[Path] = set()
+    observed: dict[Path, tuple[tuple[int, ...], str | None]] = {}
+    symlinks: set[tuple[int, int]] = set()
+    steps = 0
+    while remaining:
+        steps += 1
+        if steps > 4096:
+            raise ValueError("Recorded path ownership traversal is ambiguous")
+        component = remaining.pop(0)
+        if component in ("", "."):
+            continue
+        if component == "..":
+            if current == Path(current.anchor):
+                raise ValueError("Recorded path ownership traversal escapes the filesystem root")
+            current = current.parent
+            protected.add(current)
+            continue
+        entry = current / component
+        info = entry.lstat()
+        identity = _path_identity(info)
+        target = os.readlink(entry) if stat.S_ISLNK(info.st_mode) else None
+        previous = observed.setdefault(entry, (identity, target))
+        if previous != (identity, target):
+            raise ValueError("Recorded path ownership traversal is ambiguous")
+        protected.add(entry)
+        if stat.S_ISLNK(info.st_mode):
+            key = (info.st_dev, info.st_ino)
+            if key in symlinks:
+                raise ValueError("Recorded path ownership contains a symlink cycle")
+            symlinks.add(key)
+            link = Path(target or "")
+            if not target:
+                raise ValueError("Recorded path ownership contains an empty symlink")
+            if link.is_absolute():
+                current = Path(link.anchor)
+                remaining = [*link.parts[1:], *remaining]
+            else:
+                remaining = [*link.parts, *remaining]
+            continue
+        if remaining and not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Recorded path ownership traverses a non-directory")
+        if not remaining and not (
+            stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)
+        ):
+            raise ValueError("Recorded path ownership endpoint is nonregular")
+        current = entry
+    for entry, expected in observed.items():
+        info = entry.lstat()
+        target = os.readlink(entry) if stat.S_ISLNK(info.st_mode) else None
+        if (_path_identity(info), target) != expected:
+            raise ValueError("Recorded path ownership traversal is ambiguous")
+    return protected, current
+
+
 def _record_paths(data: Any, *, legacy_directory: Path | None) -> list[Path]:
     if not isinstance(data, dict):
         raise ValueError("Record ownership is unreadable")
@@ -102,14 +175,14 @@ def _record_paths(data: Any, *, legacy_directory: Path | None) -> list[Path]:
         locator = Path(source)
         if ".." in locator.parts:
             raise ValueError("Recorded path ownership contains traversal")
-        path = locator.resolve(strict=True)
+        components, path = _owned_path_components(locator)
         if (
             source in sources
             or legacy_directory is None
             or not locator.is_relative_to(legacy_directory)
             or not path.is_relative_to(legacy_directory)
         ):
-            paths.extend((locator, path))
+            paths.extend(components)
     return paths
 
 
@@ -131,7 +204,7 @@ def _sqlite_paths(root: Path) -> set[Path]:
     if not database.is_file():
         raise ValueError("SQLite ownership database is not a file")
     with sqlite_snapshot(database) as snapshot:
-        return _sqlite_snapshot_paths(root, snapshot)
+        return _sqlite_snapshot_paths(root, snapshot.database)
 
 
 def _sqlite_snapshot_paths(root: Path, snapshot: Path) -> set[Path]:
@@ -167,8 +240,8 @@ def _sqlite_snapshot_paths(root: Path, snapshot: Path) -> set[Path]:
                     raise ValueError("SQLite project ownership is unresolved")
                 if ".." in project.parts:
                     raise ValueError("SQLite project ownership contains traversal")
-                protected.add(project)
-                protected.add(project.resolve(strict=True))
+                components, _ = _owned_path_components(project)
+                protected.update(components)
             if record.output_root is not None:
                 path = Path(record.output_root)
                 safe_directory(path)
@@ -180,8 +253,8 @@ def _sqlite_snapshot_paths(root: Path, snapshot: Path) -> set[Path]:
                         raise ValueError("SQLite resource ownership is unresolved")
                     if ".." in path.parts:
                         raise ValueError("SQLite resource ownership contains traversal")
-                    protected.add(path)
-                    protected.add(path.resolve(strict=True))
+                    components, _ = _owned_path_components(path)
+                    protected.update(components)
                 expected = (
                     Path(task.output_root) / f"flight-agent-{task.id}"
                     if task.output_root
@@ -269,6 +342,7 @@ def cleanup_legacy_records(root: Path, *, apply: bool) -> CleanupReport:
             if any(
                 path.is_relative_to(candidate) or candidate.is_relative_to(path)
                 for path in protected
+                if path == root or path.is_relative_to(root)
             ):
                 continue
             if candidate.is_symlink() or not candidate.resolve(strict=True).is_relative_to(root):

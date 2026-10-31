@@ -441,13 +441,14 @@ function renderTask(view) {
   const confirm = available && decision.kind === "confirm_baseline";
   const retry = available && decision.kind === "retry";
   const resume = available && decision.kind === "resume";
-  $("decision-controls").hidden = !(confirm || retry || resume);
+  const guidance = available && ["clarify", "capability_gap"].includes(decision.kind);
+  $("decision-controls").hidden = !(confirm || retry || resume || guidance);
   const needsDecision = String(!$("decision-controls").hidden);
   if (changedBaseline || $("baseline-details").dataset.decision !== needsDecision) {
     $("baseline-details").open = needsDecision === "true";
     $("baseline-details").dataset.decision = needsDecision;
   }
-  $("decision-message").textContent = decision?.message || "";
+  $("decision-message").textContent = String(decision?.message || "").slice(0, 4096);
   for (const [id, show] of [["confirm", confirm], ["retry", retry], ["resume", resume]]) {
     $(id).hidden = !show;
   }

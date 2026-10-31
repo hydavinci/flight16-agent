@@ -4,6 +4,7 @@ import pytest
 from playwright.sync_api import expect, sync_playwright
 
 from tests.agent_helpers import (
+    analysis_plan_data,
     criterion_data,
     delivery_draft,
     draft_data,
@@ -18,6 +19,42 @@ pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_BROWSER_TESTS") != "1",
     reason="Browser tests are opt-in",
 )
+
+
+def test_budget_guidance_is_visible_bounded_and_escaped(tmp_path):
+    from flight_agent.runtime.agent_contracts import AgentPlan
+    from flight_agent.verification.contracts import PendingDecision
+
+    app, runtime, _, _ = make_agent_web(tmp_path, [])
+    pending = runtime.executor.propose(
+        runtime.store.create(), AgentPlan.model_validate(analysis_plan_data())
+    )
+    instruction = "Submit a new plan with a revised budget."
+    guidance = (
+        'The confirmed budget is exhausted. <img src=x onerror="window.unsafe=true"> '
+        f"{instruction} " + "x" * 5000
+    )
+    pending.status = "failed"
+    pending.error = "The confirmed budget is exhausted."
+    pending.pending_decision = PendingDecision(kind="clarify", message=guidance)
+    runtime.store.save(pending)
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        page.set_default_timeout(10000)
+        try:
+            page.goto(url)
+            page.locator("#history-panel > summary").click()
+            page.locator(
+                f'#conversation-history button[data-id="{pending.id}"]'
+            ).click()
+            expect(page.locator("#decision-message")).to_be_visible()
+            expect(page.locator("#decision-message")).to_contain_text(instruction)
+            expect(page.locator("#decision-message img")).to_have_count(0)
+            assert page.locator("#decision-message").inner_text() == guidance[:4096]
+            assert page.evaluate("window.unsafe") is None
+        finally:
+            browser.close()
 
 
 @pytest.mark.parametrize("width", [1280, 390])
