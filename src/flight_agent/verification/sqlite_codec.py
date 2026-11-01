@@ -112,6 +112,7 @@ def encode(
                         "queued_action",
                         "queued_action_committed",
                         "queue_origin",
+                        "planning_telemetry",
                     )
                 }
             ),

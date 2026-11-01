@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
+from ..copilot_diagnostics import CopilotError
 from ..runtime.evidence import verify_evidence
 from ..runtime.scheduling import (
     CapacityExceeded,
@@ -217,11 +218,22 @@ class ConversationManager:
                 )
             except PlanningFailure as exc:
                 state = "finalized" if exc.finalized else "stale"
-                logger.exception(
-                    "Conversation %s planning failed with %s reservation state",
-                    conversation_id,
-                    state,
-                )
+                if isinstance(exc.cause, CopilotError):
+                    logger.error(
+                        "Copilot planning failed for conversation %s "
+                        "reservation_state=%s category=%s exit_code=%s",
+                        conversation_id,
+                        state,
+                        exc.cause.diagnostics.category,
+                        exc.cause.diagnostics.exit_code,
+                        exc_info=False,
+                    )
+                else:
+                    logger.exception(
+                        "Conversation %s planning failed with %s reservation state",
+                        conversation_id,
+                        state,
+                    )
             except Exception as exc:
                 self._fail(conversation_id, exc, restore_unstarted=False)
 

@@ -2,6 +2,8 @@ from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, Literal
 
+from ..copilot_diagnostics import CopilotError
+from ..runtime.planning_contracts import PlanningMetrics, PlanningTelemetry
 from ..runtime.resources import ResourceReference
 from .agent_planner import AgentPlanner, bind_plan, message_sources
 from .agent_runtime import AgentExecutor, has_unresolved_call
@@ -34,6 +36,7 @@ class PlanningSuperseded(ConversationActive):
 class PlanningFailure(RuntimeError):
     def __init__(self, cause: Exception, *, finalized: bool):
         super().__init__(str(cause))
+        self.cause = cause
         self.finalized = finalized
 
 
@@ -154,6 +157,7 @@ class EngineeringRuntime:
             record.queued_action_committed = False
             record.pending_decision = None
             record.error = None
+            record.planning_telemetry = None
             self.store.save(record)
             return record
 
@@ -181,6 +185,7 @@ class EngineeringRuntime:
                 raise ValueError("Queued planning action has no recorded origin")
             queue_origin = record.queue_origin.model_copy(deep=True)
             planning_record = record.model_copy(deep=True)
+        observations: list[PlanningTelemetry] = []
         try:
             resources: dict[str, ResourceReference] = {}
             if planning_record.project_root:
@@ -201,6 +206,7 @@ class EngineeringRuntime:
                 catalog=catalog,
                 resources=resources,
                 sources=sources,
+                observe=observations.append,
             )
             plan = (
                 bind_plan(decision.plan, resources, sources, catalog)
@@ -223,6 +229,22 @@ class EngineeringRuntime:
                     and current.messages
                     and current.messages[-1] == message
                 ):
+                    if observations:
+                        telemetry = observations[-1]
+                        if (
+                            isinstance(exc, CopilotError)
+                            and telemetry.failure != exc.diagnostics
+                        ):
+                            telemetry = PlanningTelemetry(
+                                metrics=telemetry.metrics,
+                                failure=exc.diagnostics,
+                            )
+                        current.planning_telemetry = telemetry
+                    elif isinstance(exc, CopilotError):
+                        current.planning_telemetry = PlanningTelemetry(
+                            metrics=PlanningMetrics(),
+                            failure=exc.diagnostics,
+                        )
                     error = str(exc)[:4000] or "Conversation planning failed"
                     current.status, current.pending_decision = (
                         conservative_failure_transition(current, error)
@@ -255,6 +277,8 @@ class EngineeringRuntime:
                 if _managed:
                     raise PlanningSuperseded(conflict)
                 raise ConversationActive(conflict)
+            if observations:
+                record.planning_telemetry = observations[-1]
             if decision.plan is not None:
                 assert plan is not None
                 return self.executor.propose(record, plan)

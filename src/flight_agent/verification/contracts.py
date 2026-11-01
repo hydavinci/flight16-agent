@@ -17,6 +17,7 @@ from ..runtime.contracts import Name
 from ..runtime.contracts import ToolCall as ToolCall
 from ..runtime.observations import CapabilityOutcome, OutputArtifact, TaskResult
 from ..runtime.observations import MetricValue as MetricValue
+from ..runtime.planning_contracts import PlanningTelemetry
 from ..runtime.requirements import CapabilityGap
 
 AnalysisKind = Literal["step_response", "stability_margins"]
@@ -334,6 +335,7 @@ class Conversation(MutableRecord):
     queued_action: ScheduledAction | None = None
     queued_action_committed: bool = False
     queue_origin: ConversationState | None = None
+    planning_telemetry: PlanningTelemetry | None = None
 
     def restore_turn_origin(self) -> bool:
         if self.turn_origin is None:
