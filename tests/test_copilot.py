@@ -42,8 +42,12 @@ def copilot_cli(tmp_path, monkeypatch):
         "print(json.loads(sequence)[attempt] if sequence else os.environ['PROBE_EVENTS'], "
         "flush=True)\n"
         "time.sleep(float(os.environ.get('PROBE_EXIT_DELAY', '0')))\n"
-        "print(os.environ.get('PROBE_STDERR', ''), file=sys.stderr, flush=True)\n"
-        "sys.exit(int(os.environ.get('PROBE_EXIT', '0')))\n",
+        "stderr_sequence = os.environ.get('PROBE_STDERR_SEQUENCE')\n"
+        "print(json.loads(stderr_sequence)[attempt] if stderr_sequence "
+        "else os.environ.get('PROBE_STDERR', ''), file=sys.stderr, flush=True)\n"
+        "exit_sequence = os.environ.get('PROBE_EXIT_SEQUENCE')\n"
+        "sys.exit(int(json.loads(exit_sequence)[attempt] if exit_sequence "
+        "else os.environ.get('PROBE_EXIT', '0')))\n",
         encoding="utf-8",
     )
     executable.chmod(0o700)
@@ -619,6 +623,36 @@ def test_repeated_schema_failure_stays_typed_and_stops_after_two_calls(
         )
     assert caught.value.diagnostics.category == "invalid_response"
     assert "private-invalid" not in str(caught.value)
+    assert json.loads(copilot_cli.read_text())["calls"] == 2
+    assert calls == [] and store.get(record.id).task is None
+
+
+def test_transport_failure_on_structural_correction_never_triggers_a_third_call(
+    copilot_cli, monkeypatch, tmp_path,
+):
+    from tests.test_agent_planner import setup
+
+    planner, store, record, tools, calls, _ = setup(tmp_path, {})
+    planner.model = None
+    monkeypatch.setenv("PROBE_EVENTS_SEQUENCE", json.dumps([
+        events('{"action":"plan","text":"Incomplete."}'),
+        "private-provider-output",
+    ]))
+    monkeypatch.setenv("PROBE_STDERR_SEQUENCE", json.dumps(["", "WebSocket closed"]))
+    monkeypatch.setenv("PROBE_EXIT_SEQUENCE", json.dumps([0, 7]))
+    observed = []
+    with pytest.raises(CopilotError) as caught:
+        planner.propose(
+            "Report RMSE.",
+            record,
+            catalog=tools.catalog(),
+            resources={},
+            sources={},
+            observe=observed.append,
+        )
+    assert caught.value.diagnostics.category == "transport"
+    assert observed[0].metrics.correction_round_count == 1
+    assert observed[0].failure.category == "transport"
     assert json.loads(copilot_cli.read_text())["calls"] == 2
     assert calls == [] and store.get(record.id).task is None
 

@@ -60,10 +60,11 @@ Web 启动时装配 `CapabilityRegistry(agent_mode=True)`、`ResourceRegistry`�
 `EngineeringRuntime`、`AgentPlanner` 和 `AgentExecutor`。
 本机后端直接使用兼容 Python 子进程与 MATLAB Engine；远程后端通过 `RemoteSimulinkBackend`。
 
-通用 Agent 的版本化状态保存在本地文件；不使用 LangGraph 或顶层 LangChain 运行时。
+通用 Agent 的版本化状态保存在本地 SQLite WAL 数据库；不使用 LangGraph 或顶层 LangChain 运行时。
 结构化模型传输保留 `langchain-core`、`langchain-openai`、`langsmith` 和 `openai`。
-服务没有 Redis、Celery、SQLite 或任务队列；单进程只接纳一个后台任务。
-Future 完成前不释放执行槽；状态持久化与后台接纳顺序保持一致。
+服务没有 Redis 或 Celery。进程内规划和执行调度器提供有界队列与分 lane 并发；
+本机 MATLAB 默认仍为单槽。入队、恢复和结果发布都通过 SQLite 状态与会话预留核对，
+过期规划不能覆盖更新后的会话。
 
 ## 注册能力与资源
 
@@ -157,6 +158,54 @@ Copilot 适配在空临时目录运行，仅允许加载技能，禁止其文件
 不传递 MATLAB/LLM API 凭据，也不让 CLI 直接执行工程。
 数据范围与使用配置见[使用指南](usage.md#配置大模型)。
 
+## Planning context and provider telemetry
+
+Planning normalizes a closed subset of metric requests and selects candidates from
+registered output, metric, resource-role, and dependency metadata. Unknown intent,
+unknown dependency metadata, unresolved dependencies, or selected dynamic
+dependencies retain the full catalog. Missing resources and unavailable relevant
+backends remain visible for clarification or a capability gap. Selection is
+deterministic and conservative.
+
+Selection metadata is catalog-only and excluded from execution snapshots, so it
+does not rewrite confirmed baseline fingerprints or change capability versions.
+Source selection keeps complete authorized excerpts. Only explicitly scoped,
+unrelated non-user excerpts may be omitted from model context; unclassified
+sources and all user-message sources are retained. The complete authorized
+sources, resource references, project declarations, and catalog remain local for
+binding and validation. Selection grants no permission or execution authority.
+
+The logical redacted request context is limited to exactly 120,000 UTF-8 bytes
+before lossless catalog-schema packing; equality is accepted and 120,001 bytes is
+rejected. The same limit applies to the initial request and structural correction.
+Neither round can silently truncate requirements, quotations, or history to fit.
+An oversized context returns clarification without dispatch.
+
+Conversation `planning_telemetry` contains
+`metrics.serialized_bytes`, `metrics.selected_capability_count`,
+`metrics.selected_source_excerpt_count`,
+`metrics.planning_duration_seconds`, and `metrics.correction_round_count`.
+An optional `failure` contains exactly `category`, `redacted_request_id`,
+`exit_code`, `elapsed_seconds`, `response_bytes`, and a fixed bounded `summary`.
+Provider request IDs are represented by `sha256:` followed by the first 16 hex
+characters of their SHA256 digest, never their original values. The six terminal categories are
+`authentication`, `authorization`, `transport`, `timeout`, `invalid_response`,
+and `process_failure`.
+
+No assembled prompt, response body, credentials, environment dump, or raw stderr
+is stored in telemetry. Original user messages and source documents remain under
+their existing local retention rules; telemetry does not copy them. Managed
+provider-failure logs use only allowlisted category and exit-code data without an
+exception chain. A provider failure is not a capability gap and does not erase
+the previous confirmed task.
+
+Telemetry is persisted with the conversation in SQLite, survives restart, and is
+returned by the authenticated conversation API. Plan-producing success persists
+its telemetry as well as answer and clarification outcomes. Planning releases the
+outer conversation-manager lock during inference, then publishes only if its
+reservation is still current; a superseded reservation cannot publish stale
+messages, task state, or telemetry.
+
 ## 扩展一个能力
 
 可信应用启动代码注册 `Capability(...)`，声明稳定名称与版本、严格输入模型、
@@ -193,6 +242,7 @@ src/flight_agent/
 |   |-- loop.py                  # 有界执行驱动
 |   |-- budget.py                # 预算计算
 |   |-- evidence.py              # 工件、摘要与不可变回执
+|   |-- scheduling.py            # 有界规划队列与分 lane 执行调度
 |   `-- tasks.py                 # 通用依赖图节点与祖先校验
 |-- verification/
 |   |-- coordinator.py           # 会话与任务协调
@@ -200,7 +250,8 @@ src/flight_agent/
 |   |-- agent_runtime.py         # 依赖执行、复用和对账
 |   |-- routes.py                # 会话 API
 |   |-- views.py                 # v2 当前与归档任务只读视图
-|   |-- store.py                 # 会话与任务目录
+|   |-- store.py                 # 会话存储接口与兼容入口
+|   |-- sqlite_store.py          # SQLite WAL 会话、归档与导出
 |   |-- intake.py                # 目录识别、冲突与路径约束
 |   |-- plugins.py               # 生产能力装配
 |   |-- resources.py             # 资源适配器注册

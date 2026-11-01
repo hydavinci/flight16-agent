@@ -16,7 +16,7 @@
 | 模型仿真 | Simulink 及工程实际使用的工具箱 |
 | `stepinfo` | Control System Toolbox |
 | Worker 裕度分析 | 另需 Simulink Control Design |
-| 大模型 | 支持工具调用的 OpenAI 兼容 API，或已登录的本机 Copilot CLI |
+| 大模型 | 支持工具调用的 OpenAI 兼容 API，或支持环境认证的本机 Copilot CLI |
 
 **Python 3.11+ 只是本项目的要求，不代表任意该版本以上的 Python 都能运行 Engine。**
 请先核对 MATLAB 发行版的 Python 兼容性。Web 与 MATLAB 可以使用不同的虚拟环境。
@@ -105,6 +105,57 @@ CLI 须支持 JSON 输出和工具过滤。每次规划会创建新会话，使�
 此后端支持通用 Agent 的结构化规划与证据解释，不直接执行工程。
 
 全部环境变量见[配置项参考](inputs-outputs.md#环境变量)。
+
+## Copilot planning failures and isolation
+
+Copilot planning uses an empty temporary working directory and temporary
+`COPILOT_HOME`. Shell, file reads, writes, URL, and memory tools remain denied.
+Builtin MCP initialization and custom instructions are disabled; the temporary
+profile prevents unrelated user MCP/plugin configuration from being loaded.
+User configuration is never rewritten or copied.
+
+For the locally inspected Copilot CLI 1.0.105, use a supported environment
+authentication source: `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`.
+The adapter forwards authentication only to the child process, not to diagnostics
+or files. Do not paste credentials into a request or a support report.
+
+Operational limitation: no supported switch was established that both isolates
+all user MCP/plugins/session state and transparently reuses every saved-login
+profile. With saved-login-only authentication from `copilot login`, the adapter
+fails explicitly before inference; provide a supported environment authentication
+source. It does not copy saved credentials, edit settings, or retry with a less
+isolated profile. An installed CLI rejecting isolation flags is a
+`process_failure`; update the installation deliberately rather than removing
+restrictions automatically.
+
+Categories and next actions:
+
+- `authentication`: verify the supported environment authentication and account status.
+- `authorization`: verify account entitlement and requested model access.
+- `transport`: check DNS, proxy, WebSocket, and network connectivity.
+- `timeout`: inspect the remaining shared planning deadline and reduce request scope.
+- `invalid_response`: inspect the fixed summary and structured-response compatibility.
+- `process_failure`: verify installation, supported flags, and process cleanup.
+
+There is no automatic inference retry. A single existing structural correction
+may follow a complete JSON response that fails schema validation, a deterministic
+source-selection mismatch, or missing proposed delivery permission. It shares the
+original deadline and the same exact 120,000 UTF-8-byte logical-context ceiling,
+and cannot grant permission or execute a plan. Invalid JSONL, tool activity,
+incomplete responses, and provider failures are not retried. A provider failure
+during correction is terminal, so there is no third call.
+
+The authenticated conversation status API exposes durable `planning_telemetry`
+after SQLite restart. Share only its allowlisted metrics and optional six-field
+failure object, not prompts, raw CLI output, environment variables, credentials,
+or source documents.
+
+Temporary state is removed on success and handled failures. A forcibly killed
+parent can leave `flight-agent-copilot-*` directories in the operating-system
+temporary location. Treat orphaned directories as sensitive, remove them locally
+after confirming no associated process is active, and never attach them to a
+support bundle. Disabled application diagnostics do not imply any guarantee
+about the provider's own server-side retention policy.
 
 ## 运行本机工程
 

@@ -3,12 +3,16 @@ from copy import deepcopy
 import pytest
 from pydantic import ValidationError
 
+from flight_agent.runtime.capabilities import CapabilityRegistry
 from flight_agent.runtime.capability_metadata import CapabilityMetadata, CapabilityPlanning
 from flight_agent.runtime.planning_contracts import PlanningMetrics
 from flight_agent.runtime.requirements import CriterionSource
 from flight_agent.runtime.resources import ResourceReference
 from flight_agent.verification.contracts import Conversation, ConversationMessage
+from flight_agent.verification.diagnostic_planner import DiagnosticReviewer
 from flight_agent.verification.planning_context import select_context
+from flight_agent.verification.plugins import register_builtin_plugins
+from flight_agent.verification.resources import ResourceRegistry
 
 
 def selection_catalog():
@@ -217,12 +221,8 @@ def test_planning_contracts_reject_duplicate_and_unbounded_values():
 
 
 def test_catalog_only_metadata_does_not_change_execution_snapshots():
-    from flight_agent.runtime.capabilities import CapabilityRegistry
     from flight_agent.runtime.capability_metadata import CapabilitySnapshot
     from flight_agent.runtime.contracts import fingerprint
-    from flight_agent.verification.diagnostic_planner import DiagnosticReviewer
-    from flight_agent.verification.plugins import register_builtin_plugins
-    from flight_agent.verification.resources import ResourceRegistry
 
     tools = CapabilityRegistry(agent_mode=True)
     register_builtin_plugins(
@@ -238,3 +238,37 @@ def test_catalog_only_metadata_does_not_change_execution_snapshots():
     restored = CapabilitySnapshot.model_validate(old_payload)
     assert fingerprint(restored.model_dump(mode="json")) == fingerprint(old_payload)
     assert restored == snapshot
+
+
+def test_every_registered_capability_remains_reachable_with_uncertain_intent():
+    tools = CapabilityRegistry(agent_mode=True)
+    register_builtin_plugins(
+        tools,
+        ResourceRegistry(),
+        backend=None,
+        diagnostic_reviewer=DiagnosticReviewer(),
+    )
+    catalog = tools.catalog()
+    request = "Describe all registered engineering capabilities."
+    result = select_context(
+        request,
+        selection_conversation(request),
+        catalog=catalog,
+        resources={},
+        sources={},
+    )
+    assert {entry["name"] for entry in result.catalog} == {
+        entry["name"] for entry in catalog
+    }
+    for entry in catalog:
+        assert entry["metadata"]["planning"] is not None
+        for metric in entry["metadata"]["metrics"]:
+            request = f"Report {metric['id']}."
+            selected = select_context(
+                request,
+                selection_conversation(request),
+                catalog=catalog,
+                resources={},
+                sources={},
+            )
+            assert entry["name"] in {item["name"] for item in selected.catalog}
