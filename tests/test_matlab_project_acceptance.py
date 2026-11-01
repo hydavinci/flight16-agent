@@ -11,7 +11,7 @@ import os
 import shutil
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -403,6 +403,7 @@ def test_injected_web_reuses_registered_backend_for_ui_catalog_and_execution(
         raise AssertionError("Injected runtime must not create an unused local backend")
 
     monkeypatch.setattr(LocalMatlabBackend, "from_environment", classmethod(forbidden))
+    runtime.local_matlab_backend = None
     readiness_calls = []
     original_readiness = owner.readiness
 
@@ -439,59 +440,136 @@ def test_injected_web_reuses_registered_backend_for_ui_catalog_and_execution(
     )
 
 
-def test_injected_runtime_with_registered_local_tools_requires_backend_owner(
-    tmp_path, monkeypatch,
-):
+def _injected_runtime(tmp_path, capabilities, snapshots, *, declared_backend=None):
     from flight_agent.runtime.capabilities import CapabilityRegistry
-    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
     from flight_agent.verification.agent_runtime import AgentContext, AgentExecutor
     from flight_agent.verification.coordinator import EngineeringRuntime
-    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
     from flight_agent.verification.resources import ResourceRegistry
     from flight_agent.verification.store import ConversationStore
 
-    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
-    backend = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
     tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
-    for capability in local_matlab_capabilities(backend):
+    for capability in capabilities:
         tools.register(capability)
     store = ConversationStore(tmp_path / "state")
     resources = ResourceRegistry()
-    runtime = EngineeringRuntime(
+    return EngineeringRuntime(
         store,
         AgentPlanner(model=ScriptedModel(responses=[])),
         AgentExecutor(store, tools, resources, snapshots=snapshots),
         resources,
+        local_matlab_backend=declared_backend,
     )
-    with pytest.raises(ValueError, match="backend owner"):
+
+
+@pytest.mark.parametrize("registered_owner", [None, object()])
+def test_injected_local_capability_requires_registered_backend_owner(
+    tmp_path, registered_owner,
+):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    backend = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    capability = next(
+        capability
+        for capability in local_matlab_capabilities(backend)
+        if capability.name == "matlab_linearize"
+    )
+    runtime = _injected_runtime(
+        tmp_path,
+        [replace(capability, runtime_owner=registered_owner)],
+        snapshots,
+    )
+    with pytest.raises(ValueError, match="runtime owner|backend owner"):
+        create_web_app(tmp_path / "web", engineering_runtime=runtime)
+
+
+def test_injected_runtime_derives_backend_from_linearize_only_registry(
+    tmp_path, monkeypatch,
+):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    backend = LocalMatlabBackend(os.sys.executable)
+    capability = next(
+        capability
+        for capability in local_matlab_capabilities(backend)
+        if capability.name == "matlab_linearize"
+    )
+    runtime = _injected_runtime(tmp_path, [capability], snapshots)
+
+    def forbidden(cls):
+        raise AssertionError("Registered linearize owner must be used")
+
+    monkeypatch.setattr(LocalMatlabBackend, "from_environment", classmethod(forbidden))
+    app = create_web_app(tmp_path / "web", engineering_runtime=runtime)
+    assert backend.snapshots is snapshots
+    assert not snapshots.root.exists()
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        headers = {"X-Flight-Token": bootstrap["token"]}
+        catalog = client.get(f"{API}/capabilities", headers=headers).json()
+    assert bootstrap["local_matlab"]["state"] in {"available", "unavailable"}
+    assert [item["name"] for item in catalog] == ["matlab_linearize"]
+    assert not snapshots.root.exists()
+
+
+def test_injected_runtime_rejects_mixed_registered_local_backend_owners(tmp_path):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    first = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    second = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    first_capabilities = {
+        capability.name: capability for capability in local_matlab_capabilities(first)
+    }
+    second_capabilities = {
+        capability.name: capability for capability in local_matlab_capabilities(second)
+    }
+    runtime = _injected_runtime(
+        tmp_path,
+        [
+            first_capabilities["matlab_linearize"],
+            second_capabilities["matlab_stepinfo"],
+        ],
+        snapshots,
+    )
+    with pytest.raises(ValueError, match="same backend owner"):
+        create_web_app(tmp_path / "web", engineering_runtime=runtime)
+
+
+def test_injected_runtime_rejects_declared_registered_backend_mismatch(tmp_path):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    registered = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    declared = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    runtime = _injected_runtime(
+        tmp_path,
+        local_matlab_capabilities(registered),
+        snapshots,
+        declared_backend=declared,
+    )
+    with pytest.raises(ValueError, match="(?i)declared.*registered"):
         create_web_app(tmp_path / "web", engineering_runtime=runtime)
 
 
 def test_injected_runtime_rejects_backend_snapshot_store_mismatch(tmp_path):
-    from flight_agent.runtime.capabilities import CapabilityRegistry
     from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
-    from flight_agent.verification.agent_runtime import AgentContext, AgentExecutor
-    from flight_agent.verification.coordinator import EngineeringRuntime
     from flight_agent.verification.project_snapshots import ProjectSnapshotStore
-    from flight_agent.verification.resources import ResourceRegistry
-    from flight_agent.verification.store import ConversationStore
 
     backend = LocalMatlabBackend(
         os.sys.executable,
         snapshots=ProjectSnapshotStore(tmp_path / "backend" / "snapshots"),
     )
     executor_snapshots = ProjectSnapshotStore(tmp_path / "executor" / "snapshots")
-    tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
-    for capability in local_matlab_capabilities(backend):
-        tools.register(capability)
-    store = ConversationStore(tmp_path / "state")
-    resources = ResourceRegistry()
-    runtime = EngineeringRuntime(
-        store,
-        AgentPlanner(model=ScriptedModel(responses=[])),
-        AgentExecutor(store, tools, resources, snapshots=executor_snapshots),
-        resources,
-        local_matlab_backend=backend,
+    runtime = _injected_runtime(
+        tmp_path,
+        local_matlab_capabilities(backend),
+        executor_snapshots,
     )
     with pytest.raises(ValueError, match="snapshot store"):
         create_web_app(tmp_path / "web", engineering_runtime=runtime)

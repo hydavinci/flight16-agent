@@ -112,6 +112,20 @@ def test_registered_plugin_computes_real_rmse_in_independent_catalogs():
     assert CapabilityRegistry(agent_mode=True).catalog() == []
 
 
+def test_registry_preserves_typed_runtime_owner_identity():
+    owner = SimpleNamespace(name="backend")
+    registry = CapabilityRegistry(agent_mode=True)
+    registry.register(replace(sink(), runtime_owner=owner))
+
+    assert registry.runtime_owner("consume", SimpleNamespace) is owner
+    with pytest.raises(ValueError, match="runtime owner type"):
+        registry.runtime_owner("consume", dict)
+
+    unowned = CapabilityRegistry(agent_mode=True)
+    unowned.register(sink())
+    assert unowned.runtime_owner("consume", SimpleNamespace) is None
+
+
 @pytest.mark.parametrize(
     "inputs",
     [

@@ -28,6 +28,7 @@ from .runtime.scheduling import (
     PlanningScheduler,
 )
 from .service import BodyLimitMiddleware, install_validation_handler
+from .verification.adapters.local_matlab import LOCAL_MATLAB_CAPABILITY_NAMES
 from .verification.agent_planner import AgentPlanner
 from .verification.agent_runtime import AgentContext, AgentExecutor
 from .verification.backend import AnalysisBackend, RemoteSimulinkBackend
@@ -59,12 +60,32 @@ def _bind_local_matlab_backend(
     return backend
 
 
-def _has_local_matlab_capability(runtime: EngineeringRuntime) -> bool:
-    try:
-        runtime.executor.tools.definition("matlab_execute_project")
-    except ValueError:
-        return False
-    return True
+def _registered_local_matlab_backend(
+    runtime: EngineeringRuntime,
+) -> LocalMatlabBackend | None:
+    tools = runtime.executor.tools
+    registered = [
+        name for name in LOCAL_MATLAB_CAPABILITY_NAMES if tools.registered(name)
+    ]
+    if not registered:
+        return None
+    owners = []
+    for name in registered:
+        owner = tools.runtime_owner(name, LocalMatlabBackend)
+        if owner is None:
+            raise ValueError(
+                f"Registered local MATLAB capability requires its backend owner: {name}"
+            )
+        owners.append(owner)
+    registered_owner = owners[0]
+    if any(owner is not registered_owner for owner in owners[1:]):
+        raise ValueError("Registered local MATLAB capabilities must share the same backend owner")
+    declared_owner = runtime.local_matlab_backend
+    if declared_owner is not None and declared_owner is not registered_owner:
+        raise ValueError(
+            "Declared local MATLAB backend differs from the registered backend owner"
+        )
+    return registered_owner
 
 
 def create_web_app(
@@ -123,11 +144,7 @@ def create_web_app(
             local_matlab_backend=local_backend,
         )
     else:
-        owned_local_backend = engineering_runtime.local_matlab_backend
-        if _has_local_matlab_capability(engineering_runtime) and owned_local_backend is None:
-            raise ValueError(
-                "Injected runtime with local MATLAB capabilities requires its backend owner"
-            )
+        owned_local_backend = _registered_local_matlab_backend(engineering_runtime)
         if owned_local_backend is None:
             owned_local_backend = LocalMatlabBackend.from_environment()
         local_backend = _bind_local_matlab_backend(

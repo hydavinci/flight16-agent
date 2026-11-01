@@ -138,6 +138,20 @@ def metric_case(case, band=0.05):
     )
 
 
+def test_all_local_matlab_capabilities_record_one_backend_owner(tmp_path):
+    module = importlib.import_module("flight_agent.verification.adapters.local_matlab")
+    backend = LocalMatlabBackend(
+        sys.executable,
+        snapshots=ProjectSnapshotStore(tmp_path / "managed" / "snapshots"),
+    )
+    capabilities = module.local_matlab_capabilities(backend)
+
+    assert tuple(capability.name for capability in capabilities) == (
+        module.LOCAL_MATLAB_CAPABILITY_NAMES
+    )
+    assert all(capability.runtime_owner is backend for capability in capabilities)
+
+
 def test_execution_publishes_series_with_actual_producer_and_call(local_adapter_case):
     context, inputs, backend, tools = local_adapter_case
     output = CapabilityOutcome.model_validate(

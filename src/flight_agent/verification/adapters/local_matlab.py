@@ -30,6 +30,13 @@ from ..matlab_contracts import (
     StepinfoInput,
 )
 
+LOCAL_MATLAB_CAPABILITY_NAMES = (
+    "matlab_execute_project",
+    "matlab_stepinfo",
+    "matlab_linearize",
+    "matlab_allmargin",
+)
+
 
 def _project(context: AgentContext) -> MatlabProjectDescriptor:
     resource = context.resource("project")
@@ -328,6 +335,7 @@ def local_matlab_capabilities(
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
+            runtime_owner=backend,
             metadata=CapabilityMetadata(
                 resources=[
                     ResourceRequirement(role="project", kind="matlab_project", location="agent")
@@ -352,6 +360,7 @@ def local_matlab_capabilities(
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
+            runtime_owner=backend,
             metadata=CapabilityMetadata(
                 metrics=[
                     MetricDefinition(id="overshoot", label="Overshoot", unit="%"),
@@ -385,6 +394,7 @@ def local_matlab_capabilities(
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
+            runtime_owner=backend,
             metadata=CapabilityMetadata(
                 resources=[
                     ResourceRequirement(role="project", kind="matlab_project", location="agent")
@@ -421,6 +431,7 @@ def local_matlab_capabilities(
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
+            runtime_owner=backend,
             metadata=CapabilityMetadata(
                 metrics=[
                     MetricDefinition(

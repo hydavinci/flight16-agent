@@ -353,3 +353,160 @@ Licensed MATLAB remained opt-in and was not run. No dependency was installed.
 
 No software-gate concerns. Real licensed MATLAB acceptance was not run because
 it remains explicitly opt-in.
+
+## Review fix round 2/5
+
+Review fix commit:
+the separate commit containing this section and the round 2 implementation
+(no amend, push, or merge).
+
+### Strict TDD evidence
+
+The focused registry/owner tests were added before any round 2 production
+change. They covered:
+
+- generic typed capability runtime-owner persistence and lookup;
+- all four canonical local MATLAB capability names carrying one exact backend;
+- injected execution with the runtime-declared owner deliberately removed;
+- missing and wrong registered owner values;
+- a registry containing only `matlab_linearize`;
+- mixed owners across `matlab_linearize` and `matlab_stepinfo`;
+- declared-versus-registered owner mismatch;
+- derived-owner snapshot-store mismatch.
+
+The valid focused RED run used the required interpreter,
+`RUN_MATLAB_TESTS=0`, and repository-local resolved `.test-tmp`:
+
+```text
+RED: 9 failed
+```
+
+The failures demonstrated the exact production gaps:
+
+```text
+Capability.__init__() got an unexpected keyword argument 'runtime_owner'
+LOCAL_MATLAB_CAPABILITY_NAMES was absent
+declared-owner removal failed with "requires its backend owner"
+linearize-only registration constructed an unrelated environment backend
+mixed registered owners did not fail
+declared-versus-registered mismatch did not fail
+store mismatch was masked by dependence on the missing declaration
+```
+
+After the minimal registration and Web derivation changes:
+
+```text
+GREEN: 9 passed
+```
+
+### Capability registration identity
+
+- `Capability.runtime_owner` is optional and source-compatible, and the frozen
+  capability declaration records the runtime object at construction.
+- `CapabilityRegistry.register()` persists the owner in its private entry
+  beside the operation/readiness/reconciliation handlers that captured it.
+- `CapabilityRegistry.runtime_owner(name, OwnerType)` is the typed, read-only
+  lookup. It returns the exact object by identity, returns `None` for a missing
+  owner, and rejects an owner of the wrong runtime type.
+- `CapabilityRegistry.registered(name)` provides a non-throwing membership
+  check without exposing mutable registry entries.
+- No closure introspection or global ownership map is used.
+
+### Canonical local MATLAB set
+
+`LOCAL_MATLAB_CAPABILITY_NAMES` is the single adapter-owned canonical tuple:
+
+```text
+matlab_execute_project
+matlab_stepinfo
+matlab_linearize
+matlab_allmargin
+```
+
+Every `Capability` returned by `local_matlab_capabilities(backend)` records
+that exact `backend` object as its `runtime_owner`. The adapter regression
+asserts both the complete canonical name set and identity equality for every
+returned capability.
+
+### Injected Web derivation and validation
+
+- Injected Web assembly scans the complete canonical set, not only
+  `matlab_execute_project`.
+- If no canonical local capability is registered, existing custom runtimes
+  remain source-compatible and Web may construct a UI/readiness-only backend.
+- If any canonical capability is registered, its registry owner is the sole
+  source of truth for readiness, catalog availability, execution, and snapshot
+  binding.
+- Missing owners, wrong owner types, mixed owner identities, a different
+  runtime-declared owner, and a different executor snapshot-store identity all
+  fail before the application is returned.
+- `EngineeringRuntime.local_matlab_backend` is only a consistency assertion
+  when registered local capabilities exist. Removing it from a correctly
+  registered injected runtime does not change the derived backend.
+- A linearize-only registry derives and binds its registered backend without
+  creating an unrelated backend or creating the snapshot root.
+- The full injected acceptance test removes the declared owner, forbids
+  environment backend construction, and proves readiness, catalog checks, and
+  real controlled execution still use the registered exact backend/store.
+
+### Preserved behavior
+
+- The round 1 literal legacy request fixture and fixed fingerprint remain
+  unchanged.
+- SQLite marker-free historical restart/reconciliation remains receipt-only.
+- Type/size and same-size digest diagnostics remain distinct.
+- No lifecycle guard spans backend/Engine execution.
+- Existing artifact, conditions, metadata, evidence, reservation, checkpoint,
+  budget, unknown-call, no-redispatch, snapshot identity/reference, and guard
+  semantics remain active.
+
+### Review-round changed files
+
+- `src/flight_agent/runtime/capabilities.py`
+- `src/flight_agent/verification/adapters/local_matlab.py`
+- `src/flight_agent/web.py`
+- `tests/test_agent_capabilities.py`
+- `tests/test_local_matlab_adapters.py`
+- `tests/test_matlab_project_acceptance.py`
+- `.superpowers/sdd/2026-10-31-immutable-project-snapshots/task-6-report.md`
+
+### Review-round validation gates
+
+All pytest gates used
+`/Users/yhe/Work/flight-agent/.venv-matlab/bin/python`,
+`TMPDIR=<resolved worktree>/.test-tmp`, and `RUN_MATLAB_TESTS=0`.
+
+```text
+Focused owner GREEN: 9 passed
+Capability registry suite: 55 passed
+Covering capability/MATLAB/snapshot/recovery/scheduler/SQLite/Web suite:
+  972 passed, 34 skipped
+Full software-safe suite (RUN_BROWSER_TESTS=0, RUN_MATLAB_TESTS=0):
+  1921 passed, 82 skipped
+Ruff --no-cache --no-respect-gitignore src tests: all checks passed
+mypy src: no issues in 74 source files
+git diff --check: passed
+```
+
+Licensed MATLAB remained opt-in and was not run. No dependency was installed.
+
+### Review-round self-review
+
+- Confirmed the immutable registry entry, not a mutable runtime declaration,
+  identity-links each handler to its captured backend.
+- Confirmed every subset of the canonical local set triggers ownership
+  enforcement.
+- Confirmed multiple registered local names must use object identity, not
+  path/configuration equality.
+- Confirmed wrong-type and missing owners fail before readiness or route use.
+- Confirmed runtime declaration mismatch cannot redirect UI or execution.
+- Confirmed production registration and injection use the same exact backend
+  and executor snapshot store.
+- Confirmed no snapshot root is created during binding/bootstrap.
+- Confirmed non-local custom registries retain their existing construction
+  path.
+
+### Review-round concerns
+
+No software-gate concerns. Real licensed MATLAB acceptance was not run because
+it remains explicitly opt-in.

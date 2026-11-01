@@ -18,6 +18,7 @@ Context = TypeVar("Context")
 CapabilityContext = TypeVar("CapabilityContext", contravariant=True)
 Input = TypeVar("Input", bound=Contract)
 Output = TypeVar("Output", bound=Contract)
+Owner = TypeVar("Owner")
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class Capability(Generic[CapabilityContext, Input, Output]):
     reconcile: Callable[[CapabilityContext, Input], Output | None] | None = None
     validate_plan: Callable[["AgentPlan", "AgentNode"], None] | None = None
     scheduling: SchedulingMetadata | None = None
+    runtime_owner: object | None = None
 
 
 class CapabilityDefinition(Contract):
@@ -54,6 +56,7 @@ class _Entry(Generic[Context]):
     reconcile: Callable[[Context, dict[str, JsonValue]], object] | None
     validate_plan: Callable[["AgentPlan", "AgentNode"], None] | None
     scheduling: SchedulingMetadata | None
+    runtime_owner: object | None
 
 
 def validate_output(model: type[BaseModel], value: object) -> dict[str, JsonValue]:
@@ -118,6 +121,7 @@ class CapabilityRegistry(Generic[Context]):
             reconcile if capability.reconcile is not None else None,
             capability.validate_plan,
             scheduling,
+            capability.runtime_owner,
         )
 
     def _entry(self, name: str) -> _Entry[Context]:
@@ -127,6 +131,17 @@ class CapabilityRegistry(Generic[Context]):
 
     def definition(self, name: str) -> CapabilityDefinition:
         return self._entry(name).definition
+
+    def registered(self, name: str) -> bool:
+        return name in self._entries
+
+    def runtime_owner(self, name: str, owner_type: type[Owner]) -> Owner | None:
+        owner = self._entry(name).runtime_owner
+        if owner is None:
+            return None
+        if not isinstance(owner, owner_type):
+            raise ValueError(f"Capability runtime owner type mismatch: {name}")
+        return owner
 
     def scheduling(self, name: str) -> SchedulingMetadata:
         entry = self._entry(name)
