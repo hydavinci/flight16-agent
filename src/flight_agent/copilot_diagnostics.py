@@ -158,8 +158,18 @@ def _feedback_dict(issues: tuple[_SchemaIssue, ...]) -> dict[str, object]:
 
 class _SchemaFeedback(dict[str, object]):
     def __init__(self, issues: tuple[_SchemaIssue, ...]):
-        self.issues = issues
+        object.__setattr__(self, "_issues", issues)
         super().__init__(_feedback_dict(issues))
+
+    @property
+    def issues(self) -> tuple[_SchemaIssue, ...]:
+        return self._issues
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("schema feedback attributes are immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("schema feedback attributes are immutable")
 
 
 def _safe_feedback_issues(
@@ -176,8 +186,7 @@ def _safe_feedback_issues(
         if len(location) > 10 or re.fullmatch(r"[a-z0-9_]{1,100}", code) is None:
             raise ValueError("schema_feedback contains an invalid issue")
         if any(
-            re.fullmatch(r"(?:\[field\]|[A-Za-z_][A-Za-z0-9_]{0,99}|[0-9]{1,10})", part)
-            is None
+            re.fullmatch(r"(?:\[field\]|[A-Za-z_][A-Za-z0-9_]{0,99}|[0-9]{1,10})", part) is None
             for part in location
         ):
             raise ValueError("schema_feedback contains an invalid location")

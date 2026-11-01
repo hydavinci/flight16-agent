@@ -169,6 +169,35 @@ def test_invalid_response_error_owns_immutable_safe_feedback():
     assert "private" not in json.dumps(error.correction_feedback)
 
 
+def test_schema_feedback_rejects_issue_snapshot_reassignment():
+    with pytest.raises(ValidationError) as caught:
+        AgentDecision.model_validate(
+            {
+                "action": "plan",
+                "text": "private-response",
+                "private-secret-field": "private-value",
+            }
+        )
+    source = schema_feedback(caught.value, AgentDecision)
+    diagnostic = make_diagnostics(
+        "invalid_response",
+        stdout="",
+        stderr="",
+        exit_code=0,
+        elapsed_seconds=0.1,
+    )
+    expected = CopilotInvalidResponseError(
+        diagnostic, correction_feedback=source
+    ).correction_feedback
+
+    with pytest.raises(AttributeError, match="immutable"):
+        setattr(source, "issues", ((("private_secret_location",), "private_secret_code"),))
+
+    error = CopilotInvalidResponseError(diagnostic, correction_feedback=source)
+    assert error.correction_feedback == expected
+    assert "private" not in json.dumps(error.correction_feedback)
+
+
 def test_jsonl_request_identity_is_hashed_without_persisting_the_event():
     output = json.dumps(
         {
