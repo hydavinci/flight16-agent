@@ -1,6 +1,6 @@
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from time import monotonic
 from typing import Annotated, Literal, NamedTuple, Self
 
@@ -11,6 +11,7 @@ from ..copilot import CopilotTimeoutError
 from ..runtime.agent_contracts import AgentPlan, AgentPlanDraft
 from ..runtime.capability_metadata import Availability, CapabilitySnapshot
 from ..runtime.contracts import fingerprint
+from ..runtime.planning_contracts import PlanningMetrics, PlanningTelemetry
 from ..runtime.requirements import CapabilityGap, CriterionSource, TaskRequirements
 from ..runtime.resources import AgentContract, ResourceReference, Text
 from .contracts import AgentTask, Conversation, SteadyStatePolicy
@@ -22,9 +23,10 @@ from .matlab_contracts import (
     MatlabProjectDescriptor,
     ProjectExecutionInput,
 )
+from .planning_context import PlanningState, context_byte_size, select_context
 from .structured_planner import StructuredPlanner, conversation_paths, redact_text
 
-MAX_CONTEXT_BYTES = 240_000
+MAX_CONTEXT_BYTES = 120_000
 _CREDENTIAL_KEY = re.compile(
     r"(?i)^(?:authorization|proxyauthorization|apikey|accesstoken|refreshtoken|token|"
     r"password|passwd|secret|clientsecret|cookie|setcookie)$"
@@ -1395,6 +1397,37 @@ class AgentPlanner(StructuredPlanner):
         catalog: list[dict[str, object]],
         resources: dict[str, ResourceReference],
         sources: dict[str, CriterionSource],
+        observe: Callable[[PlanningTelemetry], None] | None = None,
+    ) -> AgentDecision:
+        state = PlanningState(started_at=monotonic())
+        try:
+            return self._propose(
+                message,
+                conversation,
+                catalog=catalog,
+                resources=resources,
+                sources=sources,
+                state=state,
+            )
+        finally:
+            if observe is not None:
+                observe(PlanningTelemetry(metrics=PlanningMetrics(
+                    serialized_bytes=state.serialized_bytes,
+                    selected_capability_count=state.selected_capability_count,
+                    selected_source_excerpt_count=state.selected_source_excerpt_count,
+                    planning_duration_seconds=max(0.0, monotonic() - state.started_at),
+                    correction_round_count=state.correction_round_count,
+                )))
+
+    def _propose(
+        self,
+        message: str,
+        conversation: Conversation,
+        *,
+        catalog: list[dict[str, object]],
+        resources: dict[str, ResourceReference],
+        sources: dict[str, CriterionSource],
+        state: PlanningState,
     ) -> AgentDecision:
         if not message.strip():
             raise ValueError("A nonempty request is required")
@@ -1403,6 +1436,15 @@ class AgentPlanner(StructuredPlanner):
                 action="clarify", text="需求超过长度限制，请拆分后重新提交，避免丢失判据。"
             )
         sources = _authorized_sources(conversation, resources, sources)
+        selection = select_context(
+            message,
+            conversation,
+            catalog=catalog,
+            resources=resources,
+            sources=sources,
+        )
+        state.selected_capability_count = len(selection.catalog)
+        state.selected_source_excerpt_count = len(selection.sources)
         paths = [*conversation_paths(conversation), *(item.locator for item in resources.values())]
         result = None
         if isinstance(conversation.task, AgentTask):
@@ -1417,11 +1459,11 @@ class AgentPlanner(StructuredPlanner):
         raw_context: dict[str, object] = {
             "request": message,
             "has_output_directory": conversation.output_root is not None,
-            "catalog": catalog,
+            "catalog": list(selection.catalog),
             "resources": [
                 item.model_dump(mode="json", exclude={"locator"}) for item in resources.values()
             ],
-            "sources": [source.model_dump(mode="json") for source in sources.values()],
+            "sources": [source.model_dump(mode="json") for source in selection.sources],
             "observation": result,
             "recent_messages": [
                 {"role": item.role, "content": item.content} for item in conversation.messages[-6:]
@@ -1437,20 +1479,21 @@ class AgentPlanner(StructuredPlanner):
         if selections:
             raw_context["source_selections"] = selections
         context = {key: _redact_context(value, paths) for key, value in raw_context.items()}
-        if (
-            len(json.dumps(context, ensure_ascii=False, allow_nan=False).encode("utf-8"))
-            > MAX_CONTEXT_BYTES
-        ):
+        state.serialized_bytes = context_byte_size(context)
+        if state.serialized_bytes > MAX_CONTEXT_BYTES:
             return AgentDecision(
                 action="clarify",
-                text="上下文超过大小限制；未截断需求或判据，请缩小本次输入范围。",
+                text=(
+                    "上下文超过 120 KB（120000 UTF-8 bytes）大小限制；"
+                    "未截断需求、判据或来源原文，请缩小本次输入范围。"
+                ),
             )
         timeout = self._timeout_seconds
         if timeout is None:
             timeout = (
                 ModelSettings.from_environment().timeout_seconds if self.model is None else 60.0
             )
-        deadline = monotonic() + timeout
+        deadline = state.started_at + timeout
         last_error: ValidationError | None = None
         for attempt in range(2):
             remaining = deadline - monotonic()
@@ -1459,6 +1502,7 @@ class AgentPlanner(StructuredPlanner):
                     "方案修正已达到原总超时，本次未生成新方案或触发执行。"
                 ) from last_error
             try:
+                state.correction_round_count = attempt
                 decision = self.with_timeout(remaining)._decision(context, paths)
             except CopilotTimeoutError as exc:
                 raise ValueError(
@@ -1558,12 +1602,14 @@ class AgentPlanner(StructuredPlanner):
                 **context,
                 "validation_feedback": _redact_context(feedback, paths),
             }
-            if (
-                len(json.dumps(context, ensure_ascii=False, allow_nan=False).encode("utf-8"))
-                > MAX_CONTEXT_BYTES
-            ):
-                raise ValueError(
-                    "方案校验反馈超过上下文大小限制，未截断需求；本次未生成新方案或触发执行。"
+            state.serialized_bytes = max(state.serialized_bytes, context_byte_size(context))
+            if state.serialized_bytes > MAX_CONTEXT_BYTES:
+                return AgentDecision(
+                    action="clarify",
+                    text=(
+                        "方案校验反馈超过 120 KB（120000 UTF-8 bytes）大小限制；"
+                        "未截断需求、判据或来源原文，本次未生成新方案或触发执行。"
+                    ),
                 )
         assert last_error is not None
         codes = {error["type"] for error in last_error.errors()}

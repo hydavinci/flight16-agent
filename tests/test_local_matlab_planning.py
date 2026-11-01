@@ -709,8 +709,9 @@ def test_source_selection_correction_respects_context_limit(
         documented_selection_case, monkeypatch,
         [too_large, accept_proposed_selection],
     )
-    with pytest.raises(ValueError, match="大小限制"):
-        submit(documented_selection_case)
+    record = submit(documented_selection_case)
+    assert record.messages[-1].response_kind == "clarify"
+    assert "大小限制" in record.messages[-1].content
     assert len(calls) == 1
     assert documented_selection_case[1].store.recent()[0].task is None
     assert documented_selection_case[3].requests == []
