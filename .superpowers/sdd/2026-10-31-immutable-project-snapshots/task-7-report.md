@@ -197,3 +197,113 @@ committed separately without amend, push, or merge.
 No known in-scope software concern remains. Live Windows and licensed MATLAB
 were not available; existing deterministic Windows API/reparse tests and all
 software-safe gates passed.
+
+## Fix round 1/5: reject cleanup inside an active store transaction
+
+### Finding
+
+`SQLiteConversationStore._read()` deliberately reuses the thread-local SQLite
+connection when one exists. Before this fix, `cleanup_project_snapshots()`
+could therefore read uncommitted retained-reference state and hash or delete
+filesystem objects while an outer `store.transaction()` remained active. A
+later rollback could restore SQLite references after their snapshot objects
+had already been removed.
+
+### Strict TDD evidence
+
+The active-transaction regressions were added before the production guard.
+They cover default dry-run, explicit execute mode, an existing referenced
+object, an eligible unreferenced object, and an eligible staging directory.
+
+RED:
+
+```text
+python -m pytest tests/test_project_snapshot_cleanup.py \
+  -k 'active_transaction or outer_rollback' -q --tb=short
+3 failed
+```
+
+Each failure was the expected missing rejection:
+
+```text
+Failed: DID NOT RAISE ValueError
+```
+
+GREEN after the single production change:
+
+```text
+python -m pytest tests/test_project_snapshot_cleanup.py -q --tb=short
+16 passed
+```
+
+### Fix
+
+`SQLiteConversationStore.cleanup_project_snapshots()` now checks the
+thread-local `transaction_depth` as its first operation and raises:
+
+```text
+ValueError: Project snapshot cleanup requires no active transaction
+```
+
+The check occurs before constructing `ProjectSnapshotStore`, acquiring or
+creating the lifecycle guard/layout, opening any read connection, enumerating
+managed storage, hashing content, or deleting anything. Cleanup does not open a
+second connection and does not commit, roll back, or close the caller's
+transaction.
+
+### Regression guarantees
+
+- Both dry-run and execute cleanup reject from an active outer transaction.
+- The referenced object, eligible orphan, and eligible staging directory all
+  remain present.
+- Baseline JSON and the complete reference-index rows remain byte-for-byte
+  unchanged.
+- The dry-run caller can continue using the same outer transaction and commit
+  subsequent conversation changes.
+- The execute-mode caller can continue using the same outer transaction and
+  independently roll it back.
+- Instrumentation proves the snapshot lifecycle guard is never entered.
+- A store without a snapshot root remains without one after rejection.
+
+### Validation gates
+
+All pytest commands used the selected Python, `RUN_MATLAB_TESTS=0`, and a
+repository-local resolved `TMPDIR`.
+
+```text
+Cleanup/reference/store: 72 passed, 2 skipped
+SQLite transaction regressions: 42 passed
+Stage 4 snapshot regressions: 329 passed, 17 skipped
+Full software: 1937 passed, 82 skipped
+Ruff --no-cache --no-respect-gitignore src tests: all checks passed
+mypy src: no issues in 74 source files
+git diff --check: passed
+```
+
+### Fix commit
+
+```text
+49ec734070af1338df91a1604e5ed25afa8998c4
+fix: reject snapshot cleanup in active transactions
+```
+
+The fix commit includes the required trailers. This report update is a
+separate commit; no amend, push, or merge was used.
+
+### Fix-round self-review
+
+- Confirmed every positive `transaction_depth`, including a transaction whose
+  write connection has not yet been opened, rejects cleanup.
+- Confirmed rejection precedes all snapshot-store construction and guard/root
+  side effects.
+- Confirmed normal cleanup outside a transaction retains the original
+  exclusive-guard and short independent SQLite-read lifetime.
+- Confirmed no behavior of `_read()`, nested savepoints, caller-owned
+  transaction commit/rollback, schema, CLI, HTTP, or retention policy changed.
+- Confirmed the fix is thread-local to the store transaction model and does
+  not weaken the cross-process lifecycle race protection.
+
+### Fix-round concerns
+
+No known in-scope concern remains. Live Windows and licensed MATLAB were not
+run; all software-safe gates passed.
