@@ -30,3 +30,7 @@ def test_documented_bootstrap_uses_existing_dev_extra():
         assert "uv sync --extra dev" in text
         assert "python3 -m pip install uv==0.12.6" in text
         assert "uv sync --locked --extra dev" in text
+        assert 'uv run --no-sync python -m pytest -m "not matlab" -q' in text
+        assert "uv run --no-sync python -m ruff check ." in text
+        assert "uv run --no-sync python -m mypy src" in text
+        assert "uv run --no-sync python -m build --no-isolation" in text

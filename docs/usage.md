@@ -40,6 +40,22 @@ test -e .env || cp .env.example .env
 已许可且 Python 版本匹配的专用环境，按开发验证章节的 `--inexact` 流程运行。
 安装 Python 依赖不代表已安装 MATLAB、Engine、工具箱或许可证。
 
+### 开发验证
+
+普通软件验证在工作树自己的 `.venv` 中执行；先按上节同步锁定依赖，再运行：
+
+```bash
+uv sync --extra dev
+uv run --no-sync python -m pytest -m "not matlab" -q
+uv run --no-sync python -m ruff check .
+uv run --no-sync python -m mypy src
+uv run --no-sync python -m build --no-isolation
+```
+
+`--no-sync` 避免验证命令再次改动环境。真实 MATLAB 验收只能在单独的、已许可且
+Python 版本匹配的 Engine 专用环境中运行；为保留锁文件之外安装的 Engine，先使用
+`uv sync --locked --extra dev --inexact`，不要对该环境执行默认的精确同步。
+
 ### 安装 MATLAB Engine
 
 先安装并激活 MATLAB，再在兼容的 Python 环境中安装匹配的 Engine。
