@@ -826,3 +826,40 @@ def test_spawned_processes_publish_one_complete_object(tmp_path):
                 process.join(timeout=5)
         results.close()
         results.join_thread()
+
+
+def test_same_size_and_timestamp_do_not_hide_tampering(tmp_path):
+    source, project, store, binding = snapshot_case(tmp_path)
+    path = store.verify(binding) / "initialize.m"
+    before = path.stat()
+    raw = path.read_bytes()
+    changed = bytes([raw[0] ^ 1]) + raw[1:]
+    path.chmod(0o644)
+    path.write_bytes(changed)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    path.chmod(0o444)
+    assert path.stat().st_size == before.st_size
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+    with pytest.raises(ValueError, match="digest"):
+        store.verify(binding)
+
+
+def test_source_symlink_replacement_before_copy_fails_closed(tmp_path):
+    source, project, existing, binding = snapshot_case(tmp_path)
+    store = ProjectSnapshotStore(tmp_path / "other" / "snapshots")
+    path = source / "initialize.m"
+    path.unlink()
+    path.symlink_to(source / "README.md")
+    with store.guard(), pytest.raises(ValueError, match="symlink"):
+        store.ensure(project)
+    assert not list((store.root / "objects").glob("*/*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO type test")
+def test_source_special_file_is_never_copied(tmp_path):
+    source, project, existing, binding = snapshot_case(tmp_path)
+    store = ProjectSnapshotStore(tmp_path / "other" / "snapshots")
+    os.mkfifo(source / "pipe")
+    with store.guard(), pytest.raises(ValueError, match="special file"):
+        store.ensure(project)
+    assert not list((store.root / "objects").glob("*/*"))

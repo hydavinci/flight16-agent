@@ -1251,3 +1251,43 @@ def test_snapshot_and_work_roots_cannot_overlap_external_delivery(tmp_path):
     with pytest.raises(ValueError, match="overlap"):
         executor.propose(record, delivery_plan)
     assert not executor.snapshots.root.exists()
+
+
+@pytest.mark.parametrize(
+    "kind,location", [("simulink_project", "worker"), ("diagnostic_data", "agent")]
+)
+def test_non_snapshot_resources_still_use_registered_verification(
+    tmp_path, kind, location
+):
+    from flight_agent.runtime.agent_contracts import AgentBaseline
+    from flight_agent.verification.snapshot_binding import verify_execution_resources
+
+    resource = ResourceReference(
+        id="external",
+        kind=kind,
+        location=location,
+        locator=str(tmp_path / "external"),
+        fingerprint="a" * 64,
+    )
+    data = analysis_plan_data()
+    baseline = AgentBaseline.model_validate(
+        {
+            **data,
+            "resources": [resource.model_dump(mode="json")],
+            "version": 1,
+            "confirmed": True,
+            "confirmed_at": "2026-10-31T00:00:00+00:00",
+        }
+    )
+    registry = ResourceRegistry()
+    seen = []
+
+    def reject_changed(current):
+        seen.append(current)
+        raise ValueError("Registered resource changed")
+
+    registry.register(kind, location, reject_changed, local=location == "agent")
+    with pytest.raises(ValueError, match="changed"):
+        verify_execution_resources(baseline, registry)
+    assert seen == [resource]
+    assert baseline.project_snapshots == {}

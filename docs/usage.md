@@ -445,3 +445,28 @@ explicitly resumed; no dispatched call existed until the permit was acquired.
 An already dispatched unknown call retains its identity and budget charge and
 cannot be retried until the original operation is reconciled. Existing evidence
 and source project directories are not removed by scheduler recovery.
+
+### Snapshot confirmation and cleanup
+
+A changed source fingerprint before confirmation requires rediscovery and a new
+confirmation. After confirmation, local operations use the selected immutable
+snapshot even if the original source is edited or removed. Worker project and
+offline diagnostic resource verification retain their existing behavior.
+
+Historical v2 confirmations and invocation hashes remain readable. A historical
+local task without a snapshot binding cannot dispatch new project work; propose
+and confirm a new baseline. An unresolved historical call must first reconcile
+its original receipt and is never resubmitted automatically.
+
+From the application checkout, preview snapshot cleanup for the default store:
+
+    python -c "from pathlib import Path; from flight_agent.verification.store import ConversationStore; print(ConversationStore(Path('runs/verification').resolve()).cleanup_project_snapshots())"
+
+After reviewing the report, delete only verified unreferenced managed objects:
+
+    python -c "from pathlib import Path; from flight_agent.verification.store import ConversationStore; print(ConversationStore(Path('runs/verification').resolve()).cleanup_project_snapshots(dry_run=False))"
+
+Use the actual conversation-store root if the application runs in another state
+directory. A database error prevents deletion. Corrupt or ambiguous objects are
+reported for manual investigation. Completion alone never releases evidence
+retention, and deleting external files is not a request to release their snapshot.

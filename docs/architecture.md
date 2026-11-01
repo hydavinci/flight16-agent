@@ -295,3 +295,32 @@ Python 包包含静态资源和受控 MATLAB 支持函数，不包含 MATLAB、�
 显式 `--apply` 才删除正面识别为 v1 的会话目录，保留 v2、未知记录和外部成果。
 源路径必须通过 `Path.resolve(strict=True)` 严格解析；无法解析或包含于待删目录时跳过。
 清理器不依赖任何旧任务契约；详见[历史清理](usage.md#历史清理)。
+
+## Confirmed Local Project Snapshots
+
+Static discovery is read-only. Exact-version trusted confirmation revalidates the
+selected source fingerprint, verifies or atomically publishes a canonical
+content-addressed snapshot, and commits its identity and manifest with the task.
+The immutable object lives under the conversation store's `snapshots/objects`.
+The original resource reference remains provenance; it is not rewritten into an
+execution path.
+
+New local project execution and linearization copy verified immutable bytes into
+managed `work/<conversation>/<task>/calls/<call>/local-matlab/project` directories.
+stepinfo and allmargin use independently copied, verified direct-dependency
+artifacts, with the originating snapshot lineage in their invocation receipts.
+MATLAB never runs in the immutable object. New backend working files,
+`request.json`, and `state.json` do not live in an external delivery directory.
+Authenticated Agent checkpoints and immutable receipts retain their established
+evidence-store location and digest checks.
+
+Every use, including cache reuse and new-style reconciliation, verifies the full
+manifest and file digests. Source changes after confirmation do not redirect
+execution. A later source version requires a new proposal and confirmation.
+Tampered managed objects fail closed and are never silently repaired.
+
+Cleanup uses a cross-process lifecycle guard and the complete SQLite reference
+index. Current and archived persisted task baselines retain snapshots regardless
+of terminal status, preserving retained evidence. Cleanup is explicit and dry-run
+by default; it never traverses sources, Worker locators, delivery roots, or work
+directories. Read-only permissions are not a security sandbox.
