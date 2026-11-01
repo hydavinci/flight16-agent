@@ -68,6 +68,24 @@ def local_request(tmp_path):
     )
 
 
+def test_legacy_request_json_preserves_exact_canonical_identity():
+    path = Path(__file__).parent / "fixtures" / "legacy_local_matlab_request.json"
+    literal = path.read_bytes().rstrip(b"\n")
+    request = LocalMatlabRequest.model_validate_json(literal)
+    serialized = json.dumps(
+        request.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    assert serialized == literal
+    assert b'"project_snapshot"' not in serialized
+    assert (
+        fingerprint(request.model_dump(mode="json"))
+        == "1969c54525d004eb70a1ae1d2de3e8ee44cf8201b7897a0bb0a97c149e732feb"
+    )
+
+
 def test_probe_selected_interpreter_without_starting_engine(local_backend, tmp_path, monkeypatch):
     marker = tmp_path / "probe-starts"
     monkeypatch.setenv("TEST_LOCAL_STARTS", str(marker))
@@ -173,7 +191,7 @@ def test_tampered_managed_snapshot_never_starts_engine(
     tree = local_backend.snapshots.verify(local_request.project_snapshot)
     path = tree / "initialize.m"
     path.chmod(0o644)
-    path.write_text("changed = 1;\n")
+    path.write_bytes(b"x" * path.stat().st_size)
     path.chmod(0o444)
     with pytest.raises(ValueError, match="digest"):
         local_backend.execute(local_request, tmp_path / "work")

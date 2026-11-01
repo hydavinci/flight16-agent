@@ -49,6 +49,24 @@ class DirectorySelectionRequest(BaseModel):
     path: str = Field(default="", max_length=4096)
 
 
+def _bind_local_matlab_backend(
+    backend: LocalMatlabBackend, snapshots: ProjectSnapshotStore
+) -> LocalMatlabBackend:
+    if backend.snapshots is None:
+        backend.snapshots = snapshots
+    elif backend.snapshots is not snapshots:
+        raise ValueError("Local MATLAB backend and executor must share one snapshot store")
+    return backend
+
+
+def _has_local_matlab_capability(runtime: EngineeringRuntime) -> bool:
+    try:
+        runtime.executor.tools.definition("matlab_execute_project")
+    except ValueError:
+        return False
+    return True
+
+
 def create_web_app(
     root: Path,
     *,
@@ -83,9 +101,10 @@ def create_web_app(
         if engineering_runtime is not None
         else ProjectSnapshotStore(conversations.root / "snapshots")
     )
-    local_backend = LocalMatlabBackend.from_environment()
-    local_backend.snapshots = snapshots
     if engineering_runtime is None:
+        local_backend = _bind_local_matlab_backend(
+            LocalMatlabBackend.from_environment(), snapshots
+        )
         tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
         register_builtin_plugins(
             tools, resources, backend=backend,
@@ -101,6 +120,19 @@ def create_web_app(
                 snapshots=snapshots,
             ),
             resources,
+            local_matlab_backend=local_backend,
+        )
+    else:
+        owned_local_backend = engineering_runtime.local_matlab_backend
+        if _has_local_matlab_capability(engineering_runtime) and owned_local_backend is None:
+            raise ValueError(
+                "Injected runtime with local MATLAB capabilities requires its backend owner"
+            )
+        if owned_local_backend is None:
+            owned_local_backend = LocalMatlabBackend.from_environment()
+        local_backend = _bind_local_matlab_backend(
+            owned_local_backend,
+            snapshots,
         )
     runtime = engineering_runtime
     manager = ConversationManager(

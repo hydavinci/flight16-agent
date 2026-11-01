@@ -554,6 +554,16 @@ def test_managed_tamper_is_never_reused(tmp_path, damage):
     assert obj.exists()  # No automatic repair or replacement of a corrupt identity.
 
 
+def test_size_mismatch_reports_type_size_without_claiming_digest_check(tmp_path):
+    _, _, store, binding = snapshot_case(tmp_path)
+    path = store.object_directory(binding.snapshot_id) / "tree" / "initialize.m"
+    path.chmod(0o644)
+    path.write_bytes(path.read_bytes() + b"x")
+    path.chmod(0o444)
+    with pytest.raises(ValueError, match=r"^Snapshot file type/size mismatch:"):
+        store.verify(binding)
+
+
 def test_work_copy_is_independent_and_source_is_not_reopened(tmp_path):
     source, project, store, binding = snapshot_case(tmp_path)
     shutil.rmtree(source)

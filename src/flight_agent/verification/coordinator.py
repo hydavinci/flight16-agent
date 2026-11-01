@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from functools import partial
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from ..runtime.resources import ResourceReference
 from .agent_planner import AgentPlanner, bind_plan, message_sources
@@ -16,6 +16,9 @@ from .intake import parse_directories, validate_output_root
 from .resources import ResourceRegistry, resolve_location
 from .scheduling_recovery import conservative_failure_transition
 from .store import now
+
+if TYPE_CHECKING:
+    from .local_matlab import LocalMatlabBackend
 
 Action = Literal["confirm", "resume", "retry"]
 
@@ -41,7 +44,9 @@ class EngineeringRuntime:
         planner: AgentPlanner,
         executor: AgentExecutor,
         resources: ResourceRegistry,
-    ):
+        *,
+        local_matlab_backend: "LocalMatlabBackend | None" = None,
+    ) -> None:
         if executor.store is not store or executor.resources is not resources:
             raise ValueError("Coordinator and executor must share store and resources")
         self.store = store
@@ -49,6 +54,7 @@ class EngineeringRuntime:
         self.executor = executor
         self.resources = resources
         self.locks = executor.locks
+        self.local_matlab_backend = local_matlab_backend
 
     @staticmethod
     def _message(record: Conversation, role: str, text: str) -> None:

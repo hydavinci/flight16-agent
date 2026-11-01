@@ -10,6 +10,9 @@ Base:
 Implementation commit:
 `dbf559cbd47802257a90ded8cd87407227f5a772`
 
+Initial report commit:
+`1cdc8a2dff25ab08ec689d91a0b97f3607238f63`
+
 ## TDD evidence
 
 ### RED
@@ -137,9 +140,8 @@ Licensed MATLAB remained opt-in and was not run.
 - `tests/test_local_matlab_integration.py`
 - `.superpowers/sdd/2026-10-31-immutable-project-snapshots/task-6-report.md`
 
-The snapshot-store diagnostic now describes early type/size tampering as a
-digest/type/size mismatch so all immutable-object corruption fails with the
-required digest classification.
+The snapshot-store diagnostic distinguishes an early file type/size mismatch
+from a same-size content digest mismatch.
 
 ## Validation gates
 
@@ -182,6 +184,172 @@ Executed gates:
 - Confirmed no schema, dependency, push, merge, or amend was introduced.
 
 ## Concerns
+
+No software-gate concerns. Real licensed MATLAB acceptance was not run because
+it remains explicitly opt-in.
+
+## Review fix round 1/5
+
+Review fix commit:
+the commit containing this report update (separate from both Task 6 commits
+listed above; no amend, push, or merge).
+
+### Strict TDD evidence
+
+The seven focused review tests were written or corrected before the review
+production changes. The first run used the required interpreter,
+`RUN_MATLAB_TESTS=0`, and the repository-local resolved `.test-tmp`:
+
+```text
+tests/test_local_matlab.py::test_legacy_request_json_preserves_exact_canonical_identity
+tests/test_local_matlab.py::test_tampered_managed_snapshot_never_starts_engine
+tests/test_project_snapshot_store.py::test_size_mismatch_reports_type_size_without_claiming_digest_check
+tests/test_matlab_project_acceptance.py::test_injected_web_reuses_registered_backend_for_ui_catalog_and_execution
+tests/test_matlab_project_acceptance.py::test_injected_runtime_with_registered_local_tools_requires_backend_owner
+tests/test_matlab_project_acceptance.py::test_injected_runtime_rejects_backend_snapshot_store_mismatch
+tests/test_matlab_project_acceptance.py::test_persisted_marker_free_metric_reconciles_original_directory_after_restart
+
+RED: 5 failed, 2 passed
+```
+
+The RED failures were specific to the review:
+
+- `EngineeringRuntime` did not expose ownership of its registered local
+  backend;
+- injected Web assembly constructed/configured a different backend rather than
+  reusing the capability closures' owner;
+- missing ownership and mismatched snapshot stores did not fail closed;
+- persisted restart coverage could not address the runtime's actual backend
+  owner;
+- a pure size mismatch incorrectly claimed that digest validation had run.
+
+The literal legacy request and corrected same-size digest-tamper tests already
+passed at RED, proving those compatibility/security behaviors did not require a
+production change.
+
+After the production changes:
+
+```text
+GREEN: 7 passed
+```
+
+A later focused rerun after the final typing/import correction also passed all
+seven tests.
+
+### Runtime ownership and shared-store wiring
+
+- `EngineeringRuntime` accepts an optional keyword-only
+  `local_matlab_backend`, preserving every existing positional constructor.
+- Production assembly records the exact backend passed to
+  `register_builtin_plugins()`.
+- Injected Web assembly reuses that exact object for readiness and catalog
+  availability; registered capability closures continue executing through the
+  same object.
+- The owner is bound once to `executor.snapshots` when its store is absent.
+- A different non-`None` store instance fails closed, even if paths could
+  appear equivalent.
+- An injected runtime registering `matlab_execute_project` without an exposed
+  owner fails closed rather than configuring an unused backend.
+- A runtime without local MATLAB capabilities may still obtain a separate
+  UI/readiness-only backend.
+- Binding and bootstrap do not enter a lifecycle guard or create the snapshot
+  root. No guard spans Engine/backend execution.
+
+### Legacy request identity
+
+`tests/fixtures/legacy_local_matlab_request.json` is literal canonical
+pre-Task-6 JSON with no `project_snapshot`. Current validation reserializes it
+byte-for-byte, continues omitting that field, and preserves the independently
+fixed expected fingerprint:
+
+```text
+1969c54525d004eb70a1ae1d2de3e8ee44cf8201b7897a0bb0a97c149e732feb
+```
+
+The assertion does not derive its expected fingerprint from the current
+serializer.
+
+### Persisted marker-free restart
+
+The new acceptance test uses the real SQLite-backed Web/runtime store. It:
+
+- persists a completed project call followed by an unknown metric call;
+- creates a genuine historical external call directory and receipt;
+- removes `backend_directory`, republishes the digest-bound checkpoint, deletes
+  the managed call directory, and removes the original source;
+- reconstructs Web/runtime from SQLite and resumes through HTTP;
+- forbids process spawning during reconciliation;
+- proves the original call IDs, request/state/result/checkpoint bytes, budget,
+  Engine-start marker, and snapshot inventory remain unchanged;
+- proves no replacement managed directory, source/snapshot synthesis,
+  redispatch, or new Engine start occurs.
+
+This preserves receipt-only marker-free reconciliation and authenticated
+checkpoint/receipt semantics across an actual process-style restart.
+
+### Diagnostic correction
+
+Pure type/size tampering again reports:
+
+```text
+Snapshot file type/size mismatch
+```
+
+The backend digest-tamper test now changes content without changing size, so
+its expected digest diagnostic is reached only after hashing.
+
+### Review-round changed files
+
+- `src/flight_agent/verification/coordinator.py`
+- `src/flight_agent/verification/project_snapshots.py`
+- `src/flight_agent/web.py`
+- `tests/fixtures/legacy_local_matlab_request.json`
+- `tests/test_local_matlab.py`
+- `tests/test_matlab_project_acceptance.py`
+- `tests/test_project_snapshot_store.py`
+- `.superpowers/sdd/2026-10-31-immutable-project-snapshots/task-6-report.md`
+
+### Review-round validation gates
+
+All pytest gates used
+`/Users/yhe/Work/flight-agent/.venv-matlab/bin/python`,
+`TMPDIR=<resolved worktree>/.test-tmp`, and `RUN_MATLAB_TESTS=0`.
+
+```text
+Focused review GREEN: 7 passed
+Restart/injected regression check: 3 passed
+Covering MATLAB/snapshot/recovery/scheduler/SQLite/Web suite:
+  912 passed, 34 skipped
+Full software-safe suite (RUN_BROWSER_TESTS=0, RUN_MATLAB_TESTS=0):
+  1915 passed, 82 skipped
+Ruff --no-cache --no-respect-gitignore src tests: all checks passed
+mypy src: no issues in 74 source files
+git diff --check: passed
+```
+
+Licensed MATLAB remained opt-in and was not run. No dependency was installed.
+
+### Review-round self-review
+
+- Confirmed injected readiness, catalog checks, and execution share one exact
+  backend/store identity.
+- Confirmed fail-closed paths run before an injected application becomes
+  usable.
+- Confirmed UI-only fallback does not alter runtimes with registered local
+  operations.
+- Confirmed the legacy fixture has no synthesized snapshot field and its
+  canonical bytes/fingerprint are fixed literals.
+- Confirmed restart recovery is SQLite-backed, marker-free, digest-bound, and
+  receipt-only.
+- Confirmed the recovery path neither opens the removed source nor creates a
+  new managed snapshot/work directory.
+- Confirmed the diagnostic test separates pre-hash size rejection from
+  same-size digest rejection.
+- Confirmed existing adapter artifact, conditions, metadata, evidence,
+  reservation, checkpoint, budget, unknown-call, and no-redispatch checks pass
+  unchanged.
+
+### Review-round concerns
 
 No software-gate concerns. Real licensed MATLAB acceptance was not run because
 it remains explicitly opt-in.
