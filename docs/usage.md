@@ -26,13 +26,19 @@
 在项目根目录执行，以下命令使用 macOS/Linux shell：
 
 ```bash
-python3 -m venv .venv
+python3 -m pip install uv==0.12.6
+uv sync --extra dev
 source .venv/bin/activate
-python -m pip install -e .
-cp .env.example .env
+test -e .env || cp .env.example .env
 ```
 
-已有 `.env` 时不要覆盖。安装项目不会自动安装 MATLAB、Engine 或大模型服务。
+开发依赖使用已提交的 uv.lock；CI 使用 `uv sync --locked --extra dev`，
+锁文件过期时直接失败，不在 CI 中重新解析依赖。更新依赖时先运行 `uv lock`，
+检查 uv.lock 差异并重新运行完整软件验证，再一起提交 pyproject.toml 与 uv.lock。
+`uv sync` 默认精确同步，可能移除锁文件之外安装的 MATLAB Engine。
+不要在已有 Engine 的环境中直接执行该命令；真实 MATLAB 验收使用单独的、
+已许可且 Python 版本匹配的专用环境，按开发验证章节的 `--inexact` 流程运行。
+安装 Python 依赖不代表已安装 MATLAB、Engine、工具箱或许可证。
 
 ### 安装 MATLAB Engine
 

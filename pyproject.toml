@@ -22,7 +22,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10", "ruff>=0.12", "mypy>=1.15", "build>=1.2", "playwright>=1.50,<2"]
+dev = [
+    "pytest>=8,<10",
+    "ruff>=0.12",
+    "mypy>=1.15",
+    "build>=1.2",
+    "playwright>=1.50,<2",
+    "setuptools>=77",
+    "wheel>=0.45",
+    "pyyaml>=6,<7",
+]
+
+[tool.uv]
+required-version = "==0.12.6"
 
 [project.scripts]
 flight-agent = "flight_agent.cli:main"
