@@ -7,11 +7,11 @@ from threading import Event
 import pytest
 
 from flight_agent.runtime.project_snapshots import ProjectSnapshot
-from flight_agent.verification.contracts import Conversation
+from flight_agent.verification.contracts import Conversation, ConversationMessage
 from flight_agent.verification.matlab_contracts import MatlabProjectDescriptor
 from flight_agent.verification.matlab_projects import discover_matlab_project
 from flight_agent.verification.project_snapshots import ProjectSnapshotStore
-from flight_agent.verification.store import ConversationStore
+from flight_agent.verification.store import ConversationStore, now
 from tests.matlab_project_helpers import prepared_project
 from tests.snapshot_helpers import manifest_for, snapshot_case
 from tests.test_project_snapshot_references import (
@@ -66,6 +66,42 @@ def confirm_from_process(
         results.put(("error", repr(exc)))
 
 
+def transaction_cleanup_case(tmp_path):
+    _, _, snapshots, retained = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    record = record_with_binding(store, retained)
+    with snapshots.guard():
+        store.save(record)
+    orphan_source = prepared_project(tmp_path / "orphan-source")
+    (orphan_source / "README.md").write_text("unreferenced snapshot\n")
+    orphan_project = discover_matlab_project(str(orphan_source))
+    with snapshots.guard():
+        orphan = snapshots.ensure(orphan_project)
+    temporary = snapshots.root / "staging" / f"snap-{'c' * 32}"
+    temporary.mkdir()
+    (temporary / "partial").write_bytes(b"owned staging data")
+    return store, record, snapshots, retained, orphan, temporary
+
+
+def persisted_snapshot_state(store, task_id):
+    with store._read() as connection:
+        baseline = connection.execute(
+            "SELECT baseline_json FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()[0]
+        references = connection.execute(
+            """SELECT task_id, resource_id, snapshot_id,
+                      source_fingerprint, manifest_json
+               FROM project_snapshot_references
+               ORDER BY task_id, resource_id"""
+        ).fetchall()
+    return str(baseline), [tuple(row) for row in references]
+
+
+def message(content):
+    return ConversationMessage(role="user", content=content, created_at=now())
+
+
 def test_dry_run_and_explicit_orphan_cleanup_preserve_external_directories(tmp_path):
     source, _, snapshots, binding = snapshot_case(tmp_path)
     store = ConversationStore(tmp_path / "managed")
@@ -88,6 +124,103 @@ def test_dry_run_and_explicit_orphan_cleanup_preserve_external_directories(tmp_p
     assert (source / "initialize.m").read_bytes() == original
     assert (delivery / "report.docx").read_bytes() == b"retained external report"
     assert (work / "keep.txt").is_file()
+
+
+def test_dry_run_cleanup_rejects_active_transaction_before_guard_and_can_commit(
+    tmp_path, monkeypatch
+):
+    store, record, snapshots, retained, orphan, temporary = (
+        transaction_cleanup_case(tmp_path)
+    )
+    before = persisted_snapshot_state(store, record.task.id)
+    guard_entries = []
+    original_guard = ProjectSnapshotStore.guard
+
+    @contextmanager
+    def observe_guard(instance, *, exclusive=False):
+        guard_entries.append(exclusive)
+        with original_guard(instance, exclusive=exclusive):
+            yield
+
+    monkeypatch.setattr(ProjectSnapshotStore, "guard", observe_guard)
+    with store.transaction():
+        record.messages.append(message("outer commit before rejection"))
+        store.save(record)
+        with pytest.raises(ValueError, match="cleanup requires no active transaction"):
+            store.cleanup_project_snapshots()
+        record.messages.append(message("outer commit after rejection"))
+        store.save(record)
+
+    assert [item.content for item in store.get(record.id).messages[-2:]] == [
+        "outer commit before rejection",
+        "outer commit after rejection",
+    ]
+    assert guard_entries == []
+    assert persisted_snapshot_state(store, record.task.id) == before
+    snapshots.verify(retained)
+    snapshots.verify(orphan)
+    assert temporary.is_dir()
+
+
+def test_execute_cleanup_rejects_active_transaction_and_outer_rollback_survives(
+    tmp_path, monkeypatch
+):
+    store, record, snapshots, retained, orphan, temporary = (
+        transaction_cleanup_case(tmp_path)
+    )
+    before_record = store.get(record.id)
+    before_snapshots = persisted_snapshot_state(store, record.task.id)
+    guard_entries = []
+    original_guard = ProjectSnapshotStore.guard
+
+    @contextmanager
+    def observe_guard(instance, *, exclusive=False):
+        guard_entries.append(exclusive)
+        with original_guard(instance, exclusive=exclusive):
+            yield
+
+    monkeypatch.setattr(ProjectSnapshotStore, "guard", observe_guard)
+    with pytest.raises(RuntimeError, match="outer rollback"):
+        with store.transaction():
+            record.messages.append(message("outer rollback before rejection"))
+            store.save(record)
+            with pytest.raises(
+                ValueError,
+                match="cleanup requires no active transaction",
+            ):
+                store.cleanup_project_snapshots(dry_run=False)
+            record.messages.append(message("outer rollback after rejection"))
+            store.save(record)
+            assert [
+                item.content for item in store.get(record.id).messages[-2:]
+            ] == [
+                "outer rollback before rejection",
+                "outer rollback after rejection",
+            ]
+            raise RuntimeError("outer rollback")
+
+    assert store.get(record.id) == before_record
+    assert guard_entries == []
+    assert persisted_snapshot_state(store, record.task.id) == before_snapshots
+    snapshots.verify(retained)
+    snapshots.verify(orphan)
+    assert temporary.is_dir()
+
+
+def test_active_transaction_rejection_does_not_create_snapshot_root(tmp_path):
+    store = ConversationStore(tmp_path / "managed")
+    record = store.create()
+    snapshot_root = store.root / "snapshots"
+    assert not snapshot_root.exists()
+
+    with store.transaction():
+        record.messages.append(message("transaction remains usable"))
+        store.save(record)
+        with pytest.raises(ValueError, match="cleanup requires no active transaction"):
+            store.cleanup_project_snapshots(dry_run=False)
+
+    assert not snapshot_root.exists()
+    assert store.get(record.id).messages[-1].content == "transaction remains usable"
 
 
 def test_archived_terminal_baseline_retains_snapshot_after_restart(tmp_path):

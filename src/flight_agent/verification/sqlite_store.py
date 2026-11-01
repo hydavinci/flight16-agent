@@ -209,6 +209,10 @@ class SQLiteConversationStore:
     def cleanup_project_snapshots(
         self, *, dry_run: bool = True
     ) -> SnapshotCleanupReport:
+        if getattr(self._local, "transaction_depth", 0):
+            raise ValueError(
+                "Project snapshot cleanup requires no active transaction"
+            )
         snapshots = ProjectSnapshotStore(self.root / "snapshots")
         with snapshots.guard(exclusive=True):
             with self._read() as connection:
