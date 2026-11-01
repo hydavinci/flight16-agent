@@ -46,6 +46,7 @@ from ..runtime.observations import (
     TaskResult,
     combine_outcomes,
 )
+from ..runtime.planning_contracts import PlanningTelemetry
 from ..runtime.project_snapshots import ProjectSnapshot
 from ..runtime.requirements import CapabilityGap
 from ..runtime.resources import ResourceReference, bounded_json
@@ -547,7 +548,13 @@ class AgentExecutor:
             output,
         )
 
-    def propose(self, conversation: Conversation, plan: AgentPlan) -> Conversation:
+    def propose(
+        self,
+        conversation: Conversation,
+        plan: AgentPlan,
+        *,
+        planning_telemetry: PlanningTelemetry | None = None,
+    ) -> Conversation:
         with self.locks.hold(conversation.id):
             conversation = self.store.get(conversation.id)
             if conversation.status in ("queued", "running"):
@@ -606,6 +613,8 @@ class AgentExecutor:
                     "资源、权限与预算后确认。"
                 ),
             )
+            if planning_telemetry is not None:
+                conversation.planning_telemetry = planning_telemetry
             conversation.messages.append(
                 ConversationMessage(
                     role="assistant",

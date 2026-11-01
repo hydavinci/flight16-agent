@@ -1,7 +1,7 @@
 import json
 import logging
 import sqlite3
-from threading import Event
+from threading import Event, Thread
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +14,7 @@ from flight_agent.verification.agent_planner import AgentDecision
 from flight_agent.verification.contracts import PendingDecision
 from flight_agent.verification.routes import ConversationManager, MessageRequest
 from flight_agent.verification.sqlite_store import SQLiteConversationStore
-from tests.agent_helpers import make_agent_web
+from tests.agent_helpers import draft_data, make_agent_web, wait_for_conversation
 from tests.scheduling_helpers import make_runtime, propose_fake
 
 
@@ -63,6 +63,35 @@ def test_managed_success_persists_metrics_and_clears_them_on_next_admission(tmp_
         assert runtime.store.get(saved.id).planning_telemetry is None
     finally:
         manager.close()
+
+
+def test_managed_plan_success_exposes_telemetry_and_survives_restart(tmp_path):
+    app, runtime, _, _ = make_agent_web(
+        tmp_path,
+        [{"action": "plan", "text": "Confirm analysis.", "plan": draft_data()}],
+    )
+
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = {"x-flight-token": client.get("/api/bootstrap").json()["token"]}
+        queued = client.post(
+            "/api/conversations",
+            headers=headers,
+            json={"message": "Analyze supplied arrays."},
+        ).json()
+        response = wait_for_conversation(
+            client,
+            queued["id"],
+            headers,
+            lambda record: record["status"] == "waiting_for_user",
+        )
+
+    assert response["task"] is not None
+    assert response["planning_telemetry"]["metrics"]["serialized_bytes"] > 0
+    assert response["planning_telemetry"]["failure"] is None
+    restarted = SQLiteConversationStore(runtime.store.root)
+    restarted_telemetry = restarted.get(queued["id"]).planning_telemetry
+    assert restarted_telemetry is not None
+    assert restarted_telemetry.model_dump(mode="json") == response["planning_telemetry"]
 
 
 def test_sqlite_restart_and_export_preserve_allowlisted_telemetry(tmp_path):
@@ -187,9 +216,12 @@ def test_managed_provider_failure_persists_only_safe_diagnostics_and_logs(
     assert all("exit_code=7" in record.message for record in provider_logs)
 
 
-def test_superseded_managed_success_does_not_publish_stale_telemetry(tmp_path):
-    observed = Event()
-    release = Event()
+def test_blocked_managed_planner_releases_lock_and_cannot_overwrite_superseding_state(
+    tmp_path,
+):
+    planner_entered = Event()
+    release_planner = Event()
+    superseding_state_saved = Event()
     stale = _telemetry(serialized_bytes=111)
     newer = _telemetry(serialized_bytes=222)
 
@@ -197,30 +229,42 @@ def test_superseded_managed_success_does_not_publish_stale_telemetry(tmp_path):
         def propose(self, message, conversation, *, observe=None, **kwargs):
             assert observe is not None
             observe(stale)
-            observed.set()
-            assert release.wait(5)
+            planner_entered.set()
+            release_planner.wait()
             return AgentDecision(action="answer", text="Stale answer.")
 
     runtime = make_runtime(tmp_path, Planner(), lambda context, inputs: CapabilityOutcome())
     manager = _manager(runtime)
+    publisher = None
     try:
         queued = manager.submit(None, MessageRequest(message="Question"))
-        assert observed.wait(5)
-        with runtime.locks.hold(queued.id):
-            current = runtime.store.get(queued.id)
-            current.status = "waiting_for_user"
-            current.queued_action = None
-            current.queue_origin = None
-            current.pending_decision = PendingDecision(
-                kind="clarify", message="Newer clarification"
-            )
-            current.planning_telemetry = newer
-            runtime.store.save(current)
-        release.set()
+        assert planner_entered.wait(1)
+
+        def publish_superseding_state():
+            with runtime.locks.hold(queued.id):
+                current = runtime.store.get(queued.id)
+                current.status = "waiting_for_user"
+                current.queued_action = None
+                current.queue_origin = None
+                current.pending_decision = PendingDecision(
+                    kind="clarify", message="Newer clarification"
+                )
+                current.planning_telemetry = newer
+                runtime.store.save(current)
+            superseding_state_saved.set()
+
+        publisher = Thread(target=publish_superseding_state)
+        publisher.start()
+        assert superseding_state_saved.wait(1), (
+            "managed planning held the conversation lock across planner inference"
+        )
+        release_planner.set()
         manager.close()
     finally:
-        release.set()
+        release_planner.set()
         manager.close()
+        if publisher is not None:
+            publisher.join()
 
     saved = runtime.store.get(queued.id)
     assert saved.status == "waiting_for_user"

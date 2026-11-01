@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from threading import Condition
 from typing import Literal, Self
@@ -207,8 +207,19 @@ class ConversationManager:
             record.turn_origin = None
             self.runtime.store.save(record)
 
-    def _run(self, conversation_id: str, operation: Callable[[], Conversation]) -> None:
-        with self.runtime.locks.hold(conversation_id):
+    def _run(
+        self,
+        conversation_id: str,
+        operation: Callable[[], Conversation],
+        *,
+        lock_operation: bool = True,
+    ) -> None:
+        lock = (
+            self.runtime.locks.hold(conversation_id)
+            if lock_operation
+            else nullcontext()
+        )
+        with lock:
             try:
                 operation()
             except PlanningSuperseded:
@@ -242,10 +253,18 @@ class ConversationManager:
         record: Conversation,
         reservation: Submission,
         operation: Callable[[], Conversation],
+        *,
+        lock_operation: bool = True,
     ) -> Conversation:
         response = record.model_copy(deep=True)
         try:
-            reservation.submit(lambda: self._run(record.id, operation))
+            reservation.submit(
+                lambda: self._run(
+                    record.id,
+                    operation,
+                    lock_operation=lock_operation,
+                )
+            )
         except RuntimeError as exc:
             self._fail(record.id, exc)
             raise SchedulerClosed(
@@ -291,6 +310,7 @@ class ConversationManager:
                         identifier,
                         _managed=True,
                     ),
+                    lock_operation=False,
                 )
 
     def _decision(

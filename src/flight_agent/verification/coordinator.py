@@ -281,7 +281,11 @@ class EngineeringRuntime:
                 record.planning_telemetry = observations[-1]
             if decision.plan is not None:
                 assert plan is not None
-                return self.executor.propose(record, plan)
+                return self.executor.propose(
+                    record,
+                    plan,
+                    planning_telemetry=record.planning_telemetry,
+                )
             record.messages.append(
                 ConversationMessage(
                     role="assistant",
