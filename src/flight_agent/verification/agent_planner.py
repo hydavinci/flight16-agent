@@ -7,7 +7,12 @@ from typing import Annotated, Literal, NamedTuple, Self
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 from ..config import ModelSettings
-from ..copilot import CopilotTimeoutError
+from ..copilot_diagnostics import (
+    CopilotError,
+    CopilotInvalidResponseError,
+    CopilotTimeoutError,
+    make_diagnostics,
+)
 from ..runtime.agent_contracts import AgentPlan, AgentPlanDraft
 from ..runtime.capability_metadata import Availability, CapabilitySnapshot
 from ..runtime.contracts import fingerprint
@@ -1400,6 +1405,7 @@ class AgentPlanner(StructuredPlanner):
         observe: Callable[[PlanningTelemetry], None] | None = None,
     ) -> AgentDecision:
         state = PlanningState(started_at=monotonic())
+        failure = None
         try:
             return self._propose(
                 message,
@@ -1409,6 +1415,9 @@ class AgentPlanner(StructuredPlanner):
                 sources=sources,
                 state=state,
             )
+        except CopilotError as error:
+            failure = error.diagnostics
+            raise
         finally:
             if observe is not None:
                 observe(PlanningTelemetry(metrics=PlanningMetrics(
@@ -1417,7 +1426,7 @@ class AgentPlanner(StructuredPlanner):
                     selected_source_excerpt_count=state.selected_source_excerpt_count,
                     planning_duration_seconds=max(0.0, monotonic() - state.started_at),
                     correction_round_count=state.correction_round_count,
-                )))
+                ), failure=failure))
 
     def _propose(
         self,
@@ -1488,29 +1497,47 @@ class AgentPlanner(StructuredPlanner):
                     "未截断需求、判据或来源原文，请缩小本次输入范围。"
                 ),
             )
+        settings = ModelSettings.from_environment() if self.model is None else None
         timeout = self._timeout_seconds
         if timeout is None:
-            timeout = (
-                ModelSettings.from_environment().timeout_seconds if self.model is None else 60.0
-            )
+            timeout = settings.timeout_seconds if settings is not None else 60.0
         deadline = state.started_at + timeout
         last_error: ValidationError | None = None
         for attempt in range(2):
             remaining = deadline - monotonic()
             if remaining <= 0:
+                if settings is not None and settings.provider == "copilot-cli":
+                    raise CopilotTimeoutError(
+                        0.0,
+                        diagnostics=make_diagnostics(
+                            "timeout",
+                            stdout="",
+                            stderr="",
+                            exit_code=None,
+                            elapsed_seconds=monotonic() - state.started_at,
+                        ),
+                        round_number=attempt + 1,
+                        total_budget_seconds=timeout,
+                    ) from None
                 raise ValueError(
                     "方案修正已达到原总超时，本次未生成新方案或触发执行。"
                 ) from last_error
             try:
                 state.correction_round_count = attempt
                 decision = self.with_timeout(remaining)._decision(context, paths)
-            except CopilotTimeoutError as exc:
-                raise ValueError(
-                    f"Copilot CLI 规划第 {attempt + 1} 轮超时："
-                    f"本轮可用 {exc.timeout_seconds:g}s，原总预算 {timeout:g}s"
-                    "（含前轮耗时，两轮共用）。未自动重试；"
-                    "本次未生成新方案或触发执行。"
-                ) from exc
+            except CopilotTimeoutError as error:
+                raise CopilotTimeoutError(
+                    error.timeout_seconds,
+                    diagnostics=error.diagnostics,
+                    round_number=attempt + 1,
+                    total_budget_seconds=timeout,
+                ) from None
+            except CopilotInvalidResponseError as error:
+                if attempt or error.correction_feedback is None:
+                    raise
+                feedback = error.correction_feedback
+            except CopilotError:
+                raise
             except ValidationError as exc:
                 last_error = exc
                 if attempt:

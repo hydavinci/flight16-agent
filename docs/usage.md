@@ -77,7 +77,8 @@ LLM_TIMEOUT_SECONDS=60
 
 ### 本机 Copilot CLI
 
-macOS/Linux 上安装 GitHub Copilot CLI，执行 `copilot login` 完成登录，再修改 `.env`：
+macOS/Linux 上安装 GitHub Copilot CLI，并通过进程环境提供
+`COPILOT_GITHUB_TOKEN`、`GH_TOKEN` 或 `GITHUB_TOKEN` 之一，再修改 `.env`：
 
 ```dotenv
 LLM_PROVIDER=copilot-cli
@@ -86,10 +87,20 @@ LLM_TIMEOUT_SECONDS=180
 
 可按需设置 `LLM_MODEL` 为账户有权使用的模型；不设置时使用 CLI 自己的选择。
 若从 API 配置切换，记得检查或移除原来的 `LLM_MODEL` 占位值。
-此模式不使用 `LLM_BASE_URL` 和 `LLM_API_KEY`，也不需要复制登录凭据。
+此模式不使用 `LLM_BASE_URL` 和 `LLM_API_KEY`。规划进程不会读取用户现有的
+Copilot 配置目录或复制其中的保存登录状态；只有 CLI 支持的上述环境认证会原样传入。
+如果只有 `copilot login` 保存的本机登录状态，规划会在启动 CLI 前明确报告认证不可用；
+请改用受支持的环境认证，不要复制令牌文件、改写用户设置或降低隔离强度。
 
 CLI 须支持 JSON 输出和工具过滤。每次规划会创建新会话，使用当前账户的模型额度，
-不导入已有聊天记录。配置检查不会发起模型请求，也不会证明登录仍然有效。
+在空的临时工作目录和临时 `COPILOT_HOME` 中运行，不导入已有聊天记录、自定义指令或
+内置 MCP。文件读取、Shell、写入、URL 和 memory 工具被拒绝；会话同步、自动更新、
+客户端遥测和 Bash 环境加载被禁用，日志级别为 `none`，临时日志目标随目录删除。
+配置检查不会发起模型请求，也不会证明环境令牌仍然有效。
+
+正常退出和已处理失败都会清理 `flight-agent-copilot-*` 临时目录。进程被 `SIGKILL`
+时无法保证清理；遗留目录可能包含敏感的 CLI 临时状态，须由本机管理员直接删除，
+不得收集、上传或放入支持包。
 
 此后端支持通用 Agent 的结构化规划与证据解释，不直接执行工程。
 
