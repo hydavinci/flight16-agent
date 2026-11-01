@@ -35,6 +35,7 @@ from .verification.coordinator import EngineeringRuntime
 from .verification.diagnostic_planner import DiagnosticReviewer
 from .verification.local_matlab import LocalMatlabBackend
 from .verification.plugins import register_builtin_plugins
+from .verification.project_snapshots import ProjectSnapshotStore
 from .verification.resources import ResourceLocation, ResourceRegistry, resolve_location
 from .verification.routes import ConversationManager, verification_router
 from .verification.sqlite_store import SQLiteConversationStore
@@ -65,7 +66,6 @@ def create_web_app(
         and engineering_runtime.executor.scheduler.settings != settings
     ):
         raise ValueError("Injected runtime and Web scheduler settings must match")
-    local_backend = LocalMatlabBackend.from_environment()
     resources = (
         engineering_runtime.resources if engineering_runtime is not None else ResourceRegistry()
     )
@@ -73,8 +73,19 @@ def create_web_app(
         backend: AnalysisBackend | None = RemoteSimulinkBackend.from_environment()
     except ValueError:
         backend = None
+    conversations = (
+        engineering_runtime.store
+        if engineering_runtime is not None
+        else SQLiteConversationStore(root / "runs" / "verification")
+    )
+    snapshots = (
+        engineering_runtime.executor.snapshots
+        if engineering_runtime is not None
+        else ProjectSnapshotStore(conversations.root / "snapshots")
+    )
+    local_backend = LocalMatlabBackend.from_environment()
+    local_backend.snapshots = snapshots
     if engineering_runtime is None:
-        conversations = SQLiteConversationStore(root / "runs" / "verification")
         tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
         register_builtin_plugins(
             tools, resources, backend=backend,
@@ -87,6 +98,7 @@ def create_web_app(
                 tools,
                 resources,
                 scheduler=ExecutionScheduler(settings),
+                snapshots=snapshots,
             ),
             resources,
         )

@@ -23,3 +23,14 @@ def snapshot_case(tmp_path: Path):
     with snapshots.guard():
         binding = snapshots.ensure(project)
     return source, project, snapshots, binding
+
+
+def bind_request(request, snapshots):
+    if request.project is None:
+        return request
+    with snapshots.guard():
+        binding = snapshots.ensure(request.project)
+    return type(request).model_validate({
+        **request.model_dump(mode="json"),
+        "project_snapshot": binding.model_dump(mode="json"),
+    })

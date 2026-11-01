@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 
 from flight_agent.verification.local_matlab import LocalMatlabBackend
 from flight_agent.verification.matlab_projects import discover_matlab_project
+from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+from tests.snapshot_helpers import bind_request
 from tests.test_matlab_project_acceptance import (
     PreparedCase,
     acceptance_app,
@@ -27,14 +29,16 @@ pytestmark = pytest.mark.matlab
 
 
 @pytest.fixture
-def actual_backend(monkeypatch):
+def actual_backend(monkeypatch, tmp_path):
     if os.environ.get("RUN_MATLAB_TESTS") != "1":
         pytest.skip("Actual MATLAB/Simulink is opt-in; no fake fallback")
     assert os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") == "1"
     monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
     monkeypatch.delenv("MATLAB_WORKER_URL", raising=False)
     monkeypatch.delenv("MATLAB_WORKER_TOKEN", raising=False)
-    return LocalMatlabBackend.from_environment()
+    return LocalMatlabBackend.from_environment(
+        snapshots=ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    )
 
 
 @pytest.fixture
@@ -383,6 +387,7 @@ def test_actual_linearize_preparation_workspace_visibility(
         },
     })
     directory = tmp_path / "linearize"
+    request = bind_request(request, actual_backend.snapshots)
     result = actual_backend.execute(request, directory)
     assert result.valid and result.execution_status == "completed", result.diagnostics
     assert result.details["linearization"]["workspace_assertions"] == [

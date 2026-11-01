@@ -41,7 +41,7 @@ from .matlab_contracts import (
     ProjectExecutionInput,
     StepinfoInput,
 )
-from .matlab_projects import discover_matlab_project, snapshot_matlab_project
+from .project_snapshots import ProjectSnapshotStore
 from .projects import file_digest
 
 MAX_REQUEST_BYTES = 8_000_000
@@ -420,13 +420,21 @@ def _verify_result(request: LocalMatlabRequest, result: LocalMatlabResult, direc
 
 
 class LocalMatlabBackend:
-    def __init__(self, interpreter: str):
+    def __init__(
+        self, interpreter: str, *, snapshots: ProjectSnapshotStore | None = None
+    ) -> None:
         self.interpreter = interpreter
+        self.snapshots = snapshots
         self._readiness: tuple[str, dict[str, str], Availability] | None = None
 
     @classmethod
-    def from_environment(cls) -> "LocalMatlabBackend":
-        return cls(os.environ.get("MATLAB_PYTHON_EXECUTABLE") or sys.executable)
+    def from_environment(
+        cls, *, snapshots: ProjectSnapshotStore | None = None
+    ) -> "LocalMatlabBackend":
+        return cls(
+            os.environ.get("MATLAB_PYTHON_EXECUTABLE") or sys.executable,
+            snapshots=snapshots,
+        )
 
     def readiness(self) -> Availability:
         """Share import-only UI/catalog probes; execution still checks availability afresh."""
@@ -504,6 +512,13 @@ class LocalMatlabBackend:
         digest = fingerprint(request.model_dump(mode="json"))
         if resume:
             return self._resume(request, directory)
+        if request.project is not None:
+            if request.project_snapshot is None or self.snapshots is None:
+                raise ValueError(
+                    "New project execution requires a managed snapshot store and binding"
+                )
+            with self.snapshots.guard():
+                self.snapshots.verify(request.project_snapshot)
         if directory.exists():
             raise ValueError(
                 "Run directory already exists; use resume to reconcile the original ID"
@@ -543,7 +558,8 @@ class LocalMatlabBackend:
             if available.state != "available":
                 raise ValueError(available.reason)
             if request.project is not None:
-                snapshot_matlab_project(request.project, directory / "project")
+                assert self.snapshots is not None and request.project_snapshot is not None
+                self.snapshots.materialize(request.project_snapshot, directory / "project")
             elif isinstance(request.inputs, StepinfoInput):
                 source = _stepinfo_source(request, directory)
                 publish_evidence(directory / "project", "series.json", source.read_bytes())
@@ -595,10 +611,10 @@ class LocalMatlabBackend:
             state = state.model_copy(update={"worker_exit_confirmed": True})
             write_json(directory / "state.json", state.model_dump(mode="json"))
             result = self._receipt(request, directory)
-            if request.project is not None and (
-                discover_matlab_project(request.project.root) != request.project
-            ):
-                raise ValueError("Source project changed during execution; review required")
+            if request.project_snapshot is not None:
+                assert self.snapshots is not None
+                with self.snapshots.guard():
+                    self.snapshots.verify(request.project_snapshot)
             if isinstance(request.inputs, StepinfoInput):
                 _stepinfo_source(request, directory)
             if isinstance(request.inputs, AllmarginInput):
@@ -662,6 +678,11 @@ class LocalMatlabBackend:
     def _resume(self, request: LocalMatlabRequest, directory: Path) -> LocalMatlabResult:
         digest = fingerprint(request.model_dump(mode="json"))
         try:
+            if request.project_snapshot is not None:
+                if self.snapshots is None:
+                    raise ValueError("Original snapshot store is unavailable")
+                with self.snapshots.guard():
+                    self.snapshots.verify(request.project_snapshot)
             original = _read_model(
                 directory / "request.json", LocalMatlabRequest, MAX_REQUEST_BYTES
             )

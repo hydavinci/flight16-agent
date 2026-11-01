@@ -546,7 +546,8 @@ def test_restart_unknown_original_call_reconciles_without_a_new_dispatch(
         assert done["status"] == "interrupted"
     task = runtime.store.get(done["id"]).task
     original = task.calls[0].id
-    requests = list(Path(task.result_directory).rglob("request.json"))
+    work = runtime.store.root / "work" / done["id"] / task.id
+    requests = list(work.rglob("request.json"))
     assert len(requests) == 1
     before = requests[0].read_bytes()
     # Reconstruct the actual Web/runtime against its persisted store, then resume over HTTP.
@@ -560,7 +561,7 @@ def test_restart_unknown_original_call_reconciles_without_a_new_dispatch(
     task = restored.store.get(resumed["id"]).task
     assert [call.id for call in task.calls] == [original]
     assert task.budget_state.calls == 1
-    assert list(Path(task.result_directory).rglob("request.json")) == requests
+    assert list(work.rglob("request.json")) == requests
     assert requests[0].read_bytes() == before
 
 

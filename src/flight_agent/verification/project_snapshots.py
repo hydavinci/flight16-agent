@@ -195,7 +195,7 @@ def _file_sha256(path: Path, expected: SnapshotFile) -> None:
         or before.st_nlink != 1
         or before.st_size != expected.size
     ):
-        raise ValueError(f"Snapshot file type/size mismatch: {expected.path}")
+        raise ValueError(f"Snapshot file digest/type/size mismatch: {expected.path}")
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     digest = hashlib.sha256()
     size = 0
