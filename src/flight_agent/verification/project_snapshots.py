@@ -8,6 +8,7 @@ import stat
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
@@ -21,6 +22,15 @@ from .snapshot_lock import is_reparse_point, lifecycle_lock
 _DIGEST = re.compile(r"[a-f0-9]{64}")
 MAX_MANIFEST_BYTES = 4_000_000
 _WINDOWS = os.name == "nt"
+
+
+@dataclass
+class SnapshotCleanupReport:
+    retained: list[str] = field(default_factory=list)
+    would_delete: list[str] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)
+    staging: list[str] = field(default_factory=list)
+    skipped: list[str] = field(default_factory=list)
 
 
 def _managed_lstat(path: Path) -> os.stat_result:
@@ -397,10 +407,10 @@ def _cleanup_if_owned(directory: Path, identity: tuple[int, int]) -> None:
 
 
 def _verify_object(
-    obj: Path, binding: ProjectSnapshot, *, validate_binding: bool = True
+    obj: Path,
+    snapshot_id: str,
+    expected: SnapshotManifest,
 ) -> Path:
-    if validate_binding:
-        binding = ProjectSnapshot.model_validate(binding.model_dump(mode="json"))
     safe_directory(obj)
     if not stat.S_ISDIR(_managed_lstat(obj).st_mode) or {
         item.name for item in obj.iterdir()
@@ -409,9 +419,9 @@ def _verify_object(
     raw = _read_regular(obj / "manifest.json", MAX_MANIFEST_BYTES)
     manifest = SnapshotManifest.model_validate_json(raw)
     if (
-        manifest != binding.manifest
+        manifest != expected
         or raw != manifest.canonical_bytes()
-        or manifest.snapshot_id != binding.snapshot_id
+        or manifest.snapshot_id != snapshot_id
     ):
         raise ValueError("Snapshot manifest identity mismatch")
     _verify_sealed_mode(obj, 0o555)
@@ -455,8 +465,14 @@ class ProjectSnapshotStore:
 
     def verify(self, binding: ProjectSnapshot) -> Path:
         binding = ProjectSnapshot.model_validate(binding.model_dump(mode="json"))
-        obj = self.object_directory(binding.snapshot_id)
-        return _verify_object(obj, binding, validate_binding=False)
+        return self.verify_object(binding.snapshot_id, binding.manifest)
+
+    def verify_object(
+        self, snapshot_id: str, expected: SnapshotManifest
+    ) -> Path:
+        expected = SnapshotManifest.model_validate(expected.model_dump(mode="json"))
+        obj = self.object_directory(snapshot_id)
+        return _verify_object(obj, snapshot_id, expected)
 
     def ensure(self, project: MatlabProjectDescriptor) -> ProjectSnapshot:
         project = MatlabProjectDescriptor.model_validate(project.model_dump(mode="json"))
@@ -518,7 +534,7 @@ class ProjectSnapshotStore:
             _sync_directory(self.root / "staging")
             _sync_directory(shard)
             _seal(temporary)
-            _verify_object(temporary, binding)
+            _verify_object(temporary, binding.snapshot_id, binding.manifest)
             _publish_no_replace(temporary, final)
             _sync_directory(shard)
             self.verify(binding)
@@ -550,8 +566,92 @@ class ProjectSnapshotStore:
                 raise
         return destination
 
-    def remove_object(self, binding: ProjectSnapshot) -> None:
-        self.verify(binding)
-        obj = self.object_directory(binding.snapshot_id)
+    def cleanup(
+        self, retained_ids: set[str], *, dry_run: bool
+    ) -> SnapshotCleanupReport:
+        report = SnapshotCleanupReport(retained=sorted(retained_ids))
+        objects = self.root / "objects"
+        for shard in sorted(objects.iterdir(), key=lambda item: item.name):
+            try:
+                shard_info = shard.lstat()
+            except OSError:
+                report.skipped.append(shard.name)
+                continue
+            if (
+                re.fullmatch(r"[a-f0-9]{2}", shard.name) is None
+                or is_reparse_point(shard_info)
+                or not stat.S_ISDIR(shard_info.st_mode)
+            ):
+                report.skipped.append(shard.name)
+                continue
+            for obj in sorted(shard.iterdir(), key=lambda item: item.name):
+                identifier = obj.name
+                try:
+                    object_info = obj.lstat()
+                except OSError:
+                    report.skipped.append(identifier)
+                    continue
+                if (
+                    _DIGEST.fullmatch(identifier) is None
+                    or not identifier.startswith(shard.name)
+                    or is_reparse_point(object_info)
+                    or not stat.S_ISDIR(object_info.st_mode)
+                ):
+                    report.skipped.append(identifier)
+                    continue
+                if identifier in retained_ids:
+                    continue
+                try:
+                    raw = _read_regular(
+                        obj / "manifest.json",
+                        MAX_MANIFEST_BYTES,
+                    )
+                    manifest = SnapshotManifest.model_validate_json(raw)
+                    self.verify_object(identifier, manifest)
+                except (OSError, ValueError):
+                    report.skipped.append(identifier)
+                    continue
+                report.would_delete.append(identifier)
+                if not dry_run:
+                    self.remove_verified_object(identifier, manifest)
+                    report.deleted.append(identifier)
+
+        staging = self.root / "staging"
+        for temporary in sorted(staging.iterdir(), key=lambda item: item.name):
+            try:
+                temporary_info = temporary.lstat()
+            except OSError:
+                report.skipped.append(temporary.name)
+                continue
+            if (
+                re.fullmatch(r"snap-[a-f0-9]{32}", temporary.name) is None
+                or is_reparse_point(temporary_info)
+                or not stat.S_ISDIR(temporary_info.st_mode)
+            ):
+                report.skipped.append(temporary.name)
+                continue
+            try:
+                _seal_inventory(temporary)
+            except (OSError, ValueError):
+                report.skipped.append(temporary.name)
+                continue
+            report.staging.append(temporary.name)
+            if not dry_run:
+                identity = _directory_identity(temporary)
+                _quarantine_and_remove(
+                    temporary,
+                    expected_identity=identity,
+                )
+        return report
+
+    def remove_verified_object(
+        self, snapshot_id: str, manifest: SnapshotManifest
+    ) -> None:
+        self.verify_object(snapshot_id, manifest)
+        obj = self.object_directory(snapshot_id)
         identity = _directory_identity(obj)
         _quarantine_and_remove(obj, expected_identity=identity)
+
+    def remove_object(self, binding: ProjectSnapshot) -> None:
+        binding = ProjectSnapshot.model_validate(binding.model_dump(mode="json"))
+        self.remove_verified_object(binding.snapshot_id, binding.manifest)

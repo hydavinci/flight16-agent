@@ -16,8 +16,9 @@ from ..runtime.evidence import load_agent_run, verify_evidence
 from ..runtime.observations import OutputArtifact
 from .contracts import AgentTask, Conversation
 from .intake import safe_directory
+from .project_snapshots import ProjectSnapshotStore, SnapshotCleanupReport
 from .scheduling_recovery import recover_scheduling
-from .snapshot_references import replace_snapshot_references
+from .snapshot_references import replace_snapshot_references, retained_snapshot_ids
 from .sqlite_codec import Row, canonical, decode, encode
 from .sqlite_cutover import prepare_cutover
 from .sqlite_schema import DatabaseStartupError, connect_database, migrate_database
@@ -204,6 +205,15 @@ class SQLiteConversationStore:
                 )
             ]
             return [decode(connection, identifier) for identifier in identifiers]
+
+    def cleanup_project_snapshots(
+        self, *, dry_run: bool = True
+    ) -> SnapshotCleanupReport:
+        snapshots = ProjectSnapshotStore(self.root / "snapshots")
+        with snapshots.guard(exclusive=True):
+            with self._read() as connection:
+                retained = retained_snapshot_ids(connection)
+            return snapshots.cleanup(retained, dry_run=dry_run)
 
     @staticmethod
     def _tasks(record: Conversation) -> list[AgentTask]:
