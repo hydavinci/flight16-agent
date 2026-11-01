@@ -6,7 +6,11 @@ from pydantic import JsonValue, model_validator
 
 from ...runtime.agent_contracts import AgentNode, AgentPlan
 from ...runtime.capabilities import Capability
-from ...runtime.capability_metadata import CapabilityMetadata, ResourceRequirement
+from ...runtime.capability_metadata import (
+    CapabilityMetadata,
+    CapabilityPlanning,
+    ResourceRequirement,
+)
 from ...runtime.contracts import EvidenceFile, Name, Version
 from ...runtime.evidence import verify_evidence
 from ...runtime.observations import CapabilityOutcome, Finding, OutputArtifact, ResultTable
@@ -290,6 +294,7 @@ def diagnostic_capability(
         reconcile=lambda context, inputs: execute(context, inputs, resume=True),
         validate_plan=_validate_plan,
         metadata=CapabilityMetadata(
+            planning=CapabilityPlanning(output_kinds=["finding", "table", "artifact"]),
             resources=[
                 ResourceRequirement(
                     role="diagnostic_data",

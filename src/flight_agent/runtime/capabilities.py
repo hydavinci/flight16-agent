@@ -84,7 +84,10 @@ class CapabilityRegistry(Generic[Context]):
             if not issubclass(model, Contract) or model.model_config.get("extra") != "forbid":
                 raise ValueError("Capability schemas must be strict Contract subclasses")
         metadata = (
-            CapabilityMetadata.model_validate(capability.metadata.model_dump(mode="json"))
+            CapabilityMetadata.model_validate({
+                **capability.metadata.model_dump(mode="json"),
+                "planning": capability.metadata.planning,
+            })
             if capability.metadata is not None
             else None
         )
@@ -223,7 +226,13 @@ class CapabilityRegistry(Generic[Context]):
                 "output_schema": entry.output_model.model_json_schema(),
                 **(
                     {
-                        "metadata": entry.metadata.model_dump(mode="json"),
+                        "metadata": {
+                            **entry.metadata.model_dump(mode="json"),
+                            "planning": (
+                                entry.metadata.planning.model_dump(mode="json")
+                                if entry.metadata.planning is not None else None
+                            ),
+                        },
                         "availability": self.availability(
                             entry.definition.name, resources
                         ).model_dump(mode="json"),

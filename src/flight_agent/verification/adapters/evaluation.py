@@ -7,7 +7,7 @@ from pydantic import Field, StrictBool
 
 from ...runtime.agent_contracts import AgentNode, AgentPlan
 from ...runtime.capabilities import Capability
-from ...runtime.capability_metadata import CapabilityMetadata
+from ...runtime.capability_metadata import CapabilityMetadata, CapabilityPlanning
 from ...runtime.observations import (
     CapabilityOutcome,
     CriterionCheck,
@@ -165,6 +165,7 @@ def scalar_evaluation_capability() -> Capability[
         operation=_evaluate,
         validate_plan=_validate_plan,
         metadata=CapabilityMetadata(
+            planning=CapabilityPlanning(output_kinds=["finding"], dynamic_dependencies=True),
             validity_policy={
                 "version": "1",
                 "comparison": "exact-without-implicit-tolerance",

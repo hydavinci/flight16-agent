@@ -8,6 +8,7 @@ from ...runtime.capabilities import Capability
 from ...runtime.capability_metadata import (
     Availability,
     CapabilityMetadata,
+    CapabilityPlanning,
     MetricDefinition,
     ResourceRequirement,
 )
@@ -337,6 +338,7 @@ def local_matlab_capabilities(
             readiness=readiness,
             runtime_owner=backend,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(output_kinds=["artifact"]),
                 resources=[
                     ResourceRequirement(role="project", kind="matlab_project", location="agent")
                 ],
@@ -362,6 +364,10 @@ def local_matlab_capabilities(
             readiness=readiness,
             runtime_owner=backend,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(
+                    output_kinds=["metric", "artifact"],
+                    depends_on=["matlab_execute_project"],
+                ),
                 metrics=[
                     MetricDefinition(id="overshoot", label="Overshoot", unit="%"),
                     MetricDefinition(id="settling_time", label="Settling time", unit="s"),
@@ -396,6 +402,7 @@ def local_matlab_capabilities(
             readiness=readiness,
             runtime_owner=backend,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(output_kinds=["artifact"]),
                 resources=[
                     ResourceRequirement(role="project", kind="matlab_project", location="agent")
                 ],
@@ -433,6 +440,10 @@ def local_matlab_capabilities(
             readiness=readiness,
             runtime_owner=backend,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(
+                    output_kinds=["metric", "artifact"],
+                    depends_on=["matlab_linearize"],
+                ),
                 metrics=[
                     MetricDefinition(
                         id="gain_margin", label="Gain margin", unit="dB",

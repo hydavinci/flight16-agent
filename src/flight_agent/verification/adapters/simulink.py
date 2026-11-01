@@ -9,6 +9,7 @@ from ...runtime.capabilities import Capability
 from ...runtime.capability_metadata import (
     Availability,
     CapabilityMetadata,
+    CapabilityPlanning,
     MetricDefinition,
     ResourceRequirement,
 )
@@ -314,6 +315,7 @@ def simulink_capabilities(
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(output_kinds=["metric", "artifact"]),
                 metrics=metrics,
                 resources=[
                     ResourceRequirement(
