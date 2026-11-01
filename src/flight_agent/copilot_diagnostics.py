@@ -157,6 +157,8 @@ def _feedback_dict(issues: tuple[_SchemaIssue, ...]) -> dict[str, object]:
 
 
 class _SchemaFeedback(dict[str, object]):
+    __slots__ = ("_issues",)
+
     def __init__(self, issues: tuple[_SchemaIssue, ...]):
         object.__setattr__(self, "_issues", issues)
         super().__init__(_feedback_dict(issues))

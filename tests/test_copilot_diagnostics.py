@@ -198,6 +198,31 @@ def test_schema_feedback_rejects_issue_snapshot_reassignment():
     assert "private" not in json.dumps(error.correction_feedback)
 
 
+def test_schema_feedback_has_no_dict_snapshot_bypass():
+    with pytest.raises(ValidationError) as caught:
+        AgentDecision.model_validate(
+            {
+                "action": "plan",
+                "text": "private-response",
+                "private-secret-field": "private-value",
+            }
+        )
+    source = schema_feedback(caught.value, AgentDecision)
+    diagnostic = make_diagnostics(
+        "invalid_response",
+        stdout="",
+        stderr="",
+        exit_code=0,
+        elapsed_seconds=0.1,
+    )
+
+    with pytest.raises(AttributeError):
+        source.__dict__["_issues"] = ((("private_secret_location",), "private_secret_code"),)
+
+    error = CopilotInvalidResponseError(diagnostic, correction_feedback=source)
+    assert "private" not in json.dumps(error.correction_feedback)
+
+
 def test_jsonl_request_identity_is_hashed_without_persisting_the_event():
     output = json.dumps(
         {
