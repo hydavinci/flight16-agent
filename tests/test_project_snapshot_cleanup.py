@@ -102,6 +102,39 @@ def message(content):
     return ConversationMessage(role="user", content=content, created_at=now())
 
 
+def publication_residue(snapshots, binding, marker="a"):
+    obj = snapshots.object_directory(binding.snapshot_id)
+    residue = obj.parent / f".publish-{marker * 32}"
+    obj.rename(residue)
+    return residue
+
+
+def publication_quarantine_residue(
+    snapshots,
+    binding,
+    publish_marker="a",
+    quarantine_marker="b",
+):
+    obj = snapshots.object_directory(binding.snapshot_id)
+    residue = (
+        obj.parent
+        / (
+            f"..publish-{publish_marker * 32}"
+            f".quarantine-{quarantine_marker * 32}"
+        )
+    )
+    obj.rename(residue)
+    return residue
+
+
+def object_quarantine_residue(snapshots, binding, marker="b", snapshot_id=None):
+    obj = snapshots.object_directory(binding.snapshot_id)
+    embedded = snapshot_id or binding.snapshot_id
+    residue = obj.parent / f".{embedded}.quarantine-{marker * 32}"
+    obj.rename(residue)
+    return residue
+
+
 def test_dry_run_and_explicit_orphan_cleanup_preserve_external_directories(tmp_path):
     source, _, snapshots, binding = snapshot_case(tmp_path)
     store = ConversationStore(tmp_path / "managed")
@@ -352,6 +385,206 @@ def test_staging_with_nested_symlink_is_skipped_without_quarantine(tmp_path):
     assert temporary.is_dir()
     assert (source / "initialize.m").is_file()
     assert not list(temporary.parent.glob(f".{temporary.name}.quarantine-*"))
+
+
+def test_verified_publication_residue_supports_dry_run_cleanup_and_idempotence(
+    tmp_path,
+):
+    _, _, snapshots, binding = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    residue = publication_residue(snapshots, binding)
+
+    preview = store.cleanup_project_snapshots()
+
+    assert preview.would_delete == [residue.name]
+    assert preview.deleted == []
+    assert residue.is_dir()
+    removed = store.cleanup_project_snapshots(dry_run=False)
+    assert removed.would_delete == [residue.name]
+    assert removed.deleted == [residue.name]
+    assert not residue.exists()
+    repeated = store.cleanup_project_snapshots(dry_run=False)
+    assert repeated.would_delete == []
+    assert repeated.deleted == []
+
+
+def test_verified_publication_quarantine_residue_is_reclaimed_directly(tmp_path):
+    _, _, snapshots, binding = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    residue = publication_quarantine_residue(snapshots, binding)
+
+    preview = store.cleanup_project_snapshots()
+
+    assert preview.would_delete == [residue.name]
+    assert residue.is_dir()
+    removed = store.cleanup_project_snapshots(dry_run=False)
+    assert removed.deleted == [residue.name]
+    assert not residue.exists()
+    assert not list(residue.parent.glob(f".{residue.name}.quarantine-*"))
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["publication", "publication-quarantine", "object-quarantine"],
+)
+def test_retained_verified_object_residue_is_preserved(tmp_path, kind):
+    _, _, snapshots, binding = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    record = record_with_binding(store, binding)
+    with snapshots.guard():
+        store.save(record)
+    residue = (
+        publication_residue(snapshots, binding)
+        if kind == "publication"
+        else publication_quarantine_residue(snapshots, binding)
+        if kind == "publication-quarantine"
+        else object_quarantine_residue(snapshots, binding)
+    )
+
+    report = store.cleanup_project_snapshots(dry_run=False)
+
+    assert report.retained == [binding.snapshot_id]
+    assert report.would_delete == []
+    assert report.deleted == []
+    assert residue.name not in report.skipped
+    assert residue.is_dir()
+
+
+def test_object_quarantine_cleanup_does_not_create_recursive_residue(
+    tmp_path,
+    monkeypatch,
+):
+    from flight_agent.verification import project_snapshots as module
+
+    _, _, snapshots, binding = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    residue = object_quarantine_residue(snapshots, binding)
+    remove = module._remove_quarantined_directory
+
+    def interrupt(directory, identity):
+        raise RuntimeError("cleanup interrupted before residue removal")
+
+    monkeypatch.setattr(module, "_remove_quarantined_directory", interrupt)
+    with pytest.raises(RuntimeError, match="cleanup interrupted"):
+        store.cleanup_project_snapshots(dry_run=False)
+    assert residue.is_dir()
+    assert not list(residue.parent.glob(f".{residue.name}.quarantine-*"))
+
+    monkeypatch.setattr(module, "_remove_quarantined_directory", remove)
+    removed = store.cleanup_project_snapshots(dry_run=False)
+    assert removed.would_delete == [residue.name]
+    assert removed.deleted == [residue.name]
+    assert not residue.exists()
+    assert store.cleanup_project_snapshots(dry_run=False).deleted == []
+
+
+def test_object_quarantine_embedded_identity_must_match_manifest(tmp_path):
+    _, _, snapshots, binding = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    wrong_id = binding.snapshot_id[:2] + ("f" * 62)
+    if wrong_id == binding.snapshot_id:
+        wrong_id = binding.snapshot_id[:2] + ("e" * 62)
+    residue = object_quarantine_residue(
+        snapshots,
+        binding,
+        snapshot_id=wrong_id,
+    )
+
+    report = store.cleanup_project_snapshots(dry_run=False)
+
+    assert residue.name in report.skipped
+    assert report.deleted == []
+    assert residue.is_dir()
+
+
+def test_staging_quarantine_supports_dry_run_cleanup_and_idempotence(tmp_path):
+    _, _, snapshots, binding = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    original = f"snap-{'c' * 32}"
+    residue = (
+        snapshots.root
+        / "staging"
+        / f".{original}.quarantine-{'d' * 32}"
+    )
+    residue.mkdir()
+    (residue / "partial").write_bytes(b"owned staging data")
+
+    preview = store.cleanup_project_snapshots()
+
+    assert preview.staging == [residue.name]
+    assert residue.is_dir()
+    removed = store.cleanup_project_snapshots(dry_run=False)
+    assert removed.staging == [residue.name]
+    assert not residue.exists()
+    assert store.cleanup_project_snapshots(dry_run=False).staging == []
+
+
+def test_corrupt_publication_residue_is_reported_not_deleted(tmp_path):
+    _, _, snapshots, binding = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    residue = publication_residue(snapshots, binding)
+    manifest = residue / "manifest.json"
+    manifest.chmod(0o644)
+    manifest.write_text("{}")
+
+    report = store.cleanup_project_snapshots(dry_run=False)
+
+    assert residue.name in report.skipped
+    assert report.deleted == []
+    assert residue.is_dir()
+
+
+def test_symlinked_publication_residue_is_never_followed(tmp_path):
+    source, _, snapshots, _ = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    residue = snapshots.root / "objects" / "aa" / f".publish-{'e' * 32}"
+    residue.parent.mkdir(exist_ok=True)
+    residue.symlink_to(source, target_is_directory=True)
+
+    report = store.cleanup_project_snapshots(dry_run=False)
+
+    assert residue.name in report.skipped
+    assert residue.is_symlink()
+    assert (source / "initialize.m").is_file()
+
+
+def test_reparse_publication_residue_is_never_followed_or_deleted(
+    tmp_path,
+    monkeypatch,
+):
+    _, _, snapshots, binding = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    residue = publication_residue(snapshots, binding)
+    original_lstat = Path.lstat
+
+    def reparse_lstat(path):
+        info = original_lstat(path)
+        return ReparseStat(info) if path == residue else info
+
+    monkeypatch.setattr(Path, "lstat", reparse_lstat)
+    report = store.cleanup_project_snapshots(dry_run=False)
+    monkeypatch.undo()
+
+    assert residue.name in report.skipped
+    assert residue.is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX special-file containment check")
+def test_staging_quarantine_with_special_member_is_not_deleted(tmp_path):
+    _, _, snapshots, _ = snapshot_case(tmp_path)
+    store = ConversationStore(tmp_path / "managed")
+    residue = (
+        snapshots.root
+        / "staging"
+        / f".snap-{'e' * 32}.quarantine-{'f' * 32}"
+    )
+    residue.mkdir()
+    os.mkfifo(residue / "special")
+
+    report = store.cleanup_project_snapshots(dry_run=False)
+
+    assert residue.name in report.skipped
+    assert residue.is_dir()
 
 
 def test_missing_reference_index_row_prevents_all_cleanup(tmp_path):

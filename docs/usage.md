@@ -457,6 +457,9 @@ Historical v2 confirmations and invocation hashes remain readable. A historical
 local task without a snapshot binding cannot dispatch new project work; propose
 and confirm a new baseline. An unresolved historical call must first reconcile
 its original receipt and is never resubmitted automatically.
+New invocation receipts keep compact snapshot lineage only; the confirmed
+baseline remains the authoritative full manifest. Historical receipts that
+already contain a full manifest are verified in place and are not rewritten.
 
 From the application checkout, preview snapshot cleanup for the default store:
 
@@ -470,3 +473,7 @@ Use the actual conversation-store root if the application runs in another state
 directory. A database error prevents deletion. Corrupt or ambiguous objects are
 reported for manual investigation. Completion alone never releases evidence
 retention, and deleting external files is not a request to release their snapshot.
+The report may list exact internal `.publish-*` or `.quarantine-*` residue names
+in `would_delete`, `deleted`, or `staging`. These entries are reclaimed only when
+their name, containment, ownership, manifest identity, and inventory all verify;
+retained, malformed, linked, symlinked, reparse, or special entries are skipped.

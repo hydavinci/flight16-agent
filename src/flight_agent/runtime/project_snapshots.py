@@ -74,3 +74,8 @@ class ProjectSnapshot(AgentContract):
         if self.snapshot_id != self.manifest.snapshot_id:
             raise ValueError("Snapshot identity differs from its manifest")
         return self
+
+
+class ProjectSnapshotLineage(AgentContract):
+    snapshot_id: Digest
+    source_fingerprint: Digest

@@ -318,9 +318,17 @@ Every use, including cache reuse and new-style reconciliation, verifies the full
 manifest and file digests. Source changes after confirmation do not redirect
 execution. A later source version requires a new proposal and confirmation.
 Tampered managed objects fail closed and are never silently repaired.
+The confirmed baseline is the single holder of the full manifest. New invocation
+specifications record only each resource's snapshot ID and source fingerprint;
+verification resolves that compact lineage back to the baseline before checking
+the managed object. Historical invocation receipts that embedded the full
+manifest are normalized to the same lineage identity and remain immutable.
 
 Cleanup uses a cross-process lifecycle guard and the complete SQLite reference
 index. Current and archived persisted task baselines retain snapshots regardless
 of terminal status, preserving retained evidence. Cleanup is explicit and dry-run
 by default; it never traverses sources, Worker locators, delivery roots, or work
-directories. Read-only permissions are not a security sandbox.
+directories. Exact publication and quarantine names left by interrupted snapshot
+operations are eligible only after the same containment, identity, manifest, and
+inventory checks; retained or unsafe residues remain untouched. Read-only
+permissions are not a security sandbox.

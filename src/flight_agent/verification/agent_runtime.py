@@ -67,7 +67,9 @@ from .intake import safe_directory, validate_output_root
 from .project_snapshots import ProjectSnapshotStore
 from .resources import ResourceRegistry
 from .snapshot_binding import (
+    compact_snapshot_lineage,
     local_projects,
+    normalize_snapshot_lineage,
     prepare_project_snapshots,
     snapshot_lineage,
     validate_managed_boundaries,
@@ -183,7 +185,7 @@ def build_invocation_spec(
     snapshot = baseline.capability_snapshots[node.tool]
     by_id = {resource.id: resource for resource in baseline.resources}
     resources = {role: by_id[identifier] for role, identifier in node.resource_bindings.items()}
-    lineage = snapshot_lineage(baseline, node)
+    lineage = compact_snapshot_lineage(baseline, node)
     snapshot_numerics: dict[str, JsonValue] = {}
     if lineage:
         snapshot_numerics["project_snapshots"] = {
@@ -874,16 +876,45 @@ class AgentExecutor:
         if spec is None:
             return False
         expected = self._spec(task, node, call)
+        if "project_snapshots" in spec.numerics:
+            if "project_snapshots" not in expected.numerics:
+                return False
+            try:
+                recorded_lineage = normalize_snapshot_lineage(
+                    spec.numerics["project_snapshots"]
+                )
+            except (TypeError, ValueError):
+                return False
+            if recorded_lineage != compact_snapshot_lineage(
+                task.baseline,
+                _node(node),
+            ):
+                return False
+            recorded_numerics = dict(spec.numerics)
+            recorded_numerics.pop("project_snapshots")
+            expected_numerics = dict(expected.numerics)
+            expected_numerics.pop("project_snapshots")
+            normalized = InvocationSpec.model_validate(
+                {
+                    **spec.model_dump(mode="json"),
+                    "numerics": recorded_numerics,
+                }
+            )
+            expected_without_lineage = InvocationSpec.model_validate(
+                {
+                    **expected.model_dump(mode="json"),
+                    "numerics": expected_numerics,
+                }
+            )
+            return normalized == expected_without_lineage
         if spec == expected:
             return True
-        if "project_snapshots" in spec.numerics:
-            return False
-        numerics = dict(expected.numerics)
-        numerics.pop("project_snapshots", None)
+        expected_numerics = dict(expected.numerics)
+        expected_numerics.pop("project_snapshots", None)
         legacy = InvocationSpec.model_validate(
             {
                 **expected.model_dump(mode="json"),
-                "numerics": numerics,
+                "numerics": expected_numerics,
             }
         )
         return spec == legacy
@@ -937,6 +968,12 @@ class AgentExecutor:
                 or call.baseline_version != task.baseline.version
             ):
                 raise ValueError("Completed call differs from its confirmed baseline")
+            if "project_snapshots" in spec.numerics:
+                verify_snapshot_lineage(
+                    task.baseline,
+                    _node(node),
+                    self.snapshots,
+                )
             run = self._verified_run(conversation, task, node, call, spec)
             if run not in task.analysis_runs or run.output != task.outputs[node.id]:
                 raise ValueError("Stored evidence differs from its verified receipt")

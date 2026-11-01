@@ -1,7 +1,11 @@
 from pathlib import Path
 
 from ..runtime.agent_contracts import AgentBaseline, AgentNode, AgentPlan
-from ..runtime.project_snapshots import ProjectSnapshot, SnapshotFile
+from ..runtime.project_snapshots import (
+    ProjectSnapshot,
+    ProjectSnapshotLineage,
+    SnapshotFile,
+)
 from ..runtime.resources import ResourceReference
 from ..runtime.tasks import plan_ancestors
 from .intake import safe_directory, validate_output_root
@@ -95,6 +99,40 @@ def snapshot_lineage(
         for identifier, binding in sorted(baseline.project_snapshots.items())
         if identifier in resource_ids
     }
+
+
+def compact_snapshot_lineage(
+    baseline: AgentBaseline,
+    node: AgentNode,
+) -> dict[str, ProjectSnapshotLineage]:
+    return {
+        identifier: ProjectSnapshotLineage(
+            snapshot_id=binding.snapshot_id,
+            source_fingerprint=binding.source_fingerprint,
+        )
+        for identifier, binding in snapshot_lineage(baseline, node).items()
+    }
+
+
+def normalize_snapshot_lineage(
+    value: object,
+) -> dict[str, ProjectSnapshotLineage]:
+    if not isinstance(value, dict):
+        raise ValueError("Invocation snapshot lineage must be a mapping")
+    normalized = {}
+    for identifier, raw in sorted(value.items()):
+        if not isinstance(identifier, str) or not isinstance(raw, dict):
+            raise ValueError("Invocation snapshot lineage is malformed")
+        if "manifest" in raw:
+            binding = ProjectSnapshot.model_validate(raw)
+            lineage = ProjectSnapshotLineage(
+                snapshot_id=binding.snapshot_id,
+                source_fingerprint=binding.source_fingerprint,
+            )
+        else:
+            lineage = ProjectSnapshotLineage.model_validate(raw)
+        normalized[identifier] = lineage
+    return normalized
 
 
 def verify_snapshot_lineage(

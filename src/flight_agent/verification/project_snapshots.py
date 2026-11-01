@@ -20,6 +20,18 @@ from .matlab_projects import discover_matlab_project
 from .snapshot_lock import is_reparse_point, lifecycle_lock
 
 _DIGEST = re.compile(r"[a-f0-9]{64}")
+_SHARD = re.compile(r"[a-f0-9]{2}")
+_PUBLISH_RESIDUE = re.compile(r"\.publish-[a-f0-9]{32}")
+_PUBLISH_QUARANTINE_RESIDUE = re.compile(
+    r"\.\.publish-[a-f0-9]{32}\.quarantine-[a-f0-9]{32}"
+)
+_OBJECT_QUARANTINE_RESIDUE = re.compile(
+    r"\.([a-f0-9]{64})\.quarantine-[a-f0-9]{32}"
+)
+_STAGING = re.compile(r"snap-[a-f0-9]{32}")
+_STAGING_QUARANTINE_RESIDUE = re.compile(
+    r"\.(snap-[a-f0-9]{32})\.quarantine-[a-f0-9]{32}"
+)
 MAX_MANIFEST_BYTES = 4_000_000
 _WINDOWS = os.name == "nt"
 
@@ -397,6 +409,16 @@ def _quarantine_and_remove(
     _sync_directory(directory.parent)
 
 
+def _remove_owned_residue(
+    directory: Path, *, expected_identity: tuple[int, int]
+) -> None:
+    safe_directory(directory.parent)
+    if _directory_identity(directory) != expected_identity:
+        raise ValueError("Managed residue identity changed before cleanup")
+    _remove_quarantined_directory(directory, expected_identity)
+    _sync_directory(directory.parent)
+
+
 def _cleanup_if_owned(directory: Path, identity: tuple[int, int]) -> None:
     try:
         current = _directory_identity(directory)
@@ -428,6 +450,20 @@ def _verify_object(
     _verify_sealed_mode(obj / "manifest.json", 0o444)
     _verify_tree(obj / "tree", manifest, readonly=True)
     return obj / "tree"
+
+
+def _verified_object_manifest(
+    obj: Path,
+    *,
+    expected_snapshot_id: str | None,
+) -> tuple[str, SnapshotManifest]:
+    raw = _read_regular(obj / "manifest.json", MAX_MANIFEST_BYTES)
+    manifest = SnapshotManifest.model_validate_json(raw)
+    snapshot_id = manifest.snapshot_id
+    if expected_snapshot_id is not None and snapshot_id != expected_snapshot_id:
+        raise ValueError("Snapshot residue identity mismatch")
+    _verify_object(obj, snapshot_id, manifest)
+    return snapshot_id, manifest
 
 
 class ProjectSnapshotStore:
@@ -578,7 +614,7 @@ class ProjectSnapshotStore:
                 report.skipped.append(shard.name)
                 continue
             if (
-                re.fullmatch(r"[a-f0-9]{2}", shard.name) is None
+                _SHARD.fullmatch(shard.name) is None
                 or is_reparse_point(shard_info)
                 or not stat.S_ISDIR(shard_info.st_mode)
             ):
@@ -586,45 +622,93 @@ class ProjectSnapshotStore:
                 continue
             for obj in sorted(shard.iterdir(), key=lambda item: item.name):
                 identifier = obj.name
+                quarantine_match = _OBJECT_QUARANTINE_RESIDUE.fullmatch(
+                    identifier
+                )
+                normal_object = (
+                    _DIGEST.fullmatch(identifier) is not None
+                    and identifier.startswith(shard.name)
+                )
+                publication_residue = (
+                    _PUBLISH_RESIDUE.fullmatch(identifier) is not None
+                    or _PUBLISH_QUARANTINE_RESIDUE.fullmatch(identifier)
+                    is not None
+                )
+                quarantine_residue = (
+                    quarantine_match is not None
+                    and quarantine_match.group(1).startswith(shard.name)
+                )
                 try:
                     object_info = obj.lstat()
                 except OSError:
                     report.skipped.append(identifier)
                     continue
                 if (
-                    _DIGEST.fullmatch(identifier) is None
-                    or not identifier.startswith(shard.name)
+                    not (
+                        normal_object
+                        or publication_residue
+                        or quarantine_residue
+                    )
                     or is_reparse_point(object_info)
                     or not stat.S_ISDIR(object_info.st_mode)
                 ):
                     report.skipped.append(identifier)
                     continue
-                if identifier in retained_ids:
+                if normal_object and identifier in retained_ids:
                     continue
+                expected_snapshot_id = (
+                    identifier
+                    if normal_object
+                    else quarantine_match.group(1)
+                    if quarantine_residue and quarantine_match is not None
+                    else None
+                )
                 try:
-                    raw = _read_regular(
-                        obj / "manifest.json",
-                        MAX_MANIFEST_BYTES,
+                    snapshot_id, manifest = _verified_object_manifest(
+                        obj,
+                        expected_snapshot_id=expected_snapshot_id,
                     )
-                    manifest = SnapshotManifest.model_validate_json(raw)
-                    self.verify_object(identifier, manifest)
+                    if not snapshot_id.startswith(shard.name):
+                        raise ValueError("Snapshot residue is in the wrong shard")
                 except (OSError, ValueError):
                     report.skipped.append(identifier)
                     continue
+                if snapshot_id in retained_ids:
+                    continue
                 report.would_delete.append(identifier)
                 if not dry_run:
-                    self.remove_verified_object(identifier, manifest)
+                    if normal_object:
+                        self.remove_verified_object(snapshot_id, manifest)
+                    else:
+                        verified_id, _ = _verified_object_manifest(
+                            obj,
+                            expected_snapshot_id=expected_snapshot_id,
+                        )
+                        if verified_id != snapshot_id:
+                            raise ValueError(
+                                "Snapshot residue changed before cleanup"
+                            )
+                        identity = _directory_identity(obj)
+                        _remove_owned_residue(
+                            obj,
+                            expected_identity=identity,
+                        )
                     report.deleted.append(identifier)
 
         staging = self.root / "staging"
         for temporary in sorted(staging.iterdir(), key=lambda item: item.name):
+            normal_staging = _STAGING.fullmatch(temporary.name) is not None
+            quarantine_staging = (
+                _STAGING_QUARANTINE_RESIDUE.fullmatch(temporary.name)
+                is not None
+            )
             try:
                 temporary_info = temporary.lstat()
             except OSError:
                 report.skipped.append(temporary.name)
                 continue
             if (
-                re.fullmatch(r"snap-[a-f0-9]{32}", temporary.name) is None
+                not (normal_staging or quarantine_staging)
                 or is_reparse_point(temporary_info)
                 or not stat.S_ISDIR(temporary_info.st_mode)
             ):
@@ -637,11 +721,19 @@ class ProjectSnapshotStore:
                 continue
             report.staging.append(temporary.name)
             if not dry_run:
-                identity = _directory_identity(temporary)
-                _quarantine_and_remove(
-                    temporary,
-                    expected_identity=identity,
-                )
+                if normal_staging:
+                    identity = _directory_identity(temporary)
+                    _quarantine_and_remove(
+                        temporary,
+                        expected_identity=identity,
+                    )
+                else:
+                    _seal_inventory(temporary)
+                    identity = _directory_identity(temporary)
+                    _remove_owned_residue(
+                        temporary,
+                        expected_identity=identity,
+                    )
         return report
 
     def remove_verified_object(

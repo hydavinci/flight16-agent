@@ -244,6 +244,23 @@ def _assert_unconfirmed_without_references(store, conversation_id):
     return restored
 
 
+def _full_manifest_spec(spec, baseline, node):
+    from flight_agent.runtime.agent_contracts import InvocationSpec
+    from flight_agent.verification.snapshot_binding import snapshot_lineage
+
+    numerics = dict(spec.numerics)
+    numerics["project_snapshots"] = {
+        identifier: binding.model_dump(mode="json")
+        for identifier, binding in snapshot_lineage(baseline, node).items()
+    }
+    return InvocationSpec.model_validate(
+        {
+            **spec.model_dump(mode="json"),
+            "numerics": numerics,
+        }
+    )
+
+
 def test_proposal_and_untrusted_confirmation_create_no_snapshot(tmp_path):
     executor, store, source, plan, calls, verifications = project_executor(tmp_path)
     pending = executor.propose(store.create(), plan)
@@ -835,9 +852,150 @@ def test_invocation_identity_includes_transitive_snapshot_lineage(tmp_path):
     )
     binding = baseline.project_snapshots["local"]
     assert spec.numerics["project_snapshots"] == {
-        "local": binding.model_dump(mode="json")
+        "local": {
+            "snapshot_id": binding.snapshot_id,
+            "source_fingerprint": binding.source_fingerprint,
+        }
     }
     assert spec.resource_fingerprints == {}
+
+
+def test_near_limit_manifest_with_many_receipts_stays_below_sqlite_boundary(
+    tmp_path,
+):
+    from flight_agent.runtime.agent_contracts import AgentBaseline, InvocationRun
+    from flight_agent.runtime.contracts import ToolCall, fingerprint
+    from flight_agent.runtime.evidence import persist_agent_run
+    from flight_agent.runtime.project_snapshots import (
+        ProjectSnapshot,
+        SnapshotFile,
+        SnapshotManifest,
+    )
+    from flight_agent.verification.agent_runtime import build_invocation_spec
+    from flight_agent.verification.contracts import AgentExecutionNode, AgentTask
+    from flight_agent.verification.sqlite_store import MAX_CONVERSATION_BYTES
+    from flight_agent.verification.store import now
+
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    pending = executor.propose(store.create(), plan)
+    confirmed = executor.confirm(
+        pending.id,
+        pending.task.baseline.version,
+        trusted=True,
+        _execute=False,
+    )
+    empty_digest = fingerprint("")
+    manifest = SnapshotManifest(
+        files=[
+            SnapshotFile(
+                path=f"{index:04d}-{'x' * 260}.m",
+                sha256=empty_digest,
+                size=0,
+            )
+            for index in range(4990)
+        ]
+    )
+    original = confirmed.task.baseline.project_snapshots["local"]
+    binding = ProjectSnapshot(
+        snapshot_id=manifest.snapshot_id,
+        source_fingerprint=original.source_fingerprint,
+        manifest=manifest,
+    )
+    baseline_data = confirmed.task.baseline.model_dump(mode="json")
+    baseline_data["nodes"] = baseline_data["nodes"][:1]
+    baseline_data["requirements"]["requested_outputs"] = baseline_data["requirements"][
+        "requested_outputs"
+    ][:1]
+    baseline_data["project_snapshots"] = {
+        "local": binding.model_dump(mode="json")
+    }
+    baseline = AgentBaseline.model_validate(baseline_data)
+    node = baseline.nodes[0]
+    spec = build_invocation_spec(baseline, node, {"tag": "first"}, {})
+    assert spec.numerics["project_snapshots"] == {
+        "local": {
+            "snapshot_id": binding.snapshot_id,
+            "source_fingerprint": binding.source_fingerprint,
+        }
+    }
+
+    size_store = ConversationStore(tmp_path / "size-state")
+    record = size_store.create()
+    task_id = "e" * 32
+    result_directory = size_store.task_directory(
+        record.id,
+        task_id,
+        create=True,
+    )
+    output = CapabilityOutcome(
+        findings=[
+            Finding(
+                id="seen",
+                node_id=node.id,
+                text="first",
+                status="observed",
+            )
+        ]
+    )
+    stamp = now()
+    recorded_calls = []
+    runs = []
+    for index in range(6):
+        call = ToolCall(
+            id=f"{index + 1:032x}",
+            node_id=node.id,
+            tool=spec.capability,
+            tool_version=spec.capability_version,
+            baseline_version=baseline.version,
+            status="completed",
+            started_at=stamp,
+            finished_at=stamp,
+            inputs=spec.inputs,
+            output=output.model_dump(mode="json"),
+        )
+        run = InvocationRun(
+            id=call.id,
+            spec=spec,
+            output=output,
+            output_sha256=fingerprint(output.model_dump(mode="json")),
+            started_at=stamp,
+            finished_at=stamp,
+        )
+        persist_agent_run(result_directory, run)
+        recorded_calls.append(call)
+        runs.append(run)
+    task = AgentTask(
+        id=task_id,
+        baseline=baseline,
+        baseline_sha256=fingerprint(baseline.model_dump(mode="json")),
+        nodes=[
+            AgentExecutionNode.model_validate(
+                {
+                    **node.model_dump(mode="json"),
+                    "status": "completed",
+                }
+            )
+        ],
+        calls=recorded_calls,
+        outputs={node.id: output},
+        analysis_runs=runs,
+        result_directory=str(result_directory),
+        stage=node.id,
+    )
+    record.task = task
+    compact_size = size_store._serialized_size(record)
+    full_spec = _full_manifest_spec(spec, baseline, node)
+    full_record = record.model_copy(deep=True)
+    full_record.task.analysis_runs = [
+        run.model_copy(update={"spec": full_spec}) for run in runs
+    ]
+
+    assert compact_size < MAX_CONVERSATION_BYTES
+    assert size_store._serialized_size(full_record) > MAX_CONVERSATION_BYTES
+    size_store.save(record)
+    restored = ConversationStore(size_store.root).get(record.id)
+    assert restored.task == task
+    assert size_store._serialized_size(restored) < MAX_CONVERSATION_BYTES
 
 
 def test_context_returns_isolated_snapshot_and_validates_role_and_work_root(
@@ -980,6 +1138,235 @@ def test_new_style_loaded_receipt_recovery_rejects_snapshot_tamper(
     assert recovered.task.analysis_runs == []
     assert recovered.task.outputs == {}
     assert len(calls) == 1
+
+
+def test_historical_full_manifest_pending_receipt_recovers_without_rewrite(
+    tmp_path,
+    monkeypatch,
+):
+    from flight_agent.verification import agent_runtime as module
+
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    build = module.build_invocation_spec
+    publish = module.persist_agent_run
+
+    def historical_build(baseline, node, inputs, outputs):
+        return _full_manifest_spec(
+            build(baseline, node, inputs, outputs),
+            baseline,
+            node,
+        )
+
+    def crash_after_receipt(root, run):
+        publish(root, run)
+        raise KeyboardInterrupt("Crash after historical receipt publication")
+
+    monkeypatch.setattr(module, "build_invocation_spec", historical_build)
+    monkeypatch.setattr(module, "persist_agent_run", crash_after_receipt)
+    pending = executor.propose(store.create(), plan)
+    with pytest.raises(KeyboardInterrupt):
+        executor.confirm(
+            pending.id,
+            pending.task.baseline.version,
+            trusted=True,
+        )
+    saved = store.get(pending.id)
+    historical = next(iter(saved.task.pending_specs.values()))
+    assert "manifest" in historical.numerics["project_snapshots"]["local"]
+
+    monkeypatch.setattr(module, "build_invocation_spec", build)
+    monkeypatch.setattr(module, "persist_agent_run", publish)
+    recovery = AgentExecutor(
+        ConversationStore(store.root),
+        executor.tools,
+        executor.resources,
+        snapshots=ProjectSnapshotStore(executor.snapshots.root),
+    )
+    recovered = recovery.resume(pending.id)
+
+    assert recovered.status == "completed", recovered.error
+    assert "manifest" in recovered.task.analysis_runs[0].spec.numerics[
+        "project_snapshots"
+    ]["local"]
+    assert "manifest" not in recovered.task.analysis_runs[1].spec.numerics[
+        "project_snapshots"
+    ]["local"]
+
+
+def test_historical_full_manifest_completed_receipts_verify_after_restart(
+    tmp_path,
+    monkeypatch,
+):
+    from flight_agent.verification import agent_runtime as module
+
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    build = module.build_invocation_spec
+
+    def historical_build(baseline, node, inputs, outputs):
+        return _full_manifest_spec(
+            build(baseline, node, inputs, outputs),
+            baseline,
+            node,
+        )
+
+    monkeypatch.setattr(module, "build_invocation_spec", historical_build)
+    pending = executor.propose(store.create(), plan)
+    done = executor.confirm(
+        pending.id,
+        pending.task.baseline.version,
+        trusted=True,
+    )
+    assert done.status == "completed", done.error
+    assert all(
+        "manifest" in run.spec.numerics["project_snapshots"]["local"]
+        for run in done.task.analysis_runs
+    )
+
+    monkeypatch.setattr(module, "build_invocation_spec", build)
+    recovery = AgentExecutor(
+        ConversationStore(store.root),
+        executor.tools,
+        executor.resources,
+        snapshots=ProjectSnapshotStore(executor.snapshots.root),
+    )
+    recovered = recovery.resume(done.id)
+
+    assert recovered.status == "completed", recovered.error
+    assert recovered.task.analysis_runs == done.task.analysis_runs
+
+
+def test_completed_snapshot_receipt_recovery_rejects_managed_object_tamper(
+    tmp_path,
+):
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    pending = executor.propose(store.create(), plan)
+    done = executor.confirm(
+        pending.id,
+        pending.task.baseline.version,
+        trusted=True,
+    )
+    assert done.status == "completed", done.error
+    binding = done.task.baseline.project_snapshots["local"]
+    path = (
+        executor.snapshots.object_directory(binding.snapshot_id)
+        / "tree"
+        / "initialize.m"
+    )
+    path.chmod(0o644)
+    path.write_text("tampered completed recovery object = 1;\n")
+    path.chmod(0o444)
+
+    recovery = AgentExecutor(
+        ConversationStore(store.root),
+        executor.tools,
+        executor.resources,
+        snapshots=ProjectSnapshotStore(executor.snapshots.root),
+    )
+    recovered = recovery.resume(done.id)
+
+    assert recovered.status == "failed"
+    assert "Snapshot" in recovered.error
+    assert recovered.task.analysis_runs == done.task.analysis_runs
+    assert len(calls) == 2
+
+
+def test_tampered_compact_snapshot_lineage_fails_closed_during_recovery(
+    tmp_path,
+):
+    from flight_agent.runtime.agent_contracts import InvocationRun, InvocationSpec
+    from flight_agent.runtime.contracts import ToolCall, fingerprint
+    from flight_agent.runtime.evidence import persist_agent_run
+    from flight_agent.verification.agent_runtime import build_invocation_spec
+    from flight_agent.verification.contracts import PendingDecision
+    from flight_agent.verification.store import now
+
+    executor, store, source, plan, calls, verifications = project_executor(tmp_path)
+    pending = executor.propose(store.create(), plan)
+    confirmed = executor.confirm(
+        pending.id,
+        pending.task.baseline.version,
+        trusted=True,
+        _execute=False,
+    )
+    task = confirmed.task
+    node = task.baseline.nodes[0]
+    execution_node = task.nodes[0]
+    spec = build_invocation_spec(
+        task.baseline,
+        node,
+        {"tag": "first"},
+        task.outputs,
+    )
+    numerics = dict(spec.numerics)
+    lineage = dict(numerics["project_snapshots"])
+    assert "manifest" not in lineage["local"]
+    lineage["local"] = {
+        **lineage["local"],
+        "snapshot_id": "f" * 64,
+    }
+    numerics["project_snapshots"] = lineage
+    tampered = InvocationSpec.model_validate(
+        {
+            **spec.model_dump(mode="json"),
+            "numerics": numerics,
+        }
+    )
+    stamp = now()
+    call = ToolCall(
+        id="f" * 32,
+        node_id=node.id,
+        tool=tampered.capability,
+        tool_version=tampered.capability_version,
+        baseline_version=task.baseline.version,
+        status="interrupted",
+        started_at=stamp,
+        inputs=tampered.inputs,
+        error="simulated interruption",
+    )
+    output = CapabilityOutcome(
+        findings=[
+            Finding(
+                id="seen",
+                node_id=node.id,
+                text="first",
+                status="observed",
+            )
+        ]
+    )
+    run = InvocationRun(
+        id=call.id,
+        spec=tampered,
+        output=output,
+        output_sha256=fingerprint(output.model_dump(mode="json")),
+        started_at=stamp,
+        finished_at=stamp,
+    )
+    persist_agent_run(Path(task.result_directory), run)
+    task.calls.append(call)
+    task.pending_specs[call.id] = tampered
+    execution_node.status = "interrupted"
+    execution_node.error = call.error
+    task.stage = node.id
+    confirmed.status = "interrupted"
+    confirmed.error = call.error
+    confirmed.pending_decision = PendingDecision(
+        kind="resume",
+        message="Resume the interrupted compact-lineage call.",
+    )
+    store.save(confirmed)
+
+    recovery = AgentExecutor(
+        ConversationStore(store.root),
+        executor.tools,
+        executor.resources,
+        snapshots=ProjectSnapshotStore(executor.snapshots.root),
+    )
+    recovered = recovery.resume(confirmed.id)
+
+    assert recovered.status == "interrupted"
+    assert recovered.task.analysis_runs == []
+    assert recovered.task.outputs == {}
+    assert calls == []
 
 
 def test_new_style_reconcile_verifies_after_lane_and_releases_guard(
