@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from flight_agent.copilot_diagnostics import (
     CopilotError,
+    CopilotInvalidResponseError,
     classify_failure,
     make_diagnostics,
     schema_feedback,
@@ -58,6 +59,8 @@ def test_diagnostics_allow_only_six_safe_fields():
         ("HTTP 403 Forbidden", "authorization"),
         ("model access denied", "authorization"),
         ("account access denied", "authorization"),
+        ("HTTP 407 Proxy Authentication Required", "transport"),
+        ("proxy authentication required", "transport"),
         ("WebSocket closed", "transport"),
         ("proxy connection failed", "transport"),
         ("getaddrinfo ENOTFOUND", "transport"),
@@ -114,6 +117,56 @@ def test_schema_feedback_omits_response_values_and_unknown_field_names():
     assert "private" not in encoded
     assert feedback["errors"]
     assert all(set(item) == {"location", "code", "message"} for item in feedback["errors"])
+
+
+def test_invalid_response_error_rejects_unrestricted_correction_feedback():
+    diagnostic = make_diagnostics(
+        "invalid_response",
+        stdout="",
+        stderr="",
+        exit_code=0,
+        elapsed_seconds=0.1,
+    )
+    with pytest.raises(ValueError, match="schema_feedback"):
+        CopilotInvalidResponseError(
+            diagnostic,
+            correction_feedback={
+                "errors": [],
+                "provider_payload": "private-provider-response",
+            },
+        )
+
+
+def test_invalid_response_error_owns_immutable_safe_feedback():
+    with pytest.raises(ValidationError) as caught:
+        AgentDecision.model_validate(
+            {
+                "action": "plan",
+                "text": "private-response",
+                "private-secret-field": "private-value",
+            }
+        )
+    source = schema_feedback(caught.value, AgentDecision)
+    diagnostic = make_diagnostics(
+        "invalid_response",
+        stdout="",
+        stderr="",
+        exit_code=0,
+        elapsed_seconds=0.1,
+    )
+    error = CopilotInvalidResponseError(diagnostic, correction_feedback=source)
+    expected = error.correction_feedback
+
+    source["provider_payload"] = "private-provider-response"
+    source_errors = source["errors"]
+    assert isinstance(source_errors, list)
+    source_errors.clear()
+    returned = error.correction_feedback
+    assert returned is not None
+    returned["provider_payload"] = "private-provider-response"
+
+    assert error.correction_feedback == expected
+    assert "private" not in json.dumps(error.correction_feedback)
 
 
 def test_jsonl_request_identity_is_hashed_without_persisting_the_event():

@@ -11,6 +11,8 @@ from .runtime.planning_contracts import (
 )
 
 DIAGNOSTIC_SCAN_BYTES = 8192
+_SCHEMA_FEEDBACK_MESSAGE = "Structured response schema validation failed."
+_SchemaIssue = tuple[tuple[str, ...], str]
 
 
 def _bounded_text(value: str) -> str:
@@ -21,17 +23,17 @@ def classify_failure(stdout: str, stderr: str) -> CopilotFailureCategory:
     text = _bounded_text(stderr) + "\n" + _bounded_text(stdout)
     patterns: tuple[tuple[CopilotFailureCategory, str], ...] = (
         (
+            "transport",
+            r"\b407\b|websocket|proxy|dns|ENOTFOUND|EAI_AGAIN|ECONNRESET|"
+            r"ECONNREFUSED|connection (?:failed|closed|reset)|network unreachable",
+        ),
+        (
             "authentication",
             r"\b401\b|not logged in|not authenticated|login required|"
             r"authentication (?:failed|required)|token (?:has )?expired|"
             r"expired (?:token|credentials)|please (?:log|sign) in",
         ),
         ("authorization", r"\b403\b|model access denied|account access denied|forbidden"),
-        (
-            "transport",
-            r"websocket|proxy|dns|ENOTFOUND|EAI_AGAIN|ECONNRESET|"
-            r"ECONNREFUSED|connection (?:failed|closed|reset)|network unreachable",
-        ),
     )
     for category, expression in patterns:
         if re.search(expression, text, re.IGNORECASE):
@@ -100,8 +102,14 @@ class CopilotInvalidResponseError(CopilotError):
         *,
         correction_feedback: dict[str, object] | None = None,
     ):
-        self.correction_feedback = correction_feedback
+        self._correction_issues = _safe_feedback_issues(correction_feedback)
         super().__init__(diagnostics)
+
+    @property
+    def correction_feedback(self) -> dict[str, object] | None:
+        if self._correction_issues is None:
+            return None
+        return _feedback_dict(self._correction_issues)
 
 
 class CopilotTimeoutError(CopilotError):
@@ -135,6 +143,48 @@ class CopilotTimeoutError(CopilotError):
             )
 
 
+def _feedback_dict(issues: tuple[_SchemaIssue, ...]) -> dict[str, object]:
+    return {
+        "errors": [
+            {
+                "location": list(location),
+                "code": code,
+                "message": _SCHEMA_FEEDBACK_MESSAGE,
+            }
+            for location, code in issues
+        ]
+    }
+
+
+class _SchemaFeedback(dict[str, object]):
+    def __init__(self, issues: tuple[_SchemaIssue, ...]):
+        self.issues = issues
+        super().__init__(_feedback_dict(issues))
+
+
+def _safe_feedback_issues(
+    feedback: dict[str, object] | None,
+) -> tuple[_SchemaIssue, ...] | None:
+    if feedback is None:
+        return None
+    if not isinstance(feedback, _SchemaFeedback):
+        raise ValueError("correction_feedback must be created by schema_feedback")
+    if len(feedback.issues) > 8:
+        raise ValueError("schema_feedback exceeds the error limit")
+    safe_issues: list[_SchemaIssue] = []
+    for location, code in feedback.issues:
+        if len(location) > 10 or re.fullmatch(r"[a-z0-9_]{1,100}", code) is None:
+            raise ValueError("schema_feedback contains an invalid issue")
+        if any(
+            re.fullmatch(r"(?:\[field\]|[A-Za-z_][A-Za-z0-9_]{0,99}|[0-9]{1,10})", part)
+            is None
+            for part in location
+        ):
+            raise ValueError("schema_feedback contains an invalid location")
+        safe_issues.append((tuple(location), code))
+    return tuple(safe_issues)
+
+
 def schema_feedback(error: ValidationError, schema: type[BaseModel]) -> dict[str, object]:
     field_names: set[str] = set()
 
@@ -150,7 +200,7 @@ def schema_feedback(error: ValidationError, schema: type[BaseModel]) -> dict[str
                 visit(child)
 
     visit(schema.model_json_schema())
-    errors = []
+    issues: list[_SchemaIssue] = []
     for issue in error.errors(
         include_input=False,
         include_context=False,
@@ -159,14 +209,13 @@ def schema_feedback(error: ValidationError, schema: type[BaseModel]) -> dict[str
         code = str(issue["type"])
         if re.fullmatch(r"[a-z0-9_]{1,100}", code) is None:
             code = "schema_validation"
-        errors.append(
-            {
-                "location": [
+        issues.append(
+            (
+                tuple(
                     str(part) if isinstance(part, int) or part in field_names else "[field]"
                     for part in issue["loc"][:10]
-                ],
-                "code": code,
-                "message": "Structured response schema validation failed.",
-            }
+                ),
+                code,
+            )
         )
-    return {"errors": errors}
+    return _SchemaFeedback(tuple(issues))
