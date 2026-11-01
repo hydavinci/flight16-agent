@@ -325,6 +325,8 @@ def _final_message(output: str) -> str:
     for line in output.splitlines():
         if not line.strip():
             continue
+        if complete:
+            raise ValueError("Copilot CLI returned an event after the successful result")
         try:
             event = json.loads(line)
         except json.JSONDecodeError as exc:

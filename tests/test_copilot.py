@@ -216,6 +216,42 @@ def test_assistant_tool_request_is_rejected_even_before_a_clean_message(
     assert json.loads(copilot_cli.read_text())["calls"] == 1
 
 
+@pytest.mark.parametrize("trailing_event", [
+    {
+        "type": "assistant.message",
+        "data": {
+            "content": '{"action":"clarify","text":"Post-result replacement"}',
+            "toolRequests": [],
+            "phase": "final_answer",
+        },
+    },
+    {"type": "session.idle", "data": {}},
+])
+def test_successful_result_rejects_any_later_nonblank_event(
+    copilot_cli, monkeypatch, trailing_event,
+):
+    output = (
+        events('{"action":"clarify","text":"Original"}')
+        + "\n"
+        + json.dumps(trailing_event)
+    )
+    monkeypatch.setenv("PROBE_EVENTS", output)
+    with pytest.raises(CopilotInvalidResponseError) as caught:
+        call_planner()
+    assert caught.value.diagnostics.category == "invalid_response"
+    assert json.loads(copilot_cli.read_text())["calls"] == 1
+
+
+def test_successful_result_accepts_only_trailing_blank_lines(copilot_cli, monkeypatch):
+    monkeypatch.setenv(
+        "PROBE_EVENTS",
+        events('{"action":"clarify","text":"Original"}') + "\n\n",
+    )
+    result = call_planner()
+    assert result.action == "clarify"
+    assert result.text == "Original"
+
+
 def test_copilot_returns_validated_plan_without_api_credentials(copilot_cli, monkeypatch):
     monkeypatch.setenv(
         "PROBE_EVENTS", events('{"action":"clarify","text":"Which synthetic fixture?"}')
