@@ -363,7 +363,10 @@ function schedulePoll(record, selectionVersion) {
       await renderRecord(next);
       schedulePoll(next, selectionVersion);
     } catch (error) {
-      if (selectionVersion === state.selectionVersion) showNotice(errorMessage(error));
+      if (selectionVersion === state.selectionVersion && record.id === state.selectedRunId) {
+        showNotice(errorMessage(error));
+        schedulePoll(record, selectionVersion);
+      }
     }
   }, 800);
 }

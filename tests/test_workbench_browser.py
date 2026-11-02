@@ -1,4 +1,7 @@
+import json
 import os
+import re
+import time
 from contextlib import contextmanager
 
 import pytest
@@ -51,6 +54,42 @@ def submit(page, kind="script"):
     page.locator("#parameters").fill('{"value": 3}')
     page.locator("#trusted").check()
     page.locator("#run-button").click()
+
+
+def browser_record(run_id, *, status="completed", artifacts=None):
+    completed = status == "completed"
+    return {
+        "id": run_id,
+        "request_sha256": "a" * 64,
+        "status": status,
+        "stage": status,
+        "created_at": "2026-11-02T00:00:00Z",
+        "updated_at": "2026-11-02T00:00:00Z",
+        "filename": "analysis.m",
+        "kind": "script",
+        "matlab_version": "test-engine" if completed else None,
+        "result": {"value": 6} if completed else None,
+        "error": None,
+        "log": "controlled browser log",
+        "artifacts": artifacts or [],
+    }
+
+
+def install_workbench_api(page, handler):
+    def route_api(route):
+        request = route.request
+        if request.url.endswith("/api/workbench/bootstrap"):
+            route.fulfill(
+                json={
+                    "token": "browser-test-token",
+                    "worker_configured": True,
+                    "worker_error": None,
+                }
+            )
+            return
+        handler(route)
+
+    page.route("**/api/workbench/**", route_api)
 
 
 @pytest.mark.parametrize("width", [1440, 390])
@@ -145,6 +184,242 @@ def test_browser_validation_is_explicit_and_never_submits(
             page.locator("#run-button").click()
             expect(page.locator("#notice")).to_contain_text(message)
             assert posts == []
+        finally:
+            browser.close()
+
+
+def test_file_and_parameter_byte_limits_accept_boundary_and_reject_one_over(tmp_path, monkeypatch):
+    with (
+        workbench_server(tmp_path, monkeypatch, configured=False) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        requests = []
+
+        def handler(route):
+            request = route.request
+            if request.method == "GET" and request.url.endswith("/runs"):
+                route.fulfill(json=[])
+                return
+            payload = request.post_data_json
+            requests.append(payload)
+            route.fulfill(status=202, json=browser_record(payload["id"]))
+
+        install_workbench_api(page, handler)
+        try:
+            page.goto(url + "/workbench")
+            page.locator("#trusted").check()
+            page.set_input_files(
+                "#file",
+                {"name": "analysis.m", "mimeType": "text/plain", "buffer": b"x" * 1_000_000},
+            )
+            page.locator("#run-button").click()
+            expect(page.locator("#execution-status")).to_have_text("执行完成")
+            assert len(requests) == 1
+
+            page.set_input_files(
+                "#file",
+                {
+                    "name": "analysis.m",
+                    "mimeType": "text/plain",
+                    "buffer": b"x" * 1_000_001,
+                },
+            )
+            page.locator("#run-button").click()
+            expect(page.locator("#notice")).to_contain_text("1 MB")
+            assert len(requests) == 1
+
+            page.set_input_files("#file", source_file())
+            page.locator("#parameters").fill(json.dumps({"x": "a" * 99_992}))
+            previous_id = page.locator("#run-id").text_content()
+            page.locator("#run-button").click()
+            expect(page.locator("#run-id")).not_to_have_text(previous_id)
+            assert len(requests) == 2
+
+            page.locator("#parameters").fill(json.dumps({"x": "a" * 99_993}))
+            page.locator("#run-button").click()
+            expect(page.locator("#notice")).to_contain_text("100 KB")
+            assert len(requests) == 2
+        finally:
+            browser.close()
+
+
+def test_timeout_limits_and_generated_run_id_are_enforced(tmp_path, monkeypatch):
+    with (
+        workbench_server(tmp_path, monkeypatch, configured=False) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        requests = []
+
+        def handler(route):
+            request = route.request
+            if request.method == "GET" and request.url.endswith("/runs"):
+                route.fulfill(json=[])
+                return
+            payload = request.post_data_json
+            requests.append(payload)
+            route.fulfill(status=202, json=browser_record(payload["id"]))
+
+        install_workbench_api(page, handler)
+        try:
+            page.goto(url + "/workbench")
+            page.set_input_files("#file", source_file())
+            page.locator("#trusted").check()
+            for value in ("0", "601", "1.5"):
+                page.locator("#timeout").fill(value)
+                page.locator("#run-button").click()
+                expect(page.locator("#notice")).to_contain_text("1 到 600")
+            assert requests == []
+
+            for value in ("1", "600"):
+                page.locator("#timeout").fill(value)
+                previous_id = page.locator("#run-id").text_content()
+                page.locator("#run-button").click()
+                expect(page.locator("#run-id")).not_to_have_text(previous_id)
+
+            assert [request["timeout_seconds"] for request in requests] == [1, 600]
+            assert all(re.fullmatch(r"[0-9a-f]{32}", request["id"]) for request in requests)
+            assert requests[0]["id"] != requests[1]["id"]
+        finally:
+            browser.close()
+
+
+def test_polling_recovers_from_transient_http_error_and_stops_at_terminal(tmp_path, monkeypatch):
+    with (
+        workbench_server(tmp_path, monkeypatch, configured=False) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        run_id = []
+        status_times = []
+
+        def handler(route):
+            request = route.request
+            if request.method == "GET" and request.url.endswith("/runs"):
+                route.fulfill(json=[])
+            elif request.method == "POST":
+                run_id.append(request.post_data_json["id"])
+                route.fulfill(status=202, json=browser_record(run_id[0], status="queued"))
+            else:
+                status_times.append(time.monotonic())
+                if len(status_times) == 1:
+                    route.fulfill(status=503, json={"detail": "temporary status failure"})
+                elif len(status_times) == 2:
+                    route.fulfill(json=browser_record(run_id[0], status="running"))
+                else:
+                    route.fulfill(json=browser_record(run_id[0]))
+
+        install_workbench_api(page, handler)
+        try:
+            page.goto(url + "/workbench")
+            submit(page)
+            expect(page.locator("#notice")).to_contain_text("temporary status failure")
+            expect(page.locator("#execution-status")).to_have_text("执行完成", timeout=5000)
+            assert len(status_times) == 3
+            assert all(
+                later - earlier >= 0.7 for earlier, later in zip(status_times, status_times[1:])
+            )
+            page.wait_for_timeout(1000)
+            assert len(status_times) == 3
+        finally:
+            browser.close()
+
+
+def test_selecting_history_cancels_active_run_polling(tmp_path, monkeypatch):
+    with (
+        workbench_server(tmp_path, monkeypatch, configured=False) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        active_id = []
+        history_id = "3" * 32
+        active_status_requests = []
+
+        def handler(route):
+            request = route.request
+            if request.method == "POST":
+                active_id.append(request.post_data_json["id"])
+                route.fulfill(status=202, json=browser_record(active_id[0], status="queued"))
+            elif request.url.endswith("/runs"):
+                route.fulfill(json=[browser_record(history_id)])
+            elif active_id and request.url.endswith("/" + active_id[0]):
+                active_status_requests.append(request)
+                route.fulfill(json=browser_record(active_id[0], status="running"))
+            else:
+                route.fulfill(json=browser_record(history_id))
+
+        install_workbench_api(page, handler)
+        try:
+            page.goto(url + "/workbench")
+            submit(page)
+            expect(page.locator(f'#history button[data-id="{history_id}"]')).to_be_visible()
+            page.locator(f'#history button[data-id="{history_id}"]').click()
+            expect(page.locator("#run-id")).to_have_text(history_id)
+            page.wait_for_timeout(1000)
+            assert active_status_requests == []
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("failure", ["record", "artifact", "http"])
+def test_malformed_and_http_responses_are_explicit_without_success_shape(
+    tmp_path, monkeypatch, failure
+):
+    with (
+        workbench_server(tmp_path, monkeypatch, configured=False) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        run_id = []
+
+        def handler(route):
+            request = route.request
+            if request.method == "GET" and request.url.endswith("/runs"):
+                route.fulfill(json=[])
+            elif request.method == "POST" and failure == "http":
+                route.fulfill(status=503, json={"detail": "controlled HTTP failure"})
+            elif request.method == "POST" and failure == "record":
+                route.fulfill(status=202, json={"id": "malformed"})
+            elif request.method == "POST":
+                run_id.append(request.post_data_json["id"])
+                route.fulfill(
+                    status=202,
+                    json=browser_record(
+                        run_id[0],
+                        artifacts=[
+                            {
+                                "path": "figure-1.png",
+                                "sha256": "b" * 64,
+                                "size": 4,
+                                "media_type": "image/png",
+                                "role": "figure",
+                            }
+                        ],
+                    ),
+                )
+            else:
+                route.fulfill(headers={"content-type": "image/png"}, body=b"bad")
+
+        install_workbench_api(page, handler)
+        try:
+            page.goto(url + "/workbench")
+            submit(page)
+            expected = {
+                "record": "运行记录无效",
+                "artifact": "清单不一致",
+                "http": "controlled HTTP failure",
+            }[failure]
+            expect(page.locator("#notice")).to_contain_text(expected)
+            expect(page.locator("#figures img")).to_have_count(0)
+            if failure != "artifact":
+                expect(page.locator("#result-data")).to_be_empty()
+                expect(page.locator("#result-download")).to_be_disabled()
         finally:
             browser.close()
 
