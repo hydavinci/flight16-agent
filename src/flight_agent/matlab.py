@@ -178,7 +178,6 @@ def _update_windows_tree(
     depths: dict[int, int],
     identities: dict[int, str],
     reused_at: dict[int, int],
-    root_pid: int,
 ) -> tuple[dict[int, int], str | None]:
     for pid, process in processes.items():
         if not process.creation_time or not process.creation_time.isdecimal():
@@ -214,10 +213,11 @@ def _update_windows_tree(
                     )
                 if child_time > replacement_time:
                     continue
-            elif parent_pid not in processes and parent_pid != root_pid:
+            elif parent_pid not in processes:
                 return {}, (
                     f"Windows process ancestry is uncertain for PID {pid}; "
-                    f"parent PID {parent_pid} is unavailable"
+                    f"parent PID {parent_pid} is unavailable and the process "
+                    "is still running"
                 )
             depths[pid] = depths[parent_pid] + 1
             identities[pid] = process.creation_time
@@ -247,7 +247,7 @@ def _stop_windows_tree(root_pid: int, root_creation_time: str) -> str | None:
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return f"cannot enumerate the Windows process tree: {exc}"
         live, identity_error = _update_windows_tree(
-            processes, depths, identities, reused_at, root_pid
+            processes, depths, identities, reused_at
         )
         if identity_error is not None:
             return identity_error
@@ -266,7 +266,7 @@ def _stop_windows_tree(root_pid: int, root_creation_time: str) -> str | None:
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return f"cannot verify the Windows process tree termination: {exc}"
     live, identity_error = _update_windows_tree(
-        processes, depths, identities, reused_at, root_pid
+        processes, depths, identities, reused_at
     )
     if identity_error is not None:
         return identity_error

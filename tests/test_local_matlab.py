@@ -722,6 +722,30 @@ def test_windows_cleanup_keeps_original_descendant_after_parent_pid_reuse(monkey
     assert terminated == [(43211, "20"), (43210, "10"), (43212, "25")]
 
 
+def test_windows_cleanup_rejects_child_after_unobserved_root_pid_reuse(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    snapshots = iter(
+        [
+            {43210: module._WindowsProcess(1, "10")},
+            {43211: module._WindowsProcess(43210, "30")},
+            {},
+        ]
+    )
+    terminated = []
+    monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: terminated.append((pid, creation_time)),
+    )
+
+    error = module._stop_windows_tree(43210, "10")
+
+    assert error is not None
+    assert "ancestry is uncertain" in error
+    assert terminated == [(43210, "10")]
+
+
 def test_stop_worker_binds_root_identity_from_process_handle(monkeypatch):
     module = importlib.import_module("flight_agent.matlab")
     process = Mock(spec=subprocess.Popen)
