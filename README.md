@@ -165,7 +165,8 @@ flight-agent web --port 8000
 |---|---|
 | `web.py`、`cli.py` | Web 组合、安全边界与命令行入口 |
 | `application.py` | 运行时、计算后端和后台调度器装配 |
-| `web_routes/` | 页面、配置、元数据、工件和会话路由分组 |
+| `web_routes/` | 页面、配置、元数据、工件与错误映射 |
+| `verification/routes.py` | 通用会话提交、确认、恢复、重试和状态投影 |
 | `runtime/` | 需求契约、能力注册、预算和证据 |
 | `verification/` | 会话、规划、执行、资源及计算适配器 |
 | `matlab_support/` | 受控 MATLAB 桥接函数 |

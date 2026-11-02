@@ -62,6 +62,10 @@ def test_docs_describe_actual_modules_jobs_and_engine_opt_in():
     assert "MATLAB_ACCEPTANCE_ENV" in usage
     assert "--inexact" in usage
     assert "RUN_MATLAB_TESTS=1" in usage
+    assert "真实 MATLAB 验收未运行" in usage
     readme = (ROOT / "README.md").read_text("utf-8")
     assert "not matlab and not browser" in readme
     assert "application.py" in readme
+    assert "verification/routes.py" in readme
+    assert "通用会话提交、确认、恢复、重试" in readme
+    assert "真实 MATLAB 验收未运行" in architecture

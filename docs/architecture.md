@@ -374,6 +374,9 @@ licensed MATLAB job 仅允许从默认分支手动勾选 `run_matlab`，使用
 hosted jobs 只缓存 uv 下载；不缓存虚拟环境、浏览器、MATLAB、Engine 或证据产物，
 licensed MATLAB job 禁用 uv 缓存。
 
+本分支的真实 MATLAB 验收未运行；opt-in licensed gate 仍等待受保护环境、
+self-hosted runner、专用 Engine 环境、所需工具箱和许可证基础设施。
+
 本机集成包含解析响应、真正非线性闭环、不同初始化工作区、5%/2% 调节带、错误、
 报告下载、线性化与 `allmargin` 证据链。
 独立参考与容差见 [Simulink Worker 参考](simulink-worker.md)。

@@ -87,6 +87,9 @@ GitHub CI 的软件矩阵使用 Python 3.11/3.12，浏览器测试使用独立 C
 缓存仅用于 hosted job 的 uv 下载，不包含虚拟环境、浏览器、MATLAB、Engine 或证据产物；
 licensed MATLAB job 明确禁用 uv 缓存。
 
+本分支的真实 MATLAB 验收未运行；opt-in licensed gate 仍等待受保护环境、
+self-hosted runner、专用 Engine 环境、所需工具箱和许可证基础设施。
+
 ### 安装 MATLAB Engine
 
 先安装并激活 MATLAB，再在兼容的 Python 环境中安装匹配的 Engine。
