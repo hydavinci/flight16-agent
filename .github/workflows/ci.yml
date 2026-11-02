@@ -154,12 +154,7 @@ jobs:
       - name: Install locked tools without removing the preinstalled Engine
         shell: bash
         run: uv sync --locked --extra dev --inexact --python "$MATLAB_PYTHON_EXECUTABLE"
-      - name: Real project stepinfo linearization allmargin and evidence acceptance
-        run: >-
-          uv run --no-sync python -m pytest
-          tests/test_verification_matlab.py
-          tests/test_local_matlab.py
-          tests/test_local_matlab_integration.py
-          -m matlab -v -s
+      - name: Licensed MATLAB acceptance
+        run: uv run --no-sync python -m pytest -m matlab -v -s
       - name: Lock must remain unchanged
         run: git diff --exit-code -- uv.lock

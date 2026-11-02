@@ -7,6 +7,7 @@
 这种分层支持扩展新能力，但不代表已经能执行任意 MATLAB 分析。
 只有一个通用 v2 运行时，没有 D1/D2 场景选择。
 Worker 工程与离线诊断数据都是注册资源，不是独立产品。
+此外，`/workbench` 提供与通用 Agent 分离的 Worker-only 单文件 MATLAB 执行面。
 
 [能力与资源](#注册能力与资源) · [执行机制](#方案授权与证据) · [源码目录](#源码目录) · [开发验证](#开发与验证)
 
@@ -19,6 +20,7 @@ Worker 工程与离线诊断数据都是注册资源，不是独立产品。
 | 规划与契约 | 类型化方案、来源和资源绑定 | `agent_planner.py`、`runtime/` |
 | 执行与证据 | 依赖图、权限、预算、回执与复用 | `agent_runtime.py`、`runtime/evidence.py` |
 | 计算适配 | 本机 MATLAB、Worker、离线诊断 | `verification/adapters/` |
+| 单文件工作台 | Web 代理、Worker 持久化、受控 MATLAB 包装器 | `web_routes/workbench.py`、`verification/workbench_*` |
 | 评价与交付 | 判据比较、JSON/Word、证据索引 | `adapters/evaluation.py`、`delivery.py` |
 
 表内相对模块名以 `src/flight_agent/` 或对应的 `verification/` 目录为基准，
@@ -67,6 +69,20 @@ Web / directory-task CLI
 
 知识问答不要求工程目录，也不触发数值计算。纯分析可以没有判据或总体结论，
 交付格式由需求决定，不强制 Word、图形或固定四节点。
+
+单文件工作台走独立链路：
+
+```text
+/workbench -> /api/workbench/* -> RemoteClient -> Worker /workbench/*
+           -> WorkbenchRunStore -> execute_workbench -> 固定 MATLAB 包装器
+           -> JSON result + 有界日志 + figure-N.png
+```
+
+Web 只代理提交、状态和工件，不保存工作台任务，也没有本机 MATLAB 回退。
+Worker 的 `workbench_routes` 与工程 `project_routes` 共用同一个
+`BackgroundRunner.slot`，所以两种 MATLAB 工作不会在同一 Worker 中并发执行。
+`WorkbenchRunStore` 将记录保存在 Worker 的 `runs/workbench-worker/`；终态不会触发
+自动删除，保留期限和清理由部署管理员负责。上传源码以 Worker 账户权限执行，不是沙箱。
 
 Web 启动时装配 `CapabilityRegistry(agent_mode=True)`、`ResourceRegistry`、
 `EngineeringRuntime`、`AgentPlanner` 和 `AgentExecutor`。
@@ -243,6 +259,7 @@ src/flight_agent/
 |-- application.py               # 运行时、计算后端与后台调度器装配和注入
 |-- web_routes/
 |   |-- pages.py                 # 页面和显式静态资源白名单
+|   |-- workbench.py             # 单文件页面 API、Worker 代理和示例白名单
 |   |-- configuration.py         # bootstrap 与目录配置
 |   |-- metadata.py              # 能力与资源元数据
 |   |-- artifacts.py             # 哈希校验后的工件下载
@@ -278,6 +295,9 @@ src/flight_agent/
 |   |-- matlab_contracts.py      # 本机执行、信号与时序契约
 |   |-- local_matlab.py          # 专用解释器与执行后端
 |   |-- local_matlab_worker.py   # Engine 子进程
+|   |-- workbench_store.py       # Worker 单文件运行记录与重启投影
+|   |-- workbench_worker.py      # Worker 单文件提交、状态和图形路由
+|   |-- workbench_matlab.py      # 专用 Engine 子进程、边界与工件验证
 |   |-- adapters/
 |   |   |-- local_matlab.py      # 本机执行、stepinfo、线性化与 allmargin
 |   |   |-- simulink.py          # Worker 时域与裕度
@@ -296,6 +316,7 @@ src/flight_agent/
 |-- service.py                   # HTTP 校验、鉴权与文件访问
 |-- directories.py               # 目录选择
 |-- matlab_support/
+|   |-- flight_agent_execute_workbench.m
 |   |-- flight_agent_run_project.m
 |   |-- flight_agent_local_stepinfo.m
 |   |-- flight_agent_local_linearize.m
@@ -312,6 +333,8 @@ src/flight_agent/
     |-- task-evidence.js         # 基线、授权、评价、证据与工件下载
     |-- resize-preferences.js    # 三栏调整、键盘交互与本地偏好
     |-- bootstrap.js             # 初始化、事件、轮询、历史、目录与请求时序
+    |-- matlab-workbench.html
+    |-- matlab-workbench.js / matlab-workbench.css
     `-- favicon.svg
 ```
 

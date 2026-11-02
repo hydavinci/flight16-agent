@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ from flight_agent.workbench_contracts import (
     MAX_WORKBENCH_RESULT_BYTES,
     WorkbenchRunRequest,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def workbench_request(kind: str = "script", timeout_seconds: int = 15) -> WorkbenchRunRequest:
@@ -29,6 +32,96 @@ def workbench_request(kind: str = "script", timeout_seconds: int = 15) -> Workbe
         trusted=True,
         timeout_seconds=timeout_seconds,
     )
+
+
+@pytest.mark.parametrize(
+    ("name", "content"),
+    [
+        (
+            "web_script.m",
+            """frequency_hz = params.frequency_hz;
+amplitude = params.amplitude;
+samples = params.samples;
+t = linspace(0, 2, samples);
+y = amplitude * sin(2 * pi * frequency_hz * t);
+plot(t, y);
+xlabel('Time (s)');
+ylabel('Amplitude');
+grid on;
+result = struct('samples', samples, 'peak', max(y), 'minimum', min(y));
+""",
+        ),
+        (
+            "web_function.m",
+            """function result = web_function(params)
+t = linspace(0, 2, params.samples);
+y = params.amplitude * cos(2 * pi * params.frequency_hz * t);
+plot(t, y);
+xlabel('Time (s)');
+ylabel('Amplitude');
+grid on;
+result = struct('samples', params.samples, 'peak', max(y), 'minimum', min(y));
+end
+""",
+        ),
+    ],
+)
+def test_approved_workbench_examples_are_exact(name, content):
+    assert (ROOT / "examples" / name).read_text(encoding="utf-8") == content
+
+
+def live_workbench_request(kind: str) -> WorkbenchRunRequest:
+    source = (
+        "plot(1:3);\nresult = struct('value', params.value * 2);\n"
+        if kind == "script"
+        else "function result = analysis(params)\n"
+        "plot(1:3);\n"
+        "result = struct('value', params.value * 2);\n"
+        "end\n"
+    )
+    return WorkbenchRunRequest(
+        id=("4" if kind == "script" else "5") * 32,
+        filename="analysis.m",
+        source=source,
+        kind=kind,
+        parameters={"value": 3},
+        trusted=True,
+        timeout_seconds=120,
+    )
+
+
+@pytest.mark.matlab
+@pytest.mark.skipif(
+    os.environ.get("RUN_MATLAB_TESTS") != "1",
+    reason="Live MATLAB is opt-in",
+)
+@pytest.mark.parametrize("kind", ["script", "function"])
+def test_live_workbench_executes_result_and_figure(tmp_path, kind):
+    request = live_workbench_request(kind)
+    receipt, artifacts, log = execute_workbench(tmp_path / kind, request)
+    assert receipt.result == {"value": 6}
+    assert receipt.matlab_version
+    assert [item.path for item in artifacts] == ["figure-1.png"]
+    assert (tmp_path / kind / "figure-1.png").read_bytes().startswith(b"\x89PNG")
+
+
+@pytest.mark.matlab
+@pytest.mark.skipif(
+    os.environ.get("RUN_MATLAB_TESTS") != "1",
+    reason="Live MATLAB is opt-in",
+)
+def test_live_workbench_preserves_original_matlab_error(tmp_path):
+    request = WorkbenchRunRequest(
+        id="6" * 32,
+        filename="analysis.m",
+        source="error('flight_agent:acceptance', 'original live workbench failure');\n",
+        kind="script",
+        parameters={},
+        trusted=True,
+        timeout_seconds=120,
+    )
+    with pytest.raises(MatlabError, match="original live workbench failure"):
+        execute_workbench(tmp_path / "failure", request)
 
 
 @pytest.mark.parametrize("kind", ["script", "function"])

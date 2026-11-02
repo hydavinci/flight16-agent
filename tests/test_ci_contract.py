@@ -85,7 +85,8 @@ def test_matlab_requires_manual_trusted_licensed_runner_and_preserves_engine():
     command = runs(job)
     assert "uv sync --locked --extra dev --inexact" in command
     assert "import matlab.engine" in command
-    assert "test_local_matlab_integration.py" in command
+    assert '-m matlab' in command
+    assert "tests/test_" not in command
     assert not any(
         step.get("uses", "").startswith("actions/cache@")
         for step in job["steps"]
