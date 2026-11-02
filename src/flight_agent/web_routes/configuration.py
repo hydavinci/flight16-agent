@@ -14,6 +14,7 @@ from ..directories import (
     browse_directories,
 )
 from ..remote import RemoteError
+from ..runtime.capability_metadata import Availability
 from ..verification.agent_planner import AgentPlanner
 from ..verification.backend import RemoteSimulinkBackend
 from ..verification.resources import ResourceLocation, resolve_location
@@ -45,7 +46,14 @@ def configuration_router(
 
     @router.get("/api/bootstrap")
     def bootstrap() -> dict[str, object]:
-        local = local_backend.readiness()
+        local = (
+            local_backend.readiness()
+            if local_backend is not None
+            else Availability(
+                state="unavailable",
+                reason="The injected runtime has no local MATLAB capability",
+            )
+        )
         worker_error = model_error = None
         try:
             RemoteSimulinkBackend.from_environment()
@@ -65,10 +73,15 @@ def configuration_router(
             "local_matlab": {
                 "state": local.state,
                 "reason": (
-                    "Import probe only; MATLAB startup and license are not verified."
-                    if local.state == "available"
-                    else "Local MATLAB Engine unavailable; enable MATLAB_ALLOW_TRUSTED_PROJECTS=1 "
-                    "and check the selected Python environment and Engine installation."
+                    local.reason
+                    if local_backend is None
+                    else (
+                        "Import probe only; MATLAB startup and license are not verified."
+                        if local.state == "available"
+                        else "Local MATLAB Engine unavailable; "
+                        "enable MATLAB_ALLOW_TRUSTED_PROJECTS=1 and check the selected "
+                        "Python environment and Engine installation."
+                    )
                 ),
             },
             "trusted_code_only": True,

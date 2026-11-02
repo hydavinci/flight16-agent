@@ -27,7 +27,7 @@ class ApplicationServices:
     runtime: EngineeringRuntime
     manager: ConversationManager
     resources: ResourceRegistry
-    local_backend: LocalMatlabBackend
+    local_backend: LocalMatlabBackend | None
     backend: AnalysisBackend | None
     owns_manager: bool
 
@@ -55,7 +55,7 @@ def _registered_local_matlab_backend(
         name for name in LOCAL_MATLAB_CAPABILITY_NAMES if tools.registered(name)
     ]
     if not registered:
-        return None
+        return runtime.local_matlab_backend
     owners = []
     for name in registered:
         owner = tools.runtime_owner(name, LocalMatlabBackend)
@@ -114,6 +114,7 @@ def build_application(
     except ValueError:
         backend = None
 
+    local_backend: LocalMatlabBackend | None
     if engineering_runtime is None:
         conversations = SQLiteConversationStore(root / "runs" / "verification")
         snapshots = ProjectSnapshotStore(conversations.root / "snapshots")
@@ -145,11 +146,13 @@ def build_application(
     else:
         snapshots = engineering_runtime.executor.snapshots
         owned_local_backend = _registered_local_matlab_backend(engineering_runtime)
-        if owned_local_backend is None:
-            owned_local_backend = LocalMatlabBackend.from_environment()
-        local_backend = _bind_local_matlab_backend(
-            owned_local_backend,
-            snapshots,
+        local_backend = (
+            _bind_local_matlab_backend(
+                owned_local_backend,
+                snapshots,
+            )
+            if owned_local_backend is not None
+            else None
         )
 
     manager = (

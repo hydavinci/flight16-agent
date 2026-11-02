@@ -22,11 +22,7 @@ def _bounded_text(value: str) -> str:
 def classify_failure(stdout: str, stderr: str) -> CopilotFailureCategory:
     text = _bounded_text(stderr) + "\n" + _bounded_text(stdout)
     patterns: tuple[tuple[CopilotFailureCategory, str], ...] = (
-        (
-            "transport",
-            r"\b407\b|websocket|proxy|dns|ENOTFOUND|EAI_AGAIN|ECONNRESET|"
-            r"ECONNREFUSED|connection (?:failed|closed|reset)|network unreachable",
-        ),
+        ("transport", r"\b407\b|proxy authentication required"),
         (
             "authentication",
             r"\b401\b|not logged in|not authenticated|login required|"
@@ -34,6 +30,11 @@ def classify_failure(stdout: str, stderr: str) -> CopilotFailureCategory:
             r"expired (?:token|credentials)|please (?:log|sign) in",
         ),
         ("authorization", r"\b403\b|model access denied|account access denied|forbidden"),
+        (
+            "transport",
+            r"websocket|proxy|dns|ENOTFOUND|EAI_AGAIN|ECONNRESET|"
+            r"ECONNREFUSED|connection (?:failed|closed|reset)|network unreachable",
+        ),
     )
     for category, expression in patterns:
         if re.search(expression, text, re.IGNORECASE):

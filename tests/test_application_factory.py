@@ -13,7 +13,9 @@ from flight_agent.web import create_web_app
 from tests.agent_helpers import make_agent_web, wait_for_conversation
 
 
-def test_injected_runtime_manager_and_schedulers_keep_identity(tmp_path):
+def test_injected_runtime_manager_and_schedulers_keep_identity(tmp_path, monkeypatch):
+    import flight_agent.application as application
+
     fixture_app, runtime, calls, _ = make_agent_web(
         tmp_path / "fixture",
         [{"action": "answer", "text": "No execution."}],
@@ -23,6 +25,11 @@ def test_injected_runtime_manager_and_schedulers_keep_identity(tmp_path):
     planning = PlanningScheduler(settings.planning_workers, settings.planning_queue)
     execution = ExecutionTurnScheduler(settings.execution_turns)
     manager = ConversationManager(runtime, planning, execution)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Injected runtimes must not create an unused MATLAB backend")
+
+    monkeypatch.setattr(application.LocalMatlabBackend, "from_environment", forbidden)
     app = create_web_app(
         tmp_path / "app",
         engineering_runtime=runtime,
@@ -31,13 +38,18 @@ def test_injected_runtime_manager_and_schedulers_keep_identity(tmp_path):
     try:
         assert app.state.services.runtime is runtime
         assert app.state.services.resources is runtime.resources
-        assert app.state.services.local_backend.snapshots is runtime.executor.snapshots
+        assert app.state.services.local_backend is None
         assert app.state.services.manager is manager
         assert app.state.conversation_manager is manager
         assert manager.planning is planning
         assert manager.execution is execution
         with TestClient(app, base_url="http://127.0.0.1") as client:
-            headers = {"x-flight-token": client.get("/api/bootstrap").json()["token"]}
+            bootstrap = client.get("/api/bootstrap").json()
+            assert bootstrap["local_matlab"] == {
+                "state": "unavailable",
+                "reason": "The injected runtime has no local MATLAB capability",
+            }
+            headers = {"x-flight-token": bootstrap["token"]}
             response = client.post(
                 "/api/conversations",
                 headers=headers,
