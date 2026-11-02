@@ -5,6 +5,12 @@ from fastapi.responses import FileResponse
 
 STATIC_ASSETS = {
     "agent.js": "text/javascript",
+    "api.js": "text/javascript",
+    "state.js": "text/javascript",
+    "render.js": "text/javascript",
+    "task-evidence.js": "text/javascript",
+    "resize-preferences.js": "text/javascript",
+    "bootstrap.js": "text/javascript",
     "agent.css": "text/css",
     "favicon.svg": "image/svg+xml",
 }
