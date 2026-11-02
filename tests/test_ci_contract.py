@@ -76,6 +76,7 @@ def test_matlab_requires_manual_trusted_licensed_runner_and_preserves_engine():
     assert job["environment"] == "matlab-acceptance"
     assert job["env"]["RUN_MATLAB_TESTS"] == "1"
     assert job["env"]["MATLAB_ALLOW_TRUSTED_PROJECTS"] == "1"
+    assert job["env"]["UV_NO_CACHE"] == "1"
     assert "UV_CACHE_DIR" not in job["env"]
     names = [step.get("name", "") for step in job["steps"]]
     assert names.index("Check actual MATLAB and required licenses") < names.index(

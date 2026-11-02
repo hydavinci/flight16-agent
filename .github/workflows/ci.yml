@@ -114,6 +114,7 @@ jobs:
       RUN_BROWSER_TESTS: "0"
       RUN_MATLAB_TESTS: "1"
       MATLAB_ALLOW_TRUSTED_PROJECTS: "1"
+      UV_NO_CACHE: "1"
       UV_PROJECT_ENVIRONMENT: ${{ vars.MATLAB_ACCEPTANCE_ENV }}
       MATLAB_PYTHON_EXECUTABLE: ${{ format('{0}/bin/python', vars.MATLAB_ACCEPTANCE_ENV) }}
     steps:
