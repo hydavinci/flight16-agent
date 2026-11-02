@@ -1,23 +1,20 @@
 import logging
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager, nullcontext
-from pathlib import Path
+from collections.abc import Callable
+from contextlib import nullcontext
 from threading import Condition
 from typing import Literal, Self
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from ..copilot_diagnostics import CopilotError
-from ..runtime.evidence import verify_evidence
 from ..runtime.scheduling import (
-    CapacityExceeded,
     ExecutionTurnScheduler,
     PlanningScheduler,
     SchedulerClosed,
     Submission,
 )
+from ..web_routes.errors import request_errors
 from .contracts import (
     Conversation,
     ConversationMessage,
@@ -375,31 +372,6 @@ def verification_router(
     runtime = manager.runtime
     router = APIRouter(prefix="/api/conversations", dependencies=[Depends(authorize)])
 
-    @contextmanager
-    def request_errors() -> Iterator[None]:
-        try:
-            yield
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Unknown conversation or task") from exc
-        except CapacityExceeded as exc:
-            raise HTTPException(
-                status_code=429,
-                detail={"code": "scheduler_capacity", "message": str(exc)},
-                headers={"Retry-After": "1"},
-            ) from exc
-        except SchedulerClosed as exc:
-            raise HTTPException(
-                status_code=503,
-                detail={"code": "scheduler_closed", "message": str(exc)},
-            ) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except OSError as exc:
-            logger.exception("Conversation storage is unavailable")
-            raise HTTPException(
-                status_code=503, detail="Conversation storage is unavailable"
-            ) from exc
-
     @router.get("")
     def recent() -> list[dict[str, str | None]]:
         with request_errors():
@@ -427,10 +399,6 @@ def verification_router(
         with request_errors():
             return manager.submit(None, request)
         raise AssertionError("Unreachable")
-
-    @router.get("/capabilities")
-    def capabilities() -> list[dict[str, object]]:
-        return manager.runtime.capability_catalog()
 
     @router.get("/{conversation_id}")
     def status(conversation_id: str) -> Conversation:
@@ -466,24 +434,6 @@ def verification_router(
     def retry(conversation_id: str, request: ConfirmationRequest) -> Conversation:
         with request_errors():
             return manager.decide(conversation_id, "retry", request)
-        raise AssertionError("Unreachable")
-
-    @router.get("/{conversation_id}/tasks/{task_id}/artifacts/{name:path}")
-    def artifact(conversation_id: str, task_id: str, name: str) -> FileResponse:
-        with request_errors():
-            record = runtime.store.get(conversation_id)
-            tasks = ([record.task] if record.task else []) + record.archived_tasks
-            task = next((task for task in tasks if task.id == task_id), None)
-            if task is None:
-                raise KeyError("Unknown task")
-            item = next((artifact for artifact in task.artifacts if artifact.path == name), None)
-            if item is None:
-                raise HTTPException(status_code=404, detail="Unknown artifact")
-            directory = runtime.store.task_directory(conversation_id, task_id, task.output_root)
-            if str(directory) != task.result_directory:
-                raise ValueError("Task result directory does not match its persisted identity")
-            path = verify_evidence(directory, item)
-            return FileResponse(path, filename=Path(name).name)
         raise AssertionError("Unreachable")
 
     return router
