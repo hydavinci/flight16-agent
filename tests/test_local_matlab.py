@@ -601,19 +601,87 @@ def test_cleanup_reports_unterminated_worker_after_bounded_waits(monkeypatch):
 
 def test_windows_cleanup_terminates_and_verifies_entire_process_tree(monkeypatch):
     module = importlib.import_module("flight_agent.matlab")
-    processes = {43210: 1, 43211: 43210, 43212: 43211}
+    processes = {
+        43210: module._WindowsProcess(1, "root"),
+        43211: module._WindowsProcess(43210, "child"),
+        43212: module._WindowsProcess(43211, "grandchild"),
+    }
     terminated = []
 
     monkeypatch.setattr(module, "_windows_processes", lambda: dict(processes))
 
-    def terminate(pid):
-        terminated.append(pid)
+    def terminate(pid, creation_time):
+        terminated.append((pid, creation_time))
         processes.pop(pid)
         return None
 
     monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
     assert module._stop_windows_tree(43210) is None
-    assert terminated == [43212, 43211, 43210]
+    assert terminated == [
+        (43212, "grandchild"),
+        (43211, "child"),
+        (43210, "root"),
+    ]
+
+
+def test_windows_process_enumeration_rejects_empty_cim_error_success(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    completed = subprocess.CompletedProcess(
+        ["powershell.exe"],
+        0,
+        stdout="",
+        stderr="Get-CimInstance : Access denied",
+    )
+    run = Mock(return_value=completed)
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    with pytest.raises(OSError, match="Access denied|empty"):
+        module._windows_processes()
+
+    command = run.call_args.args[0][-1]
+    assert "$ErrorActionPreference='Stop'" in command
+    assert "-ErrorAction Stop" in command
+
+
+def test_windows_cleanup_does_not_kill_reused_descendant_pid(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+
+    def process(parent_pid, creation_time):
+        return module._WindowsProcess(parent_pid, creation_time)
+
+    snapshots = iter(
+        [
+            {
+                43210: process(1, "root-a"),
+                43211: process(43210, "child-a"),
+            },
+            {43211: process(999, "child-b")},
+        ]
+    )
+    terminated = []
+    monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: terminated.append((pid, creation_time)),
+    )
+
+    assert module._stop_windows_tree(43210) is None
+    assert terminated == [(43211, "child-a"), (43210, "root-a")]
+
+
+def test_windows_cleanup_fails_closed_without_process_identity(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = SimpleNamespace(parent_pid=1, creation_time="")
+    terminate = Mock(return_value=None)
+    monkeypatch.setattr(module, "_windows_processes", lambda: {43210: process})
+    monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
+
+    error = module._stop_windows_tree(43210)
+
+    assert error is not None
+    assert "identity" in error
+    terminate.assert_not_called()
 
 
 def test_windows_cleanup_reports_process_tree_that_cannot_be_verified(monkeypatch):
@@ -621,12 +689,15 @@ def test_windows_cleanup_reports_process_tree_that_cannot_be_verified(monkeypatc
     monkeypatch.setattr(
         module,
         "_windows_processes",
-        lambda: {43210: 1, 43211: 43210},
+        lambda: {
+            43210: module._WindowsProcess(1, "root"),
+            43211: module._WindowsProcess(43210, "child"),
+        },
     )
     monkeypatch.setattr(
         module,
         "_windows_terminate_pid",
-        lambda pid: "access denied" if pid == 43211 else None,
+        lambda pid, creation_time: "access denied" if pid == 43211 else None,
     )
     error = module._stop_windows_tree(43210)
     assert error is not None
@@ -640,10 +711,10 @@ def test_windows_cleanup_converts_termination_timeout_to_uncertainty(monkeypatch
     monkeypatch.setattr(
         module,
         "_windows_processes",
-        lambda: {43210: 1},
+        lambda: {43210: module._WindowsProcess(1, "root")},
     )
 
-    def timeout(pid):
+    def timeout(pid, creation_time):
         raise subprocess.TimeoutExpired(["taskkill.exe"], 5)
 
     monkeypatch.setattr(module, "_windows_terminate_pid", timeout)
@@ -657,14 +728,18 @@ def test_windows_cleanup_final_verification_detects_late_descendant(monkeypatch)
     module = importlib.import_module("flight_agent.matlab")
     snapshots = iter(
         [
-            {43210: 1},
-            {43210: 1},
-            {43210: 1},
-            {43211: 43210},
+            {43210: module._WindowsProcess(1, "root")},
+            {43210: module._WindowsProcess(1, "root")},
+            {43210: module._WindowsProcess(1, "root")},
+            {43211: module._WindowsProcess(43210, "late-child")},
         ]
     )
     monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
-    monkeypatch.setattr(module, "_windows_terminate_pid", lambda pid: None)
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: None,
+    )
 
     error = module._stop_windows_tree(43210)
 

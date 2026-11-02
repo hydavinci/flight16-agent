@@ -20,6 +20,11 @@ class _CleanupResult(NamedTuple):
     error: str | None
 
 
+class _WindowsProcess(NamedTuple):
+    parent_pid: int
+    creation_time: str
+
+
 def engine_available() -> bool:
     try:
         return importlib.util.find_spec("matlab.engine") is not None
@@ -27,10 +32,14 @@ def engine_available() -> bool:
         return False
 
 
-def _windows_processes() -> dict[int, int]:
+def _windows_processes() -> dict[int, _WindowsProcess]:
     command = (
-        "Get-CimInstance Win32_Process | "
-        "Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress"
+        "$ErrorActionPreference='Stop';"
+        "$items=@(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {"
+        "[pscustomobject]@{ProcessId=[int]$_.ProcessId;"
+        "ParentProcessId=[int]$_.ParentProcessId;"
+        "CreationTime=$_.CreationDate.ToUniversalTime().ToFileTimeUtc().ToString()}});"
+        "ConvertTo-Json -InputObject $items -Compress"
     )
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
@@ -39,61 +48,150 @@ def _windows_processes() -> dict[int, int]:
         timeout=5,
         check=False,
     )
-    if result.returncode != 0:
+    if result.returncode != 0 or result.stderr.strip():
         raise OSError(result.stderr.strip() or "PowerShell process enumeration failed")
     if not result.stdout.strip():
-        return {}
+        raise OSError("PowerShell process enumeration returned empty output")
     decoded = json.loads(result.stdout)
     records = decoded if isinstance(decoded, list) else [decoded]
-    return {
-        int(record["ProcessId"]): int(record["ParentProcessId"])
-        for record in records
-        if isinstance(record, dict)
-        and "ProcessId" in record
-        and "ParentProcessId" in record
-    }
+    if not records:
+        raise OSError("PowerShell process enumeration returned no processes")
+    processes: dict[int, _WindowsProcess] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Invalid Windows process enumeration record")
+        creation_time = str(record.get("CreationTime", ""))
+        if not creation_time:
+            raise ValueError("Windows process identity is unavailable")
+        processes[int(record["ProcessId"])] = _WindowsProcess(
+            parent_pid=int(record["ParentProcessId"]),
+            creation_time=creation_time,
+        )
+    return processes
 
 
-def _windows_terminate_pid(pid: int) -> str | None:
-    result = subprocess.run(
-        ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=False,
-    )
-    if result.returncode == 0:
+def _windows_terminate_pid(pid: int, creation_time: str) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [
+            ("low", wintypes.DWORD),
+            ("high", wintypes.DWORD),
+        ]
+
+    win_dll = getattr(ctypes, "WinDLL")
+    get_last_error = getattr(ctypes, "get_last_error")
+    kernel = win_dll("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateProcess.restype = wintypes.BOOL
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    access = 0x0001 | 0x1000 | 0x00100000
+    handle = kernel.OpenProcess(access, False, pid)
+    if not handle:
+        error = get_last_error()
+        if error == 87:
+            return None
+        return f"OpenProcess({pid}) failed with Windows error {error}"
+    try:
+        created = FileTime()
+        exited = FileTime()
+        kernel_time = FileTime()
+        user_time = FileTime()
+        if not kernel.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            return f"GetProcessTimes({pid}) failed with Windows error {get_last_error()}"
+        actual_creation = str((created.high << 32) | created.low)
+        if actual_creation != creation_time:
+            return f"process identity changed for PID {pid}"
+        if not kernel.TerminateProcess(handle, 1):
+            return f"TerminateProcess({pid}) failed with Windows error {get_last_error()}"
+        wait_result = kernel.WaitForSingleObject(handle, 2000)
+        if wait_result != 0:
+            return f"process {pid} did not terminate within the Windows cleanup deadline"
         return None
-    return result.stderr.strip() or result.stdout.strip() or f"taskkill exited {result.returncode}"
+    finally:
+        kernel.CloseHandle(handle)
 
 
-def _expand_windows_tree(
-    processes: dict[int, int], depths: dict[int, int]
-) -> None:
+def _update_windows_tree(
+    processes: dict[int, _WindowsProcess],
+    depths: dict[int, int],
+    identities: dict[int, str | None],
+    reused: set[int],
+) -> tuple[dict[int, int], str | None]:
+    for pid, process in processes.items():
+        if not process.creation_time:
+            return {}, f"Windows process identity is unavailable for PID {pid}"
+        if pid not in identities:
+            continue
+        expected = identities[pid]
+        if expected is None:
+            identities[pid] = process.creation_time
+        elif expected != process.creation_time:
+            reused.add(pid)
     changed = True
     while changed:
         changed = False
-        for pid, parent_pid in processes.items():
-            if parent_pid in depths and pid not in depths:
-                depths[pid] = depths[parent_pid] + 1
+        for pid, process in processes.items():
+            if (
+                process.parent_pid in depths
+                and process.parent_pid not in reused
+                and pid not in depths
+            ):
+                depths[pid] = depths[process.parent_pid] + 1
+                identities[pid] = process.creation_time
                 changed = True
+    return (
+        {
+            pid: depth
+            for pid, depth in depths.items()
+            if pid in processes
+            and pid not in reused
+            and identities[pid] == processes[pid].creation_time
+        },
+        None,
+    )
 
 
 def _stop_windows_tree(root_pid: int) -> str | None:
     depths = {root_pid: 0}
+    identities: dict[int, str | None] = {root_pid: None}
+    reused: set[int] = set()
     termination_errors: dict[int, str] = {}
     for _ in range(3):
         try:
             processes = _windows_processes()
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return f"cannot enumerate the Windows process tree: {exc}"
-        _expand_windows_tree(processes, depths)
-        live = {pid: depth for pid, depth in depths.items() if pid in processes}
+        live, identity_error = _update_windows_tree(processes, depths, identities, reused)
+        if identity_error is not None:
+            return identity_error
         if not live:
             return None
         for pid in sorted(live, key=live.__getitem__, reverse=True):
             try:
-                error = _windows_terminate_pid(pid)
+                creation_time = identities[pid]
+                assert creation_time is not None
+                error = _windows_terminate_pid(pid, creation_time)
             except (OSError, subprocess.SubprocessError) as exc:
                 error = str(exc)
             if error is not None:
@@ -103,8 +201,10 @@ def _stop_windows_tree(root_pid: int) -> str | None:
         processes = _windows_processes()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return f"cannot verify the Windows process tree termination: {exc}"
-    _expand_windows_tree(processes, depths)
-    remaining = sorted(pid for pid in depths if pid in processes)
+    live, identity_error = _update_windows_tree(processes, depths, identities, reused)
+    if identity_error is not None:
+        return identity_error
+    remaining = sorted(live)
     if not remaining:
         return None
     details = "; ".join(
