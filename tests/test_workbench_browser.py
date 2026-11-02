@@ -252,6 +252,22 @@ def test_timeout_limits_and_generated_run_id_are_enforced(tmp_path, monkeypatch)
     ):
         browser = playwright.chromium.launch()
         page = browser.new_page()
+        page.add_init_script(
+            """
+            window.__cryptoCalls = 0;
+            Object.defineProperty(crypto, "getRandomValues", {
+              configurable: true,
+              value: (array) => {
+                const offset = window.__cryptoCalls * array.length;
+                window.__cryptoCalls += 1;
+                for (let index = 0; index < array.length; index += 1) {
+                  array[index] = offset + index;
+                }
+                return array;
+              },
+            });
+            """
+        )
         requests = []
 
         def handler(route):
@@ -273,6 +289,7 @@ def test_timeout_limits_and_generated_run_id_are_enforced(tmp_path, monkeypatch)
                 page.locator("#run-button").click()
                 expect(page.locator("#notice")).to_contain_text("1 到 600")
             assert requests == []
+            page.evaluate("window.__cryptoCalls = 0")
 
             for value in ("1", "600"):
                 page.locator("#timeout").fill(value)
@@ -281,8 +298,12 @@ def test_timeout_limits_and_generated_run_id_are_enforced(tmp_path, monkeypatch)
                 expect(page.locator("#run-id")).not_to_have_text(previous_id)
 
             assert [request["timeout_seconds"] for request in requests] == [1, 600]
+            assert [request["id"] for request in requests] == [
+                "000102030405060708090a0b0c0d0e0f",
+                "101112131415161718191a1b1c1d1e1f",
+            ]
             assert all(re.fullmatch(r"[0-9a-f]{32}", request["id"]) for request in requests)
-            assert requests[0]["id"] != requests[1]["id"]
+            assert page.evaluate("window.__cryptoCalls") == 2
         finally:
             browser.close()
 
@@ -362,6 +383,40 @@ def test_selecting_history_cancels_active_run_polling(tmp_path, monkeypatch):
             expect(page.locator("#run-id")).to_have_text(history_id)
             page.wait_for_timeout(1000)
             assert active_status_requests == []
+        finally:
+            browser.close()
+
+
+def test_page_exit_event_cancels_active_run_polling(tmp_path, monkeypatch):
+    with (
+        workbench_server(tmp_path, monkeypatch, configured=False) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        run_id = []
+        status_requests = []
+
+        def handler(route):
+            request = route.request
+            if request.method == "GET" and request.url.endswith("/runs"):
+                route.fulfill(json=[])
+            elif request.method == "POST":
+                run_id.append(request.post_data_json["id"])
+                route.fulfill(status=202, json=browser_record(run_id[0], status="queued"))
+            else:
+                status_requests.append(request)
+                route.fulfill(json=browser_record(run_id[0], status="running"))
+
+        install_workbench_api(page, handler)
+        try:
+            page.goto(url + "/workbench")
+            submit(page)
+            expect(page.locator("#execution-status")).to_have_text("执行中")
+            assert len(status_requests) == 1
+            page.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide'))")
+            page.wait_for_timeout(1000)
+            assert len(status_requests) == 1
         finally:
             browser.close()
 
