@@ -12,9 +12,13 @@ from flight_agent.verification.plugins import register_builtin_plugins
 from tests.agent_helpers import delivery_draft, make_agent_web
 from tests.helpers import serve_app, tool_message
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in",
-)
+pytestmark = [
+    pytest.mark.browser,
+    pytest.mark.skipif(
+        os.environ.get("RUN_BROWSER_TESTS") != "1",
+        reason="Browser tests are opt-in",
+    ),
+]
 
 
 def local_web(tmp_path, monkeypatch):

@@ -15,10 +15,13 @@ from tests.agent_helpers import (
 from tests.helpers import serve_app, tool_message
 from tests.test_agent_evaluation import evaluation_plan
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_BROWSER_TESTS") != "1",
-    reason="Browser tests are opt-in",
-)
+pytestmark = [
+    pytest.mark.browser,
+    pytest.mark.skipif(
+        os.environ.get("RUN_BROWSER_TESTS") != "1",
+        reason="Browser tests are opt-in",
+    ),
+]
 
 
 def test_queued_state_keeps_polling_and_disables_confirmation(tmp_path):

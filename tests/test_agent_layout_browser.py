@@ -6,9 +6,13 @@ from playwright.sync_api import expect, sync_playwright
 from tests.agent_helpers import draft_data, make_agent_web
 from tests.helpers import serve_app
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in",
-)
+pytestmark = [
+    pytest.mark.browser,
+    pytest.mark.skipif(
+        os.environ.get("RUN_BROWSER_TESTS") != "1",
+        reason="Browser tests are opt-in",
+    ),
+]
 
 
 @pytest.mark.parametrize("message,display", [

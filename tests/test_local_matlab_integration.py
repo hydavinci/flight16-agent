@@ -396,3 +396,49 @@ def test_actual_linearize_preparation_workspace_visibility(
     ]
     assert discover_matlab_project(str(root)) == project
     assert actual_backend.execute(request, directory, resume=True) == result
+
+    from flight_agent.runtime.evidence import publish_evidence, verify_evidence
+    from flight_agent.verification.matlab_contracts import AllmarginInput
+
+    published = []
+    for filename, artifact_id in (
+        ("linear-model.mat", "linear_model"),
+        ("metadata.json", "metadata"),
+    ):
+        artifact = next(item for item in result.artifacts if item.path == filename)
+        original = verify_evidence(directory, artifact)
+        relative = f"calls/{request.id}/published/{filename}"
+        publish_evidence(tmp_path, relative, original.read_bytes())
+        descriptor = artifact.model_copy(
+            update={
+                "id": artifact_id,
+                "node_id": "linearize",
+                "path": relative,
+            }
+        )
+        verify_evidence(tmp_path, descriptor)
+        published.append(descriptor)
+    margins_request = LocalMatlabRequest(
+        id="d" * 32,
+        operation="allmargin",
+        inputs=AllmarginInput(
+            linear_model=published[0],
+            conditions=conditions,
+        ),
+        input_evidence=published,
+    )
+    margins_directory = tmp_path / "margins"
+    margins = actual_backend.execute(margins_request, margins_directory)
+    assert margins.valid and margins.execution_status == "completed", margins.diagnostics
+    assert "metrics" in margins.details
+    assert {"linear-model.mat", "producer-metadata.json", "bode.png"} <= {
+        item.path for item in margins.artifacts
+    }
+    for artifact in margins.artifacts:
+        verify_evidence(margins_directory, artifact)
+    assert actual_backend.execute(
+        margins_request,
+        margins_directory,
+        resume=True,
+    ) == margins
+    assert discover_matlab_project(str(root)) == project

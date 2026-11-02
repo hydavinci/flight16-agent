@@ -48,7 +48,10 @@ flight_agent = ["static/*", "matlab_support/*.m"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-markers = ["matlab: requires an installed and licensed MATLAB with compatible Engine"]
+markers = [
+    "matlab: requires an installed and licensed MATLAB with compatible Engine",
+    "browser: requires RUN_BROWSER_TESTS=1 and installed Playwright Chromium",
+]
 
 [tool.ruff]
 target-version = "py311"

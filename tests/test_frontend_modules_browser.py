@@ -7,10 +7,13 @@ from playwright.sync_api import expect, sync_playwright
 from tests.agent_helpers import make_agent_web
 from tests.helpers import serve_app
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_BROWSER_TESTS") != "1",
-    reason="Browser tests are opt-in",
-)
+pytestmark = [
+    pytest.mark.browser,
+    pytest.mark.skipif(
+        os.environ.get("RUN_BROWSER_TESTS") != "1",
+        reason="Browser tests are opt-in",
+    ),
+]
 
 
 def test_importing_bootstrap_alone_has_no_network_or_handler_side_effects(tmp_path):

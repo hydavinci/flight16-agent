@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_matlab:
+        description: Run licensed MATLAB acceptance on the trusted self-hosted runner
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_CACHE_DIR: /tmp/flight-agent-uv-cache
+  UV_PYTHON_DOWNLOADS: never
+
+jobs:
+  software:
+    name: Software Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      RUN_BROWSER_TESTS: "0"
+      RUN_MATLAB_TESTS: "0"
+      MATLAB_ALLOW_TRUSTED_PROJECTS: "0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.6"
+          enable-cache: false
+      - name: Cache uv downloads only
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.UV_CACHE_DIR }}
+          key: uv-${{ runner.os }}-${{ runner.arch }}-0.12.6-software-${{ matrix.python-version }}-${{ hashFiles('uv.lock') }}
+      - name: Validate committed lock
+        run: uv lock --check
+      - name: Install locked development dependencies
+        run: uv sync --locked --extra dev --python "${{ matrix.python-version }}"
+      - name: Software tests
+        run: uv run --no-sync python -m pytest -m "not matlab and not browser" -q
+      - name: Ruff
+        run: uv run --no-sync python -m ruff check .
+      - name: Mypy
+        run: uv run --no-sync python -m mypy src
+      - name: Build wheel and source distribution
+        run: uv run --no-sync python -m build --no-isolation
+      - name: Lock must remain unchanged
+        run: git diff --exit-code -- uv.lock
+
+  browser:
+    name: Browser Chromium
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUN_BROWSER_TESTS: "1"
+      RUN_MATLAB_TESTS: "0"
+      MATLAB_ALLOW_TRUSTED_PROJECTS: "0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.6"
+          enable-cache: false
+      - name: Cache uv downloads only
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.UV_CACHE_DIR }}
+          key: uv-${{ runner.os }}-${{ runner.arch }}-0.12.6-browser-3.12-${{ hashFiles('uv.lock') }}
+      - name: Validate committed lock
+        run: uv lock --check
+      - name: Install locked development dependencies
+        run: uv sync --locked --extra dev --python "3.12"
+      - name: Install Chromium and Linux dependencies
+        run: uv run --no-sync python -m playwright install --with-deps chromium --only-shell
+      - name: Browser tests
+        run: uv run --no-sync python -m pytest -m "browser and not matlab" -q
+      - name: Lock must remain unchanged
+        run: git diff --exit-code -- uv.lock
+
+  matlab:
+    name: Licensed MATLAB acceptance
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.run_matlab &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, matlab]
+    environment: matlab-acceptance
+    timeout-minutes: 60
+    env:
+      RUN_BROWSER_TESTS: "0"
+      RUN_MATLAB_TESTS: "1"
+      MATLAB_ALLOW_TRUSTED_PROJECTS: "1"
+      UV_PROJECT_ENVIRONMENT: ${{ vars.MATLAB_ACCEPTANCE_ENV }}
+      MATLAB_PYTHON_EXECUTABLE: ${{ format('{0}/bin/python', vars.MATLAB_ACCEPTANCE_ENV) }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.6"
+          enable-cache: false
+      - name: Validate dedicated compatible Engine environment
+        shell: bash
+        run: |
+          test -n "$UV_PROJECT_ENVIRONMENT"
+          test "${UV_PROJECT_ENVIRONMENT:0:1}" = "/"
+          test -f "$UV_PROJECT_ENVIRONMENT/pyvenv.cfg"
+          test "$UV_PROJECT_ENVIRONMENT" != "$GITHUB_WORKSPACE/.venv"
+          test -x "$MATLAB_PYTHON_EXECUTABLE"
+          "$MATLAB_PYTHON_EXECUTABLE" -c 'import sys; import matlab.engine; assert sys.version_info >= (3, 11); print(sys.executable)'
+      - name: Validate committed lock
+        run: uv lock --check
+      - name: Install locked tools without removing the preinstalled Engine
+        shell: bash
+        run: uv sync --locked --extra dev --inexact --python "$MATLAB_PYTHON_EXECUTABLE"
+      - name: Check actual MATLAB and required licenses
+        shell: bash
+        run: |
+          "$MATLAB_PYTHON_EXECUTABLE" - <<'PY'
+          import matlab.engine
+          engine = matlab.engine.start_matlab("-nodesktop -nosplash")
+          try:
+              for feature in (
+                  "MATLAB", "SIMULINK", "Control_Toolbox", "Simulink_Control_Design",
+              ):
+                  assert engine.license("test", feature), feature
+              print(engine.version())
+          finally:
+              engine.quit()
+          PY
+      - name: Real project stepinfo linearization allmargin and evidence acceptance
+        run: >-
+          uv run --no-sync python -m pytest
+          tests/test_verification_matlab.py
+          tests/test_local_matlab.py
+          tests/test_local_matlab_integration.py
+          -m matlab -v -s
+      - name: Lock must remain unchanged
+        run: git diff --exit-code -- uv.lock
