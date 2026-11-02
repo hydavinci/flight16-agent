@@ -7,7 +7,7 @@ from pydantic import Field, StrictBool
 
 from ...runtime.agent_contracts import AgentNode, AgentPlan
 from ...runtime.capabilities import Capability
-from ...runtime.capability_metadata import CapabilityMetadata
+from ...runtime.capability_metadata import CapabilityMetadata, CapabilityPlanning
 from ...runtime.observations import (
     CapabilityOutcome,
     CriterionCheck,
@@ -17,6 +17,7 @@ from ...runtime.observations import (
 )
 from ...runtime.requirements import Criterion
 from ...runtime.resources import AgentContract
+from ...runtime.scheduling_contracts import SchedulingMetadata
 
 COMPARATORS: dict[str, Callable[[float, float], bool]] = {
     "<": operator.lt,
@@ -160,9 +161,11 @@ def scalar_evaluation_capability() -> Capability[
         input_model=ScalarEvaluationInput,
         output_model=CapabilityOutcome,
         effect="read_only",
+        scheduling=SchedulingMetadata("read_only"),
         operation=_evaluate,
         validate_plan=_validate_plan,
         metadata=CapabilityMetadata(
+            planning=CapabilityPlanning(output_kinds=["finding"], dynamic_dependencies=True),
             validity_policy={
                 "version": "1",
                 "comparison": "exact-without-implicit-tolerance",

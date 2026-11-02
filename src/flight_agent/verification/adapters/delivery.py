@@ -10,7 +10,7 @@ from pydantic import Field, JsonValue, TypeAdapter, model_validator
 
 from ...runtime.agent_contracts import AgentNode, AgentPlan
 from ...runtime.capabilities import Capability
-from ...runtime.capability_metadata import CapabilityMetadata
+from ...runtime.capability_metadata import CapabilityMetadata, CapabilityPlanning
 from ...runtime.contracts import Digest, Name, RunId, fingerprint
 from ...runtime.evidence import describe_evidence, publish_evidence, verify_evidence
 from ...runtime.observations import (
@@ -21,6 +21,7 @@ from ...runtime.observations import (
 )
 from ...runtime.requirements import CapabilityGap, TaskRequirements
 from ...runtime.resources import AgentContract
+from ...runtime.scheduling_contracts import SchedulingMetadata
 from ..intake import safe_directory
 from .evaluation import OutcomeContext
 
@@ -295,10 +296,12 @@ def delivery_capability() -> Capability[DeliveryContext, DeliveryInput, Capabili
         input_model=DeliveryInput,
         output_model=CapabilityOutcome,
         effect="write_delivery",
+        scheduling=SchedulingMetadata("read_only"),
         operation=_deliver,
         reconcile=_reconcile,
         validate_plan=_validate_plan,
         metadata=CapabilityMetadata(
+            planning=CapabilityPlanning(output_kinds=["artifact"], dynamic_dependencies=True),
             validity_policy={
                 "version": "1",
                 "evidence": "Verified dependency receipts and file digests.",

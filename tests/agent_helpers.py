@@ -226,7 +226,7 @@ def make_agent_web(tmp_path, decisions):
         model=ScriptedModel(responses=[tool_message("propose_agent", item) for item in decisions])
     )
     executor = AgentExecutor(store, tools, resources)
-    runtime = EngineeringRuntime(store, planner, executor, resources, legacy=None)
+    runtime = EngineeringRuntime(store, planner, executor, resources)
     return create_web_app(tmp_path, engineering_runtime=runtime), runtime, calls, tools
 
 

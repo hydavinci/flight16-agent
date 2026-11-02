@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Generic, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, Generic, TypeVar
 
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
@@ -9,6 +9,7 @@ from .capability_metadata import Availability, CapabilityMetadata, CapabilitySna
 from .contracts import Effect, ExecutionScope, Name, Version, finite_mapping
 from .observations import CapabilityOutcome, Finding, Observation, OutputArtifact, ResultTable
 from .resources import ResourceReference
+from .scheduling_contracts import SchedulingMetadata, validate_scheduling
 
 if TYPE_CHECKING:
     from .agent_contracts import AgentNode, AgentPlan, AgentScope
@@ -17,6 +18,7 @@ Context = TypeVar("Context")
 CapabilityContext = TypeVar("CapabilityContext", contravariant=True)
 Input = TypeVar("Input", bound=Contract)
 Output = TypeVar("Output", bound=Contract)
+Owner = TypeVar("Owner")
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,8 @@ class Capability(Generic[CapabilityContext, Input, Output]):
     readiness: Callable[[tuple[ResourceReference, ...]], Availability] | None = None
     reconcile: Callable[[CapabilityContext, Input], Output | None] | None = None
     validate_plan: Callable[["AgentPlan", "AgentNode"], None] | None = None
+    scheduling: SchedulingMetadata | None = None
+    runtime_owner: object | None = None
 
 
 class CapabilityDefinition(Contract):
@@ -51,6 +55,8 @@ class _Entry(Generic[Context]):
     readiness: Callable[[tuple[ResourceReference, ...]], Availability] | None
     reconcile: Callable[[Context, dict[str, JsonValue]], object] | None
     validate_plan: Callable[["AgentPlan", "AgentNode"], None] | None
+    scheduling: SchedulingMetadata | None
+    runtime_owner: object | None
 
 
 def validate_output(model: type[BaseModel], value: object) -> dict[str, JsonValue]:
@@ -78,7 +84,10 @@ class CapabilityRegistry(Generic[Context]):
             if not issubclass(model, Contract) or model.model_config.get("extra") != "forbid":
                 raise ValueError("Capability schemas must be strict Contract subclasses")
         metadata = (
-            CapabilityMetadata.model_validate(capability.metadata.model_dump(mode="json"))
+            CapabilityMetadata.model_validate({
+                **capability.metadata.model_dump(mode="json"),
+                "planning": capability.metadata.planning,
+            })
             if capability.metadata is not None
             else None
         )
@@ -89,6 +98,11 @@ class CapabilityRegistry(Generic[Context]):
                 raise ValueError("Agent output_model must be exactly CapabilityOutcome")
             if capability.effect in ("write_candidate", "adopt_candidate"):
                 raise ValueError("Candidate effects are unsupported for agent capabilities")
+        scheduling = (
+            validate_scheduling(definition.effect, capability.scheduling)
+            if self._agent_mode or metadata is not None
+            else capability.scheduling
+        )
 
         def invoke(context: Context, inputs: dict[str, JsonValue]) -> object:
             validated = capability.input_model.model_validate(inputs)
@@ -109,6 +123,8 @@ class CapabilityRegistry(Generic[Context]):
             capability.readiness,
             reconcile if capability.reconcile is not None else None,
             capability.validate_plan,
+            scheduling,
+            capability.runtime_owner,
         )
 
     def _entry(self, name: str) -> _Entry[Context]:
@@ -118,6 +134,21 @@ class CapabilityRegistry(Generic[Context]):
 
     def definition(self, name: str) -> CapabilityDefinition:
         return self._entry(name).definition
+
+    def registered(self, name: str) -> bool:
+        return name in self._entries
+
+    def runtime_owner(self, name: str, owner_type: type[Owner]) -> Owner | None:
+        owner = self._entry(name).runtime_owner
+        if owner is None:
+            return None
+        if not isinstance(owner, owner_type):
+            raise ValueError(f"Capability runtime owner type mismatch: {name}")
+        return owner
+
+    def scheduling(self, name: str) -> SchedulingMetadata:
+        entry = self._entry(name)
+        return validate_scheduling(entry.definition.effect, entry.scheduling)
 
     def validate_inputs(self, name: str, inputs: dict[str, JsonValue]) -> dict[str, JsonValue]:
         return validate_output(self._entry(name).input_model, inputs)
@@ -176,7 +207,7 @@ class CapabilityRegistry(Generic[Context]):
             raise ValueError("Unknown capability input field")
         for field_name, field in fields.items():
             if field_name in inputs:
-                annotation = (
+                annotation: Any = (
                     Annotated[field.annotation, *field.metadata]
                     if field.metadata
                     else field.annotation
@@ -195,7 +226,13 @@ class CapabilityRegistry(Generic[Context]):
                 "output_schema": entry.output_model.model_json_schema(),
                 **(
                     {
-                        "metadata": entry.metadata.model_dump(mode="json"),
+                        "metadata": {
+                            **entry.metadata.model_dump(mode="json"),
+                            "planning": (
+                                entry.metadata.planning.model_dump(mode="json")
+                                if entry.metadata.planning is not None else None
+                            ),
+                        },
                         "availability": self.availability(
                             entry.definition.name, resources
                         ).model_dump(mode="json"),

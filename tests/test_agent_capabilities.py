@@ -26,6 +26,7 @@ from flight_agent.runtime.contracts import fingerprint
 from flight_agent.runtime.loop import LoopDecision, run_loop
 from flight_agent.runtime.observations import CapabilityOutcome, Observation, ResultTable
 from flight_agent.runtime.resources import AgentContract, ResourceReference
+from flight_agent.runtime.scheduling_contracts import SchedulingMetadata
 from tests.agent_helpers import (
     analysis_plan_data,
     register_rmse,
@@ -109,6 +110,20 @@ def test_registered_plugin_computes_real_rmse_in_independent_catalogs():
     with pytest.raises(ValueError, match="registered"):
         register_rmse(registry, calls)
     assert CapabilityRegistry(agent_mode=True).catalog() == []
+
+
+def test_registry_preserves_typed_runtime_owner_identity():
+    owner = SimpleNamespace(name="backend")
+    registry = CapabilityRegistry(agent_mode=True)
+    registry.register(replace(sink(), runtime_owner=owner))
+
+    assert registry.runtime_owner("consume", SimpleNamespace) is owner
+    with pytest.raises(ValueError, match="runtime owner type"):
+        registry.runtime_owner("consume", dict)
+
+    unowned = CapabilityRegistry(agent_mode=True)
+    unowned.register(sink())
+    assert unowned.runtime_owner("consume", SimpleNamespace) is None
 
 
 @pytest.mark.parametrize(
@@ -236,7 +251,8 @@ def test_invocation_checks_resource_readiness_without_computation():
 @pytest.mark.parametrize("effect", ["execute_project", "write_delivery"])
 def test_effects_outside_confirmed_agent_scope_are_blocked(effect):
     registry = CapabilityRegistry(agent_mode=True)
-    registry.register(sink(effect=effect))
+    lane = "local_matlab" if effect == "execute_project" else "read_only"
+    registry.register(sink(effect=effect, scheduling=SchedulingMetadata(lane)))
     with pytest.raises(ValueError, match="permission"):
         registry.invoke("consume", {"observations": []}, context(), scope())
 

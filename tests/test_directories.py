@@ -8,8 +8,7 @@ from fastapi.testclient import TestClient
 from flight_agent.remote import RemoteError
 from flight_agent.verification.backend import RemoteSimulinkBackend
 from flight_agent.web import create_web_app
-from tests.helpers import serve_app
-from tests.test_worker import HEADERS, TOKEN, worker
+from tests.helpers import HEADERS, TOKEN, serve_app, worker
 
 
 def web_client(project: Path) -> TestClient:
@@ -200,14 +199,13 @@ def test_output_browse_root_has_no_parent(project: Path) -> None:
 def test_worker_directory_browse_requires_auth_and_project_enablement(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_UPLOADS", "1")
-    monkeypatch.delenv("MATLAB_ALLOW_TRUSTED_PROJECTS", raising=False)
+    monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
     with TestClient(worker().create_worker_app(project, TOKEN)) as client:
         assert client.get("/verification/directories").status_code == 401
         response = client.get("/verification/directories", headers=HEADERS)
 
-    assert response.status_code == 403
-    assert "MATLAB_ALLOW_TRUSTED_PROJECTS" in response.json()["detail"]
+    assert response.status_code == 200
+    assert "directories" in response.json()
 
 
 def test_project_browse_uses_authenticated_worker(
@@ -332,10 +330,9 @@ def test_project_browse_surfaces_worker_connection_failure(
 @pytest.mark.parametrize(
     "params,expected",
     [
-        ({"location": "agent"}, 200),
+        ({"location": "agent"}, 422),
         ({"location": "diagnostic_data"}, 200),
         ({"location": "unregistered"}, 422),
-        ({"location": "agent", "scenario": "d1"}, 422),
         ({}, 422),
     ],
 )

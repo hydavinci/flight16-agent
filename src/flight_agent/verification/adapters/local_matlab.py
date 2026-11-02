@@ -8,6 +8,7 @@ from ...runtime.capabilities import Capability
 from ...runtime.capability_metadata import (
     Availability,
     CapabilityMetadata,
+    CapabilityPlanning,
     MetricDefinition,
     ResourceRequirement,
 )
@@ -15,6 +16,7 @@ from ...runtime.contracts import fingerprint
 from ...runtime.evidence import describe_evidence, publish_evidence, verify_evidence
 from ...runtime.observations import CapabilityOutcome, Finding, Observation, OutputArtifact
 from ...runtime.resources import ResourceReference
+from ...runtime.scheduling_contracts import SchedulingMetadata
 from ..agent_runtime import AgentContext, ExecutionUncertain, ReconciledFailure
 from ..local_matlab import LocalMatlabBackend, _read_model, _verify_result
 from ..matlab_contracts import (
@@ -28,7 +30,13 @@ from ..matlab_contracts import (
     ProjectExecutionInput,
     StepinfoInput,
 )
-from ..matlab_projects import discover_matlab_project
+
+LOCAL_MATLAB_CAPABILITY_NAMES = (
+    "matlab_execute_project",
+    "matlab_stepinfo",
+    "matlab_linearize",
+    "matlab_allmargin",
+)
 
 
 def _project(context: AgentContext) -> MatlabProjectDescriptor:
@@ -124,8 +132,9 @@ def _request(
             raise ExecutionUncertain("Original local MATLAB request requires reconciliation")
         if os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") != "1":
             raise ValueError("Set MATLAB_ALLOW_TRUSTED_PROJECTS=1")
-        if project is not None and discover_matlab_project(project.root) != project:
-            raise ValueError("Local project fingerprint/selected entries changed")
+        if context.work_directory is None:
+            raise ValueError("Local MATLAB requires its managed per-call work directory")
+        binding = context.project_snapshot("project") if project is not None else None
         if isinstance(inputs, StepinfoInput):
             _series(context, inputs)
         context.budget.check_limits()
@@ -137,10 +146,14 @@ def _request(
             operation=operation,
             inputs=inputs,
             project=project,
+            project_snapshot=binding,
             input_evidence=evidence,
             timeout_seconds=timeout,
         )
-        context.save_checkpoint({"request": request.model_dump(mode="json")})
+        context.save_checkpoint({
+            "request": request.model_dump(mode="json"),
+            "backend_directory": str(context.work_directory / "local-matlab"),
+        })
     if (
         request.id != context.call_id
         or request.operation != operation
@@ -149,7 +162,28 @@ def _request(
         or request.input_evidence != evidence
     ):
         raise ValueError("Local MATLAB checkpoint differs from the original confirmed invocation")
+    if request.project_snapshot is not None:
+        if request.project_snapshot != context.project_snapshot("project"):
+            raise ValueError("Original request snapshot differs from the confirmed baseline")
+    elif not resume and project is not None:
+        raise ValueError("New local execution requires a confirmed managed snapshot")
     return request
+
+
+def _work_directory(context: AgentContext, *, resume: bool) -> Path:
+    saved = context.load_checkpoint()
+    if saved is None:
+        raise ExecutionUncertain("Original local MATLAB checkpoint is missing")
+    if "backend_directory" not in saved:
+        if not resume:
+            raise ExecutionUncertain("Historical local execution requires reconciliation")
+        return context.directory / f"calls/{context.call_id}/local-matlab"
+    if context.work_directory is None:
+        raise ValueError("Local MATLAB requires its managed per-call work directory")
+    expected = context.work_directory / "local-matlab"
+    if saved["backend_directory"] != str(expected):
+        raise ValueError("Local work directory differs from its authenticated checkpoint")
+    return expected
 
 
 def _outcome(
@@ -194,6 +228,8 @@ def _outcome(
     )
     if request.project is not None:
         details["project_fingerprint"] = request.project.fingerprint
+    if request.project_snapshot is not None:
+        details["project_snapshot_id"] = request.project_snapshot.snapshot_id
     for artifact in artifacts:
         if artifact.id in {"series", "linear_model"}:
             details[artifact.id] = artifact.model_dump(mode="json")
@@ -246,8 +282,14 @@ def local_matlab_capabilities(
     def execute(
         context: AgentContext, inputs: LocalMatlabInput, *, resume: bool
     ) -> CapabilityOutcome:
+        context.scope.authorize("execute_project")
+        if not resume and isinstance(inputs, (ProjectExecutionInput, LinearizeInput)):
+            if backend.snapshots is None:
+                raise ValueError("Local MATLAB requires its managed snapshot store")
+            with backend.snapshots.guard():
+                backend.snapshots.verify(context.project_snapshot("project"))
         request = _request(context, inputs, resume=resume)
-        directory = context.directory / f"calls/{context.call_id}/local-matlab"
+        directory = _work_directory(context, resume=resume)
         if not resume and isinstance(inputs, StepinfoInput):
             source = _series(context, inputs)
             # Backend evidence locators are relative to the enclosing call directory.
@@ -290,10 +332,13 @@ def local_matlab_capabilities(
             input_model=ProjectExecutionInput,
             output_model=CapabilityOutcome,
             effect="execute_project",
+            scheduling=SchedulingMetadata("local_matlab"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
+            runtime_owner=backend,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(output_kinds=["artifact"]),
                 resources=[
                     ResourceRequirement(role="project", kind="matlab_project", location="agent")
                 ],
@@ -313,10 +358,16 @@ def local_matlab_capabilities(
             input_model=StepinfoInput,
             output_model=CapabilityOutcome,
             effect="execute_project",
+            scheduling=SchedulingMetadata("local_matlab"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
+            runtime_owner=backend,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(
+                    output_kinds=["metric", "artifact"],
+                    depends_on=["matlab_execute_project"],
+                ),
                 metrics=[
                     MetricDefinition(id="overshoot", label="Overshoot", unit="%"),
                     MetricDefinition(id="settling_time", label="Settling time", unit="s"),
@@ -345,10 +396,13 @@ def local_matlab_capabilities(
                 "Linearize a sourced existing model at its explicitly selected operating point."
             ),
             input_model=LinearizeInput, output_model=CapabilityOutcome, effect="execute_project",
+            scheduling=SchedulingMetadata("local_matlab"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
+            runtime_owner=backend,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(output_kinds=["artifact"]),
                 resources=[
                     ResourceRequirement(role="project", kind="matlab_project", location="agent")
                 ],
@@ -380,10 +434,16 @@ def local_matlab_capabilities(
             name="matlab_allmargin", version="1",
             description="Compute SISO loop margins from a verified dependency linear-model MAT.",
             input_model=AllmarginInput, output_model=CapabilityOutcome, effect="execute_project",
+            scheduling=SchedulingMetadata("local_matlab"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
+            runtime_owner=backend,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(
+                    output_kinds=["metric", "artifact"],
+                    depends_on=["matlab_linearize"],
+                ),
                 metrics=[
                     MetricDefinition(
                         id="gain_margin", label="Gain margin", unit="dB",

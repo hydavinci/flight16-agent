@@ -309,9 +309,11 @@ def test_nested_capability_cannot_reset_the_outer_call_budget(tmp_path):
     data = analysis_plan_data()
     data["budget"]["max_calls"] = 1
     done = confirm(runtime, propose(runtime, conversation, data))
-    assert done.status == "failed"
+    assert done.status == "interrupted"
     assert "call budget" in done.error
     assert done.task.budget_state.calls == 1
+    assert done.task.calls[0].status == "interrupted"
+    assert done.task.calls[0].id in done.task.pending_specs
 
 
 def test_resource_registry_requires_explicit_verifiers_and_rechecks_real_fingerprints(tmp_path):
@@ -444,6 +446,7 @@ def test_source_and_output_directories_must_not_overlap(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     conversation.output_root = str(source)
+    runtime.store.save(conversation)
     runtime.resources.register("project", "web", lambda resource: None, local=True)
     data = analysis_plan_data()
     data["allowed_effects"].append("write_delivery")
@@ -481,9 +484,13 @@ def test_tool_declaration_is_rechecked_before_each_dispatch(tmp_path):
     )
     data["budget"]["max_no_progress"] = 3
     done = confirm(runtime, propose(runtime, conversation, data))
-    assert done.status == "failed"
-    assert "snapshot" in done.error or "declaration" in done.error
+    assert done.status == "running"
+    assert done.error is None
+    assert done.queued_action == "confirm"
     assert len(done.task.calls) == 1
+    assert done.task.calls[0].status == "running"
+    assert done.task.analysis_runs == []
+    assert done.task.outputs == {}
     assert calls == []
 
 
@@ -513,8 +520,19 @@ def test_dependency_receipts_are_reverified_before_exposing_the_next_context(tmp
     )
     pending = propose(runtime, conversation, data)
     done = confirm(runtime, pending)
-    assert done.status == "failed"
+    assert done.status == "running"
+    assert done.error is None
+    assert done.queued_action == "confirm"
     assert calls == ["compute", "unrelated"]
+    assert [call.status for call in done.task.calls] == [
+        "completed",
+        "running",
+    ]
+    assert [node.status for node in done.task.nodes] == [
+        "completed",
+        "running",
+        "pending",
+    ]
 
 
 def test_evaluation_cannot_replace_the_confirmed_threshold(tmp_path):
@@ -563,6 +581,7 @@ def test_external_output_requires_delivery_permission_before_creating_directorie
     runtime, _, conversation, calls = setup(tmp_path)
     root = tmp_path / "external"
     conversation.output_root = str(root)
+    runtime.store.save(conversation)
     with pytest.raises(ValueError, match="write_delivery|delivery permission"):
         propose(runtime, conversation)
     assert not root.exists()
@@ -573,6 +592,7 @@ def test_external_output_directory_is_created_only_after_explicit_confirmation(t
     runtime, _, conversation, calls = setup(tmp_path)
     root = tmp_path / "external"
     conversation.output_root = str(root)
+    runtime.store.save(conversation)
     data = analysis_plan_data()
     data["allowed_effects"].append("write_delivery")
     pending = propose(runtime, conversation, data)

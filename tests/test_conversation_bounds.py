@@ -14,3 +14,4 @@ def test_oversized_conversation_cannot_replace_its_last_readable_record(tmp_path
     with pytest.raises(ValueError, match="8 MB|size|limit"):
         store.save(record)
     assert store.get(record.id) == original
+    assert not list(store.root.rglob("conversation.json"))

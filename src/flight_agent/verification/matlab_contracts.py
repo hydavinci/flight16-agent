@@ -3,12 +3,21 @@ import math
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self
 
-from pydantic import ConfigDict, Field, JsonValue, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    JsonValue,
+    SerializerFunctionWrapHandler,
+    ValidationInfo,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
-from ..models import Contract, FiniteNumber, Nonempty
+from ..models import MAX_RESULT, Contract, FiniteNumber, Nonempty, finite_json
 from ..runtime.contracts import Digest, RunId
 from ..runtime.observations import MetricValue, OutputArtifact
-from ..upload_models import MAX_RESULT, finite_json
+from ..runtime.project_snapshots import ProjectSnapshot
 from .contracts import FileDigest, SteadyStatePolicy, matlab_identifier, relative_path
 from .intake import safe_directory
 
@@ -267,8 +276,18 @@ class LocalMatlabRequest(_MatlabContract):
     operation: Literal["execute_project", "stepinfo", "linearize", "allmargin"]
     inputs: LocalMatlabInput
     project: MatlabProjectDescriptor | None = None
+    project_snapshot: ProjectSnapshot | None = None
     input_evidence: Annotated[list[OutputArtifact], Field(max_length=200)] = []
     timeout_seconds: Annotated[int, Field(ge=1, le=1800)] = 300
+
+    @model_serializer(mode="wrap")
+    def stable_project_snapshot_serialization(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        result: dict[str, object] = handler(self)
+        if self.project_snapshot is None:
+            result.pop("project_snapshot", None)
+        return result
 
     @model_validator(mode="after")
     def matched_operation(self) -> Self:
@@ -307,6 +326,24 @@ class LocalMatlabRequest(_MatlabContract):
             item.path.startswith(inputs.working_directory + "/") for item in self.project.files
         ):
             raise ValueError("Working directory must contain inventoried project files")
+        return self
+
+    @model_validator(mode="after")
+    def matching_project_snapshot(self) -> Self:
+        if self.project_snapshot is not None:
+            if self.project is None:
+                raise ValueError("Artifact-only operations cannot supply a project snapshot")
+            if (
+                self.project_snapshot.source_fingerprint != self.project.fingerprint
+                or [
+                    item.model_dump(mode="json")
+                    for item in self.project_snapshot.manifest.files
+                ]
+                != [item.model_dump(mode="json") for item in self.project.files]
+            ):
+                raise ValueError(
+                    "Request snapshot differs from the original project inventory"
+                )
         return self
 
 

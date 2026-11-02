@@ -8,14 +8,17 @@ from ..runtime.contracts import (
     AnalysisSpec,
     DesignContext,
     Digest,
+    EvidenceFile,
+    MutableRecord,
     Name,
     PlanRevision,
     ResourceBudget,
     RunId,
+    ToolCall,
     Version,
     finite_mapping,
 )
-from .diagnostic_data import DiagnosticOutput
+from .diagnostic_data import DiagnosticOutput, DiagnosticProject
 
 Reason = Annotated[str, Field(min_length=1, max_length=2000)]
 Unknowns = Annotated[list[Reason], Field(max_length=40)]
@@ -221,6 +224,42 @@ class DiagnosisTermination(Contract):
     detail: Reason
     created_at: Nonempty
     unknowns: Unknowns
+
+
+class DiagnosticExecutionNode(MutableRecord):
+    id: Name
+    tool: Name
+    inputs: dict[str, JsonValue] = {}
+    status: Literal["pending", "running", "completed", "failed", "interrupted"] = "pending"
+    error: str | None = None
+
+
+class DiagnosticRunState(MutableRecord):
+    schema_version: Literal["2.0"] = "2.0"
+    id: RunId
+    project: DiagnosticProject
+    baseline: DiagnosisBaseline
+    result_directory: Nonempty
+    nodes: list[DiagnosticExecutionNode] = []
+    calls: list[ToolCall] = []
+    analysis_runs: list[AnalysisRun] = []
+    plan_revisions: list[DiagnosisPlanRevision] = []
+    rounds: list[DiagnosticRound] = []
+    assessments: list[HypothesisAssessment] = []
+    artifacts: list[EvidenceFile] = []
+    input_snapshot: DiagnosticProject | None = None
+    pending_analysis: PendingAnalysis | None = None
+    termination: DiagnosisTermination | None = None
+    started_at: str | None = None
+    dispatch_count: Annotated[int, Field(strict=True, ge=0, le=40)] = 0
+    no_progress_rounds: Annotated[int, Field(strict=True, ge=0)] = 0
+
+    @property
+    def current_hypotheses(self) -> list[Hypothesis]:
+        for round_ in reversed(self.rounds):
+            if round_.review.hypothesis_revision is not None:
+                return round_.review.hypothesis_revision.hypotheses
+        return self.baseline.hypotheses
 
 
 def validate_assessments(

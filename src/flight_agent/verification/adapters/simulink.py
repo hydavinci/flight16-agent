@@ -9,12 +9,19 @@ from ...runtime.capabilities import Capability
 from ...runtime.capability_metadata import (
     Availability,
     CapabilityMetadata,
+    CapabilityPlanning,
     MetricDefinition,
     ResourceRequirement,
 )
 from ...runtime.observations import CapabilityOutcome, Finding, Observation, OutputArtifact
 from ...runtime.resources import AgentContract, ResourceReference
-from ..agent_runtime import AgentContext, ExecutionUncertain, ReconciledFailure
+from ...runtime.scheduling_contracts import SchedulingMetadata
+from ..agent_runtime import (
+    AgentContext,
+    ExecutionUncertain,
+    PreDispatchBudgetExhausted,
+    ReconciledFailure,
+)
 from ..artifacts import artifact_path, describe_artifact, verify_artifact
 from ..backend import AnalysisBackend
 from ..contracts import AnalysisKind, AnalysisResult, AnalysisRunRequest, RunRecord
@@ -51,10 +58,13 @@ def _request(
     else:
         if saved is not None:
             raise ExecutionUncertain("Original Worker request must be reconciled, not dispatched")
-        context.budget.check_limits()
-        timeout = min(300, floor(context.budget.remaining_seconds()))
-        if timeout < 1:
-            raise BudgetExhausted("Less than one second remains for Worker execution")
+        try:
+            context.budget.check_limits()
+            timeout = min(300, floor(context.budget.remaining_seconds()))
+            if timeout < 1:
+                raise BudgetExhausted("Less than one second remains for Worker execution")
+        except BudgetExhausted as exc:
+            raise PreDispatchBudgetExhausted(str(exc)) from exc
         request = AnalysisRunRequest(
             id=context.call_id,
             project_root=resource.locator,
@@ -300,10 +310,12 @@ def simulink_capabilities(
             input_model=SimulinkInput,
             output_model=CapabilityOutcome,
             effect="execute_project",
+            scheduling=SchedulingMetadata("remote_worker"),
             operation=lambda context, inputs: execute(context, inputs, resume=False),
             reconcile=lambda context, inputs: execute(context, inputs, resume=True),
             readiness=readiness,
             metadata=CapabilityMetadata(
+                planning=CapabilityPlanning(output_kinds=["metric", "artifact"]),
                 metrics=metrics,
                 resources=[
                     ResourceRequirement(

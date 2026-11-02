@@ -34,23 +34,15 @@ def test_generic_view_preserves_analysis_requirements_and_real_observations(tmp_
     assert view.nodes[0].tool == "offline_rmse"
 
 
-def test_legacy_verification_projection_does_not_invent_requirement_sources(tmp_path):
-    from flight_agent.verification.compat import to_legacy_view
-    from tests.test_verification_runtime import confirm, runtime_fixture
+def test_task_view_rejects_legacy_schema_version(tmp_path):
+    from pydantic import ValidationError
 
-    runtime, _, _, root = runtime_fixture(tmp_path)
-    done = confirm(runtime, runtime.submit(None, "Verify the supplied project.", str(root)))
-    original = done.model_dump(mode="json")
-    view = to_legacy_view(done.task)
-    assert view.schema_version == "1.0"
-    assert view.requirements.mode == "verification"
-    assert all(item.source is None for item in view.requirements.criteria)
-    assert all("历史记录未提供来源" in item.source_note for item in view.requirements.criteria)
-    assert view.evaluation.status == done.task.evaluation.status
-    assert [item.status for item in view.evaluation.checks] == [
-        item.status for item in done.task.evaluation.checks
-    ]
-    assert done.model_dump(mode="json") == original
+    from tests.test_agent_history import agent_task
+
+    data = views().to_task_view(agent_task(tmp_path)).model_dump()
+    data["schema_version"] = "1.0"
+    with pytest.raises(ValidationError):
+        views().TaskView.model_validate(data)
 
 
 def test_view_endpoint_keeps_raw_record_api_and_requires_authentication(tmp_path):
@@ -77,54 +69,36 @@ def test_view_endpoint_keeps_raw_record_api_and_requires_authentication(tmp_path
         assert raw["task"]["baseline"] == record["task"]["baseline"]
 
 
-def test_legacy_recovery_projection_preserves_both_adoption_and_original_continuation(
-    tmp_path,
-    monkeypatch,
-):
-    from flight_agent.verification.compat import to_legacy_view
-    from tests.test_verification_replanning import failed_delivery
-    from tests.test_verification_runtime import proposal
+def test_v2_current_and_archived_views_preserve_calls_without_mutating_record(tmp_path):
+    from flight_agent.verification.contracts import Conversation, ToolCall
+    from tests.test_agent_history import agent_task
 
-    _, _, _, _, failed, _ = failed_delivery(tmp_path, monkeypatch, proposal(threshold=4))
-    view = to_legacy_view(failed.task)
-    assert view.confirmation.recovery_action == "resume"
-    assert view.confirmation.recovery_proposal["action"] == "plan"
-
-
-def test_historical_worker_log_does_not_block_current_or_archived_view(tmp_path):
-    from flight_agent.verification.compat import to_legacy_view
-    from tests.test_verification_runtime import confirm, runtime_fixture
-
-    runtime, _, _, root = runtime_fixture(tmp_path)
-    done = confirm(runtime, runtime.submit(None, "Verify historical results.", str(root)))
     log = "Historical Worker log.\n" * 500
-    done.task.worker_run = done.task.worker_run.model_copy(update={"log": log})
-    runtime.store.save(done)
-    assert to_legacy_view(done.task).details["historical_record"]["worker_run"]["log"] == log
-    from flight_agent.verification.views import to_conversation_view
-
-    done.archived_tasks.append(done.task.model_copy(deep=True))
-    projected = to_conversation_view(done)
-    assert projected.task.evaluation.status == "pass"
-    assert projected.archived_tasks[0].details["historical_record"]["worker_run"]["log"] == log
-
-
-def test_invalid_historical_analysis_cannot_be_projected_as_valid_metrics(tmp_path):
-    from flight_agent.verification.compat import to_legacy_view
-    from tests.test_verification_runtime import confirm, runtime_fixture
-
-    runtime, _, _, root = runtime_fixture(tmp_path)
-    done = confirm(runtime, runtime.submit(None, "Verify historical results.", str(root)))
-    analysis = done.task.result.analyses[0]
-    invalid = analysis.model_copy(
-        update={
-            "valid": False,
-            "diagnostics": ["Steady-state response is not stationary."],
-        }
+    task = agent_task(tmp_path)
+    task.calls.append(
+        ToolCall(
+            id="1" * 32,
+            node_id="compute",
+            tool="offline_rmse",
+            baseline_version=1,
+            status="completed",
+            started_at="now",
+            output={"log": log},
+        )
     )
-    done.task.result = done.task.result.model_copy(update={"analyses": [invalid]})
-    projected = to_legacy_view(done.task)
-    assert projected.observations
-    assert all(not value.valid for value in projected.observations)
-    assert all("not stationary" in value.reason for value in projected.observations)
-    assert projected.evaluation.status == done.task.evaluation.status
+    record = Conversation(
+        id="b" * 32,
+        created_at="now",
+        updated_at="now",
+        task=task,
+        archived_tasks=[task.model_copy(deep=True)],
+    )
+    before = record.model_dump(mode="json")
+
+    projected = views().to_conversation_view(record)
+
+    assert projected.task.schema_version == "2.0"
+    assert projected.task.calls[0].output["log"] == log
+    assert projected.archived_tasks[0].schema_version == "2.0"
+    assert projected.archived_tasks[0].calls[0].output["log"] == log
+    assert record.model_dump(mode="json") == before

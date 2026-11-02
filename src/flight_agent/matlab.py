@@ -1,16 +1,11 @@
 import importlib.util
+import json
 import logging
-import math
 import os
 import signal
 import subprocess
-import sys
-from pathlib import Path
+import time
 from typing import NamedTuple
-
-from pydantic import ValidationError
-
-from .models import AnalysisResult, Parameters, validate_result_context
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +20,264 @@ class _CleanupResult(NamedTuple):
     error: str | None
 
 
+class _WindowsProcess(NamedTuple):
+    parent_pid: int
+    creation_time: str
+
+
 def engine_available() -> bool:
     try:
         return importlib.util.find_spec("matlab.engine") is not None
     except (ImportError, ValueError):
         return False
+
+
+def _windows_processes() -> dict[int, _WindowsProcess]:
+    command = (
+        "$ErrorActionPreference='Stop';"
+        "$items=@(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {"
+        "[pscustomobject]@{ProcessId=[int]$_.ProcessId;"
+        "ParentProcessId=[int]$_.ParentProcessId;"
+        "CreationTime=$_.CreationDate.ToUniversalTime().ToFileTimeUtc().ToString()}});"
+        "ConvertTo-Json -InputObject $items -Compress"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        raise OSError(result.stderr.strip() or "PowerShell process enumeration failed")
+    if not result.stdout.strip():
+        raise OSError("PowerShell process enumeration returned empty output")
+    decoded = json.loads(result.stdout)
+    records = decoded if isinstance(decoded, list) else [decoded]
+    if not records:
+        raise OSError("PowerShell process enumeration returned no processes")
+    processes: dict[int, _WindowsProcess] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Invalid Windows process enumeration record")
+        creation_time = str(record.get("CreationTime", ""))
+        if not creation_time or not creation_time.isdecimal():
+            raise ValueError("Windows process identity is unavailable")
+        processes[int(record["ProcessId"])] = _WindowsProcess(
+            parent_pid=int(record["ParentProcessId"]),
+            creation_time=creation_time,
+        )
+    return processes
+
+
+def _windows_process_creation_time(process: subprocess.Popen[str]) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [
+            ("low", wintypes.DWORD),
+            ("high", wintypes.DWORD),
+        ]
+
+    handle = getattr(process, "_handle", None)
+    if handle is None:
+        raise OSError("Windows worker process handle is unavailable")
+    win_dll = getattr(ctypes, "WinDLL")
+    get_last_error = getattr(ctypes, "get_last_error")
+    kernel = win_dll("kernel32", use_last_error=True)
+    kernel.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    created = FileTime()
+    exited = FileTime()
+    kernel_time = FileTime()
+    user_time = FileTime()
+    if not kernel.GetProcessTimes(
+        int(handle),
+        ctypes.byref(created),
+        ctypes.byref(exited),
+        ctypes.byref(kernel_time),
+        ctypes.byref(user_time),
+    ):
+        raise OSError(
+            f"GetProcessTimes({process.pid}) failed with Windows error {get_last_error()}"
+        )
+    return str((created.high << 32) | created.low)
+
+
+def _windows_terminate_pid(pid: int, creation_time: str) -> str | None:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [
+            ("low", wintypes.DWORD),
+            ("high", wintypes.DWORD),
+        ]
+
+    win_dll = getattr(ctypes, "WinDLL")
+    get_last_error = getattr(ctypes, "get_last_error")
+    kernel = win_dll("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.TerminateProcess.restype = wintypes.BOOL
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    access = 0x0001 | 0x1000 | 0x00100000
+    handle = kernel.OpenProcess(access, False, pid)
+    if not handle:
+        error = get_last_error()
+        if error == 87:
+            return None
+        return f"OpenProcess({pid}) failed with Windows error {error}"
+    try:
+        created = FileTime()
+        exited = FileTime()
+        kernel_time = FileTime()
+        user_time = FileTime()
+        if not kernel.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            return f"GetProcessTimes({pid}) failed with Windows error {get_last_error()}"
+        actual_creation = str((created.high << 32) | created.low)
+        if actual_creation != creation_time:
+            return f"process identity changed for PID {pid}"
+        if not kernel.TerminateProcess(handle, 1):
+            return f"TerminateProcess({pid}) failed with Windows error {get_last_error()}"
+        wait_result = kernel.WaitForSingleObject(handle, 2000)
+        if wait_result != 0:
+            return f"process {pid} did not terminate within the Windows cleanup deadline"
+        return None
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _update_windows_tree(
+    processes: dict[int, _WindowsProcess],
+    depths: dict[int, int],
+    identities: dict[int, str],
+    reused_at: dict[int, int],
+) -> tuple[dict[int, int], str | None]:
+    for pid, process in processes.items():
+        if not process.creation_time or not process.creation_time.isdecimal():
+            return {}, f"Windows process identity is unavailable for PID {pid}"
+        if pid not in identities:
+            continue
+        expected = identities[pid]
+        if expected != process.creation_time:
+            replacement_time = int(process.creation_time)
+            reused_at[pid] = min(reused_at.get(pid, replacement_time), replacement_time)
+    changed = True
+    while changed:
+        changed = False
+        for pid, process in processes.items():
+            parent_pid = process.parent_pid
+            if parent_pid not in depths or pid in depths:
+                continue
+            child_time = int(process.creation_time)
+            parent_time = int(identities[parent_pid])
+            if child_time == parent_time:
+                return {}, (
+                    f"Windows process ancestry is uncertain for PID {pid}; "
+                    f"it has the same creation time as parent PID {parent_pid}"
+                )
+            if child_time < parent_time:
+                continue
+            if parent_pid in reused_at:
+                replacement_time = reused_at[parent_pid]
+                if child_time == replacement_time:
+                    return {}, (
+                        f"Windows process ancestry is uncertain for PID {pid} "
+                        f"after parent PID {parent_pid} reuse"
+                    )
+                if child_time > replacement_time:
+                    continue
+            elif parent_pid not in processes:
+                return {}, (
+                    f"Windows process ancestry is uncertain for PID {pid}; "
+                    f"parent PID {parent_pid} is unavailable and the process "
+                    "is still running"
+                )
+            depths[pid] = depths[parent_pid] + 1
+            identities[pid] = process.creation_time
+            changed = True
+    return (
+        {
+            pid: depth
+            for pid, depth in depths.items()
+            if pid in processes
+            and pid not in reused_at
+            and identities[pid] == processes[pid].creation_time
+        },
+        None,
+    )
+
+
+def _stop_windows_tree(root_pid: int, root_creation_time: str) -> str | None:
+    if not root_creation_time.isdecimal():
+        return "Windows root process identity is unavailable"
+    depths = {root_pid: 0}
+    identities = {root_pid: root_creation_time}
+    reused_at: dict[int, int] = {}
+    termination_errors: dict[int, str] = {}
+    for _ in range(3):
+        try:
+            processes = _windows_processes()
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            return f"cannot enumerate the Windows process tree: {exc}"
+        live, identity_error = _update_windows_tree(
+            processes, depths, identities, reused_at
+        )
+        if identity_error is not None:
+            return identity_error
+        if not live:
+            return None
+        for pid in sorted(live, key=live.__getitem__, reverse=True):
+            try:
+                error = _windows_terminate_pid(pid, identities[pid])
+            except (OSError, subprocess.SubprocessError) as exc:
+                error = str(exc)
+            if error is not None:
+                termination_errors[pid] = error
+        time.sleep(0.05)
+    try:
+        processes = _windows_processes()
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return f"cannot verify the Windows process tree termination: {exc}"
+    live, identity_error = _update_windows_tree(
+        processes, depths, identities, reused_at
+    )
+    if identity_error is not None:
+        return identity_error
+    remaining = sorted(live)
+    if not remaining:
+        return None
+    details = "; ".join(
+        f"{pid}: {termination_errors.get(pid, 'termination not confirmed')}"
+        for pid in remaining
+    )
+    return f"Windows process tree still running after termination: {details}"
 
 
 def _stop_worker(process: subprocess.Popen[str], *, label: str = "MATLAB") -> _CleanupResult:
@@ -54,11 +302,26 @@ def _stop_worker(process: subprocess.Popen[str], *, label: str = "MATLAB") -> _C
             if detail not in errors:
                 errors.append(detail)
 
-    send_signal(signal.SIGTERM)
+    windows_creation_time: str | None = None
+    if os.name == "nt":
+        try:
+            windows_creation_time = _windows_process_creation_time(process)
+        except (OSError, TypeError, ValueError) as exc:
+            errors.append(f"cannot bind the Windows worker process identity: {exc}")
+        if windows_creation_time is not None:
+            if error := _stop_windows_tree(process.pid, windows_creation_time):
+                errors.append(error)
+    else:
+        send_signal(signal.SIGTERM)
     try:
         stdout, stderr = process.communicate(timeout=2)
     except subprocess.TimeoutExpired:
-        send_signal(signal.SIGKILL)
+        if os.name == "nt":
+            if windows_creation_time is not None:
+                if error := _stop_windows_tree(process.pid, windows_creation_time):
+                    errors.append(error)
+        else:
+            send_signal(signal.SIGKILL)
         try:
             stdout, stderr = process.communicate(timeout=2)
         except subprocess.TimeoutExpired as exc:
@@ -80,62 +343,3 @@ def _stop_worker(process: subprocess.Popen[str], *, label: str = "MATLAB") -> _C
         stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else stderr or "",
         error,
     )
-
-
-class MatlabRunner:
-    def __init__(self, project_root: Path, timeout_seconds: float = 120):
-        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-            raise ValueError("MATLAB timeout must be finite and greater than zero")
-        self.project_root = project_root.resolve()
-        self.timeout_seconds = timeout_seconds
-        self.log = ""
-
-    def run(self, parameters: Parameters) -> AnalysisResult:
-        entry = self.project_root / "matlab" / "analyze_demo.m"
-        if not entry.is_file():
-            raise MatlabError(f"Trusted MATLAB entry is missing: {entry}")
-        process = subprocess.Popen(
-            [sys.executable, "-m", "flight_agent.matlab_worker", str(self.project_root)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            start_new_session=True,
-        )
-        cleanup: _CleanupResult | None = None
-        try:
-            stdout, stderr = process.communicate(
-                parameters.model_dump_json(), timeout=self.timeout_seconds
-            )
-        except subprocess.TimeoutExpired as exc:
-            cleanup = _stop_worker(process)
-            self.log = cleanup.stderr
-            message = (
-                f"MATLAB timed out after {self.timeout_seconds:g}s; worker termination requested. "
-                "Check for detached MATLAB processes before retrying."
-            )
-            if cleanup.error:
-                self.log += "\n" + cleanup.error
-                message += "\n" + cleanup.error
-            raise MatlabError(message) from exc
-        finally:
-            if process.poll() is None and cleanup is None:
-                cleanup = _stop_worker(process)
-                self.log = cleanup.stderr
-                if cleanup.error:
-                    self.log += "\n" + cleanup.error
-        self.log = stderr
-        if process.returncode != 0:
-            cleanup = _stop_worker(process)
-            if cleanup.error:
-                self.log += "\n" + cleanup.error
-            raise MatlabError(
-                f"MATLAB worker failed (exit {process.returncode}): {self.log.strip()}"
-            )
-        try:
-            result = AnalysisResult.model_validate_json(stdout)
-            validate_result_context(result, parameters)
-            return result
-        except (ValidationError, ValueError) as exc:
-            raise MatlabError(f"Invalid MATLAB JSON result: {exc}") from exc

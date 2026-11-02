@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 
 def verification_module(name):
@@ -106,3 +107,61 @@ def margin_result_data(gain=6.0, phase=45.0):
             }
         ],
     }
+
+
+class ControlledBackend:
+    def __init__(self):
+        self.calls = []
+        self.fail_after_completion = False
+        self.completed = {}
+
+    def inspect(self, root):
+        return verification_module("projects").ProjectInspector().inspect(root)
+
+    def execute(self, request, directory, on_progress, *, resume=False):
+        from flight_agent.remote import RemoteError
+
+        contracts = verification_module("contracts")
+        self.calls.append((request, resume))
+        if resume:
+            assert request.id in self.completed
+        data = step_result_data()
+        data["analyses"] = []
+        for kind in request.analyses:
+            item = step_result_data() if kind == "step_response" else margin_result_data()
+            data["analyses"].extend(item["analyses"])
+        directory.mkdir(parents=True, exist_ok=True)
+        names = [name for item in data["analyses"] for name in item["artifact_paths"]]
+        for name in names:
+            path = directory / name
+            if path.suffix == ".png":
+                Image.new("RGB", (32, 32)).save(path)
+            else:
+                path.write_bytes(b"MATLAB test fixture" + b" " * 128)
+        data.update(
+            run_id=request.id,
+            project_fingerprint=request.project_fingerprint,
+            trim_point=request.trim_point,
+            artifacts=[
+                verification_module("artifacts").describe_artifact(directory, name).model_dump()
+                for name in names
+            ],
+        )
+        result = contracts.AnalysisResult.model_validate(data)
+        (directory / "analysis.json").write_text(result.model_dump_json())
+        self.completed[request.id] = result
+        if self.fail_after_completion and not resume:
+            raise RemoteError("Controlled lost acknowledgement")
+        store = verification_module("store")
+        on_progress(
+            contracts.RunRecord(
+                id=request.id,
+                request_sha256=store.request_digest(request),
+                created_at=store.now(),
+                updated_at=store.now(),
+                status="completed",
+                stage="completed",
+                result=result,
+            )
+        )
+        return result

@@ -86,31 +86,22 @@ def test_failure_is_propagated_without_retry_or_successful_persistence():
     assert not saved
 
 
-@pytest.mark.parametrize("scenario", ["d1", "d2"])
-def test_domain_execution_obeys_the_shared_progression_bound(tmp_path, monkeypatch, scenario):
-    from tests.verification_helpers import verification_module
+def test_generic_execution_obeys_the_shared_progression_bound(tmp_path, monkeypatch):
+    from tests.agent_helpers import analysis_plan_data
+    from tests.test_agent_runtime import confirm, propose, runtime_module, setup
 
     loop = kernel("loop")
 
     def limited(**options):
         return loop.run_loop(**{**options, "max_steps": 1})
 
-    module = verification_module("runtime" if scenario == "d1" else "diagnostic_engine")
-    monkeypatch.setattr(module, "run_loop", limited, raising=False)
-    if scenario == "d1":
-        from tests.test_verification_runtime import proposal, runtime_fixture
-
-        runtime, _, _, root = runtime_fixture(tmp_path, [proposal()])
-    else:
-        from tests.test_diagnosis_runtime import runtime_fixture
-
-        runtime, _, _, root = runtime_fixture(tmp_path)
-    pending = runtime.submit(None, "Analyze the synthetic evidence.", str(root), scenario=scenario)
-    done = runtime.confirm(pending.id, pending.task.baseline.version, trusted=True)
+    monkeypatch.setattr(runtime_module(), "run_loop", limited)
+    runtime, _, conversation, calls = setup(tmp_path)
+    data = analysis_plan_data()
+    data["nodes"].append({**data["nodes"][0], "id": "second-analysis"})
+    done = confirm(runtime, propose(runtime, conversation, data))
     assert done.status == "failed"
     assert "step budget" in done.error.lower()
-    if scenario == "d1":
-        assert done.task.evaluation is None
-    else:
-        assert len(done.task.rounds) == 1
-        assert len(done.task.analysis_runs) == 1
+    assert len(calls) == 1
+    assert len(done.task.analysis_runs) == 1
+    assert done.task.nodes[1].status == "pending"

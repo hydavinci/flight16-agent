@@ -1,76 +1,11 @@
-import json
+import shutil
 from pathlib import Path
 
 import pytest
 
 
 @pytest.fixture
-def parameter_data():
-    return {
-        "schema_version": "1.0",
-        "aircraft_type": "demo_fixed_wing",
-        "condition": "demo_cruise",
-        "mass_kg": 10.0,
-        "wing_area_m2": 0.8,
-        "airspeed_mps": 20.0,
-        "air_density_kg_m3": 1.225,
-        "thrust_n": 30.0,
-    }
-
-
-@pytest.fixture
-def result_data():
-    return {
-        "schema_version": "1.0",
-        "aircraft_type": "demo_fixed_wing",
-        "condition": "demo_cruise",
-        "model_version": "demo-static-v1",
-        "matlab_version": "test-engine",
-        "valid": True,
-        "diagnostics": [],
-        "metrics": {
-            "wing_loading": {"value": 122.583125, "unit": "N/m^2"},
-            "dynamic_pressure": {"value": 245.0, "unit": "Pa"},
-            "required_lift_coefficient": {"value": 0.5003392857142857, "unit": "1"},
-            "thrust_to_weight": {"value": 0.3059148638933785, "unit": "1"},
-        },
-    }
-
-
-@pytest.fixture
-def rule_data():
-    return {
-        "version": "demo-rules-v1",
-        "model_version": "demo-static-v1",
-        "demo_only": True,
-        "rules": [
-            {
-                "id": "DEMO-CL",
-                "metric": "required_lift_coefficient",
-                "operator": "<=",
-                "threshold": 1.2,
-                "unit": "1",
-                "aircraft_type": "demo_fixed_wing",
-                "condition": "demo_cruise",
-                "source_id": "demo.md",
-                "source_section": "演示判据",
-            }
-        ],
-    }
-
-
-@pytest.fixture
-def project(tmp_path, rule_data):
-    for name in ("matlab", "rules", "knowledge"):
-        (tmp_path / name).mkdir()
-    (tmp_path / "matlab" / "analyze_demo.m").write_text("% test entry", encoding="utf-8")
-    (tmp_path / "rules" / "demo.json").write_text(
-        json.dumps(rule_data, ensure_ascii=False), encoding="utf-8"
-    )
-    (tmp_path / "knowledge" / "demo.md").write_text(
-        "# 演示判据\n\n升力系数 required_lift_coefficient 不超过 1.2。仅用于软件演示。",
-        encoding="utf-8",
-    )
+def project(tmp_path):
     return tmp_path
 
 
@@ -80,7 +15,114 @@ def repository_root():
 
 
 @pytest.fixture
-def fake_engine(monkeypatch, repository_root):
-    directory = repository_root / "tests" / "fixtures" / "fake_matlab"
+def fake_engine(monkeypatch, repository_root, tmp_path):
+    source = repository_root / "tests" / "fixtures" / "fake_matlab"
+    directory = tmp_path / "fake_matlab"
+    shutil.copytree(source, directory)
+    engine = directory / "matlab" / "engine.py"
+    engine.write_text(
+        engine.read_text(encoding="utf-8")
+        + r'''
+
+def _workbench(self, run_dir, filename, kind, parameters_json, request_sha256, max_figures):
+    from PIL import Image
+
+    directory = Path(run_dir)
+    mode = os.environ.get("TEST_ENGINE_MODE", "")
+    assert filename == "analysis.m"
+    assert kind in {"script", "function"}
+    assert json.loads(parameters_json) == {"value": 3}
+    assert max_figures == 5
+    assert "LLM_API_KEY" not in os.environ
+    assert "OPENAI_API_KEY" not in os.environ
+    assert "LANGSMITH_API_KEY" not in os.environ
+    assert "MATLAB_WORKER_TOKEN" not in os.environ
+    if mode == "execution_error":
+        raise MatlabExecutionError("original MATLAB solver failure")
+    if mode == "workbench_block":
+        time.sleep(60)
+    print("workbench log")
+    if mode == "workbench_log_flood":
+        print("x" * 1_000_001)
+    if mode == "workbench_missing_receipt":
+        return
+    figures = ["figure-1.png"]
+    receipt = {
+        "request_sha256": request_sha256,
+        "result": {"value": 6},
+        "matlab_version": "test-engine",
+        "figures": figures,
+    }
+    if mode == "workbench_wrong_digest":
+        receipt["request_sha256"] = "0" * 64
+    elif mode == "workbench_missing_result":
+        del receipt["result"]
+    elif mode == "workbench_too_many_figures":
+        receipt["figures"] = [f"figure-{index}.png" for index in range(1, 7)]
+    if mode == "workbench_nan":
+        (directory / "receipt.json").write_text(
+            '{"request_sha256":"' + request_sha256
+            + '","result":NaN,"matlab_version":"test-engine","figures":[]}'
+        )
+        return
+    if mode == "workbench_inf":
+        (directory / "receipt.json").write_text(
+            '{"request_sha256":"' + request_sha256
+            + '","result":Infinity,"matlab_version":"test-engine","figures":[]}'
+        )
+        return
+    if mode == "workbench_null":
+        receipt["result"] = None
+    if mode == "workbench_result_boundary":
+        receipt["result"] = "x" * 3_999_998
+    if mode == "workbench_oversized_receipt_metadata":
+        receipt["result"] = "x" * 3_999_998
+        receipt["padding"] = "x" * 4_096
+    if mode == "workbench_oversized_result":
+        receipt["result"] = "x" * 4_000_001
+    if mode == "workbench_receipt_symlink":
+        target = directory / "unsafe-receipt.json"
+        target.write_text(json.dumps(receipt))
+        (directory / "receipt.json").symlink_to(target)
+        return
+    (directory / "receipt.json").write_text(json.dumps(receipt))
+    for name in receipt["figures"]:
+        path = directory / name
+        Image.new("RGB", (2, 2), color="blue").save(path)
+    if mode == "workbench_invalid_png":
+        (directory / "figure-1.png").write_bytes(b"not PNG")
+    elif mode == "workbench_large_dimensions":
+        Image.new("1", (4001, 4000)).save(directory / "figure-1.png")
+    elif mode == "workbench_large_png":
+        (directory / "figure-1.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 2_000_000)
+    elif mode == "workbench_artifact_symlink":
+        path = directory / "figure-1.png"
+        target = directory / "unsafe-figure.png"
+        path.replace(target)
+        path.symlink_to(target)
+
+
+_original_feval = Engine.feval
+
+
+def _feval(self, name, *args, **kwargs):
+    if name == "flight_agent_execute_workbench":
+        kwargs.pop("nargout", None)
+        return _workbench(self, *args, **kwargs)
+    return _original_feval(self, name, *args, **kwargs)
+
+
+def _which(self, name, **kwargs):
+    if name == "flight_agent_execute_workbench":
+        return str(Path(self.paths[-1]) / (name + ".m"))
+    return ""
+
+
+Engine.feval = _feval
+Engine.which = _which
+''',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("PYTHONPATH", str(directory))
+    monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
     monkeypatch.delenv("TEST_ENGINE_MODE", raising=False)

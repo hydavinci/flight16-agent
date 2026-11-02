@@ -11,12 +11,12 @@ from typing import IO, Literal, TypeVar
 
 from pydantic import BaseModel
 
+from ..json_io import write_json
 from ..matlab import _stop_worker
 from ..runtime.capability_metadata import Availability
 from ..runtime.contracts import fingerprint
 from ..runtime.evidence import publish_evidence, verify_evidence
 from ..runtime.observations import OutputArtifact
-from ..session import _write_json
 from .artifacts import MAX_ARTIFACT_BYTES, describe_artifact
 from .intake import safe_directory
 from .matlab import MAX_LOG_BYTES, MAX_RESULT_BYTES
@@ -41,7 +41,7 @@ from .matlab_contracts import (
     ProjectExecutionInput,
     StepinfoInput,
 )
-from .matlab_projects import discover_matlab_project, snapshot_matlab_project
+from .project_snapshots import ProjectSnapshotStore
 from .projects import file_digest
 
 MAX_REQUEST_BYTES = 8_000_000
@@ -420,13 +420,21 @@ def _verify_result(request: LocalMatlabRequest, result: LocalMatlabResult, direc
 
 
 class LocalMatlabBackend:
-    def __init__(self, interpreter: str):
+    def __init__(
+        self, interpreter: str, *, snapshots: ProjectSnapshotStore | None = None
+    ) -> None:
         self.interpreter = interpreter
+        self.snapshots = snapshots
         self._readiness: tuple[str, dict[str, str], Availability] | None = None
 
     @classmethod
-    def from_environment(cls) -> "LocalMatlabBackend":
-        return cls(os.environ.get("MATLAB_PYTHON_EXECUTABLE") or sys.executable)
+    def from_environment(
+        cls, *, snapshots: ProjectSnapshotStore | None = None
+    ) -> "LocalMatlabBackend":
+        return cls(
+            os.environ.get("MATLAB_PYTHON_EXECUTABLE") or sys.executable,
+            snapshots=snapshots,
+        )
 
     def readiness(self) -> Availability:
         """Share import-only UI/catalog probes; execution still checks availability afresh."""
@@ -504,6 +512,13 @@ class LocalMatlabBackend:
         digest = fingerprint(request.model_dump(mode="json"))
         if resume:
             return self._resume(request, directory)
+        if request.project is not None:
+            if request.project_snapshot is None or self.snapshots is None:
+                raise ValueError(
+                    "New project execution requires a managed snapshot store and binding"
+                )
+            with self.snapshots.guard():
+                self.snapshots.verify(request.project_snapshot)
         if directory.exists():
             raise ValueError(
                 "Run directory already exists; use resume to reconcile the original ID"
@@ -512,8 +527,8 @@ class LocalMatlabBackend:
         state = LocalMatlabCheckpoint(
             id=request.id, request_sha256=digest, status="running", interpreter=self.interpreter
         )
-        _write_json(directory / "request.json", request.model_dump(mode="json"))
-        _write_json(directory / "state.json", state.model_dump(mode="json"))
+        write_json(directory / "request.json", request.model_dump(mode="json"))
+        write_json(directory / "state.json", state.model_dump(mode="json"))
         status: Literal["failed", "unknown", "interrupted"] = "failed"
         try:
             if isinstance(request.inputs, (ProjectExecutionInput, LinearizeInput)):
@@ -543,7 +558,8 @@ class LocalMatlabBackend:
             if available.state != "available":
                 raise ValueError(available.reason)
             if request.project is not None:
-                snapshot_matlab_project(request.project, directory / "project")
+                assert self.snapshots is not None and request.project_snapshot is not None
+                self.snapshots.materialize(request.project_snapshot, directory / "project")
             elif isinstance(request.inputs, StepinfoInput):
                 source = _stepinfo_source(request, directory)
                 publish_evidence(directory / "project", "series.json", source.read_bytes())
@@ -556,7 +572,7 @@ class LocalMatlabBackend:
                     publish_evidence(directory / "project", name, source.read_bytes())
                 _linear_model_source(request, directory)
             execution = _execution_request(request, directory)
-            _write_json(directory / "execution.json", execution.model_dump(mode="json"))
+            write_json(directory / "execution.json", execution.model_dump(mode="json"))
             _output_bounds(directory)
             process = None
             cleanup_error = None
@@ -565,7 +581,7 @@ class LocalMatlabBackend:
                 try:
                     process = self._spawn(str(directory), cwd=directory, log=log)
                     state = state.model_copy(update={"pid": process.pid})
-                    _write_json(directory / "state.json", state.model_dump(mode="json"))
+                    write_json(directory / "state.json", state.model_dump(mode="json"))
                     deadline = time.monotonic() + request.timeout_seconds
                     while process.poll() is None:
                         if time.monotonic() >= deadline:
@@ -593,12 +609,12 @@ class LocalMatlabBackend:
             if process is None or process.returncode != 0:
                 raise ValueError("Worker exited without a verified terminal receipt")
             state = state.model_copy(update={"worker_exit_confirmed": True})
-            _write_json(directory / "state.json", state.model_dump(mode="json"))
+            write_json(directory / "state.json", state.model_dump(mode="json"))
             result = self._receipt(request, directory)
-            if request.project is not None and (
-                discover_matlab_project(request.project.root) != request.project
-            ):
-                raise ValueError("Source project changed during execution; review required")
+            if request.project_snapshot is not None:
+                assert self.snapshots is not None
+                with self.snapshots.guard():
+                    self.snapshots.verify(request.project_snapshot)
             if isinstance(request.inputs, StepinfoInput):
                 _stepinfo_source(request, directory)
             if isinstance(request.inputs, AllmarginInput):
@@ -648,7 +664,7 @@ class LocalMatlabBackend:
         *,
         receipt: bool = False,
     ) -> LocalMatlabResult:
-        _write_json(directory / "result.json", result.model_dump(mode="json"))
+        write_json(directory / "result.json", result.model_dump(mode="json"))
         state = state.model_copy(
             update={
                 "status": result.execution_status,
@@ -656,12 +672,17 @@ class LocalMatlabBackend:
                 "receipt_sha256": file_digest(directory / "receipt.json") if receipt else None,
             }
         )
-        _write_json(directory / "state.json", state.model_dump(mode="json"))
+        write_json(directory / "state.json", state.model_dump(mode="json"))
         return result
 
     def _resume(self, request: LocalMatlabRequest, directory: Path) -> LocalMatlabResult:
         digest = fingerprint(request.model_dump(mode="json"))
         try:
+            if request.project_snapshot is not None:
+                if self.snapshots is None:
+                    raise ValueError("Original snapshot store is unavailable")
+                with self.snapshots.guard():
+                    self.snapshots.verify(request.project_snapshot)
             original = _read_model(
                 directory / "request.json", LocalMatlabRequest, MAX_REQUEST_BYTES
             )
@@ -737,4 +758,4 @@ def _normalize_series(request: LocalMatlabRequest, directory: Path) -> None:
         data[role]["time"] = [value * factor for value in item.time]
         data[role]["time_unit"] = "s"
     series = MatlabSeriesPair.model_validate(data)
-    _write_json(directory / "series.json", series.model_dump(mode="json"))
+    write_json(directory / "series.json", series.model_dump(mode="json"))

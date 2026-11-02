@@ -1,9 +1,11 @@
 import os
+from threading import Event, Timer
 
 import pytest
 from playwright.sync_api import expect, sync_playwright
 
 from tests.agent_helpers import (
+    analysis_plan_data,
     criterion_data,
     delivery_draft,
     draft_data,
@@ -14,10 +16,130 @@ from tests.agent_helpers import (
 from tests.helpers import serve_app, tool_message
 from tests.test_agent_evaluation import evaluation_plan
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_BROWSER_TESTS") != "1",
-    reason="Browser tests are opt-in",
-)
+pytestmark = [
+    pytest.mark.browser,
+    pytest.mark.skipif(
+        os.environ.get("RUN_BROWSER_TESTS") != "1",
+        reason="Browser tests are opt-in",
+    ),
+]
+
+
+def test_slow_bootstrap_cannot_clear_a_message_before_submission(tmp_path, monkeypatch):
+    app, runtime, _, _ = make_agent_web(
+        tmp_path,
+        [{"action": "plan", "text": "Analyze supplied arrays.", "plan": draft_data()}],
+    )
+    release = Event()
+    locations = runtime.resources.locations
+
+    def delayed_locations():
+        assert release.wait(timeout=5)
+        return locations()
+
+    monkeypatch.setattr(runtime.resources, "locations", delayed_locations)
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        requests = []
+        page.on(
+            "request",
+            lambda request: requests.append(request.post_data_json)
+            if request.method == "POST" and request.url.endswith("/api/conversations") else None,
+        )
+        timer = Timer(0.5, release.set)
+        timer.start()
+        try:
+            page.goto(url)
+            page.get_by_label("任务需求", exact=True).fill("Analyze supplied synthetic arrays.")
+            page.locator("#send").click()
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
+            assert requests == [{"message": "Analyze supplied synthetic arrays."}]
+        finally:
+            release.set()
+            timer.join()
+            browser.close()
+
+
+def test_queued_state_keeps_polling_and_disables_confirmation(tmp_path):
+    from threading import Event
+
+    app, runtime, calls, tools = make_agent_web(tmp_path, [])
+    record = runtime.store.create()
+    identifier = record.id
+    queued = {
+        "id": identifier, "status": "queued", "queued_action": "message",
+        "project_root": None, "resource_location": None, "output_root": None,
+        "task": None, "archived_tasks": [], "messages": [],
+        "pending_decision": None, "error": None,
+    }
+    completed = {**queued, "status": "completed", "queued_action": None}
+    views = []
+    show_completed = Event()
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.set_default_timeout(10000)
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        page.add_init_script(
+            f"localStorage.setItem('verification-conversation', '{identifier}')"
+        )
+
+        def reply(route):
+            views.append(route.request.url)
+            route.fulfill(json=completed if show_completed.is_set() else queued)
+
+        page.route(f"**/api/conversations/{identifier}/view", reply)
+        try:
+            page.goto(url)
+            expect(page.locator("#conversation-status")).to_have_text("排队中")
+            expect(page.locator("#send")).to_be_disabled()
+            expect(page.locator("#trusted")).to_be_disabled()
+            expect(page.locator("#next-action")).to_contain_text("尚未")
+            show_completed.set()
+            expect(page.locator("#conversation-status")).to_have_text("已完成")
+            assert len(views) >= 2
+            assert not calls
+            assert not errors
+        finally:
+            browser.close()
+
+
+def test_budget_guidance_is_visible_bounded_and_escaped(tmp_path):
+    from flight_agent.runtime.agent_contracts import AgentPlan
+    from flight_agent.verification.contracts import PendingDecision
+
+    app, runtime, _, _ = make_agent_web(tmp_path, [])
+    pending = runtime.executor.propose(
+        runtime.store.create(), AgentPlan.model_validate(analysis_plan_data())
+    )
+    instruction = "Submit a new plan with a revised budget."
+    guidance = (
+        'The confirmed budget is exhausted. <img src=x onerror="window.unsafe=true"> '
+        f"{instruction} " + "x" * 5000
+    )
+    pending.status = "failed"
+    pending.error = "The confirmed budget is exhausted."
+    pending.pending_decision = PendingDecision(kind="clarify", message=guidance)
+    runtime.store.save(pending)
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        page.set_default_timeout(10000)
+        try:
+            page.goto(url)
+            page.locator("#history-panel > summary").click()
+            page.locator(
+                f'#conversation-history button[data-id="{pending.id}"]'
+            ).click()
+            expect(page.locator("#decision-message")).to_be_visible()
+            expect(page.locator("#decision-message")).to_contain_text(instruction)
+            expect(page.locator("#decision-message img")).to_have_count(0)
+            assert page.locator("#decision-message").inner_text() == guidance[:4096]
+            assert page.evaluate("window.unsafe") is None
+        finally:
+            browser.close()
 
 
 @pytest.mark.parametrize("width", [1280, 390])
@@ -33,7 +155,13 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
         page = browser.new_page(viewport={"width": width, "height": 900})
         page.set_default_timeout(10000)
         errors = []
+        requests = []
         page.on("pageerror", lambda error: errors.append(str(error)))
+        page.on(
+            "request",
+            lambda request: requests.append(request.post_data_json)
+            if request.method == "POST" and request.url.endswith("/api/conversations") else None,
+        )
         try:
             page.goto(url)
             if width <= 1100:
@@ -46,6 +174,8 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
             expect(page.locator("#confirm")).to_be_visible()
             expect(page.locator("#conversation-status")).to_be_visible()
             expect(page.locator("#confirm")).to_be_disabled()
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
+            expect(page.locator("#baseline")).not_to_contain_text("执行方案 v1")
             expect(page.locator("#baseline")).to_contain_text("offline_rmse")
             expect(page.locator("#trust-warning")).not_to_contain_text("工程初始化代码")
             expect(page.locator("#evaluation-card")).to_be_hidden()
@@ -60,6 +190,7 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
             expect(page.locator("#evaluation")).to_contain_text("1.414")
             expect(page.locator("#evaluation")).not_to_contain_text("PASS")
             assert len(calls) == 1
+            assert requests == [{"message": "Analyze supplied synthetic arrays."}]
             assert runtime.store.recent()[0].task.schema_version == "2.0"
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             assert not errors
@@ -158,11 +289,10 @@ def test_capability_gap_is_displayed_without_execution_and_old_consent_is_reset(
             page.goto(url)
             page.get_by_label("任务需求", exact=True).fill("Analyze supplied arrays.")
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v1")
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
             page.locator("#trusted").check()
             page.get_by_label("任务需求", exact=True).fill("Revise the requested arrays.")
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v2")
             expect(page.locator("#trusted")).not_to_be_checked()
             expect(page.locator("#confirm")).to_be_disabled()
             page.locator("#trusted").check()
@@ -283,7 +413,7 @@ def test_accepted_submission_survives_view_failure_without_duplicate_post(tmp_pa
             assert len(runtime.store.recent()) == 1
             assert len(pending) == 1
             pending.pop().continue_()
-            expect(page.locator("#baseline")).to_contain_text("v1")
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
             expect(page.get_by_label("任务需求", exact=True)).to_have_value("")
             assert len(runtime.store.recent()) == 1
             assert not calls
@@ -317,7 +447,7 @@ def test_browser_reconfirms_sourced_acceptance_and_runs_another_registered_metri
                 "Analyze synthetic arrays [0,2] and [0,0]; JSON only, no acceptance.",
             )
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v1")
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
             assert not rmse_calls
             page.locator("#trusted").check()
             page.locator("#confirm").click()
@@ -343,7 +473,6 @@ def test_browser_reconfirms_sourced_acceptance_and_runs_another_registered_metri
             ]
             page.get_by_label("任务需求", exact=True).fill(message)
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v2")
             expect(page.locator("#baseline")).to_contain_text(source["reference"])
             expect(page.locator("#trusted")).not_to_be_checked()
             expect(page.locator("#confirm")).to_be_disabled()

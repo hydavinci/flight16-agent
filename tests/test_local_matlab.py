@@ -1,3 +1,4 @@
+import errno
 import importlib
 import json
 import os
@@ -5,6 +6,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -16,10 +19,11 @@ from flight_agent.verification.matlab_contracts import (
 )
 from flight_agent.verification.matlab_projects import discover_matlab_project
 from tests.matlab_project_helpers import prepared_project
+from tests.snapshot_helpers import bind_request
 
 
 @pytest.fixture
-def local_backend(monkeypatch):
+def local_backend(monkeypatch, tmp_path):
     try:
         module = importlib.import_module("flight_agent.verification.local_matlab")
     except ModuleNotFoundError:
@@ -29,7 +33,11 @@ def local_backend(monkeypatch):
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(fake), str(root / "src")]))
     monkeypatch.setenv("MATLAB_PYTHON_EXECUTABLE", sys.executable)
     monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
-    return module.LocalMatlabBackend.from_environment()
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    return module.LocalMatlabBackend.from_environment(
+        snapshots=ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    )
 
 
 @pytest.fixture
@@ -41,7 +49,7 @@ def local_request(tmp_path):
     project = discover_matlab_project(str(root))
     entry = next(item for item in project.entries if item.path == "analyze.m")
     entry = entry.model_copy(update={"arguments": [{"condition": "cruise"}]})
-    return LocalMatlabRequest(
+    request = LocalMatlabRequest(
         id="a" * 32,
         operation="execute_project",
         project=project,
@@ -53,6 +61,29 @@ def local_request(tmp_path):
             response_signal=SignalSelection(source="return", path=["response"], unit="deg/s"),
             conditions={"condition": "cruise"},
         ),
+    )
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    return bind_request(
+        request, ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    )
+
+
+def test_legacy_request_json_preserves_exact_canonical_identity():
+    path = Path(__file__).parent / "fixtures" / "legacy_local_matlab_request.json"
+    literal = path.read_bytes().rstrip(b"\n")
+    request = LocalMatlabRequest.model_validate_json(literal)
+    serialized = json.dumps(
+        request.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    assert serialized == literal
+    assert b'"project_snapshot"' not in serialized
+    assert (
+        fingerprint(request.model_dump(mode="json"))
+        == "1969c54525d004eb70a1ae1d2de3e8ee44cf8201b7897a0bb0a97c149e732feb"
     )
 
 
@@ -128,6 +159,53 @@ def test_execution_records_original_identity_and_snapshot_evidence(
     assert json.loads((directory / "series.json").read_text())["response"]["values"] == [0, 2, 3]
     assert discover_matlab_project(local_request.project.root) == local_request.project
     assert not (Path(local_request.project.root) / "raw.mat").exists()
+
+
+def test_backend_executes_only_managed_snapshot_after_source_removal(
+    local_backend, local_request, tmp_path, monkeypatch
+):
+    import shutil
+
+    shutil.rmtree(local_request.project.root)
+    module = importlib.import_module("flight_agent.verification.local_matlab")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Execution must not copy the original source")
+
+    monkeypatch.setattr(module, "snapshot_matlab_project", forbidden, raising=False)
+    directory = tmp_path / "work" / "local-matlab"
+    result = local_backend.execute(local_request, directory)
+    assert result.valid, result.diagnostics
+    binding = local_request.project_snapshot
+    immutable = local_backend.snapshots.verify(binding)
+    assert (directory / "project" / "initialize.m").read_bytes() == (
+        immutable / "initialize.m"
+    ).read_bytes()
+    assert result.request_sha256 == fingerprint(local_request.model_dump(mode="json"))
+
+
+def test_tampered_managed_snapshot_never_starts_engine(
+    local_backend, local_request, tmp_path, monkeypatch
+):
+    marker = tmp_path / "starts"
+    monkeypatch.setenv("TEST_LOCAL_STARTS", str(marker))
+    tree = local_backend.snapshots.verify(local_request.project_snapshot)
+    path = tree / "initialize.m"
+    path.chmod(0o644)
+    path.write_bytes(b"x" * path.stat().st_size)
+    path.chmod(0o444)
+    with pytest.raises(ValueError, match="digest"):
+        local_backend.execute(local_request, tmp_path / "work")
+    assert not marker.exists()
+
+
+def test_new_project_execution_cannot_fall_back_to_bare_source(
+    local_backend, local_request, tmp_path
+):
+    bare = local_request.model_copy(update={"project_snapshot": None})
+    with pytest.raises(ValueError, match="snapshot"):
+        local_backend.execute(bare, tmp_path / "bare")
+    assert not (tmp_path / "bare").exists()
 
 
 def test_model_mode_keeps_initializer_and_existing_settings(local_backend, local_request, tmp_path):
@@ -317,12 +395,13 @@ def test_optional_selectors_allow_genuine_execution_artifacts(
     assert any(item.path == "raw.mat" for item in result.artifacts)
 
 
-def test_changed_source_is_rejected_before_engine_start(local_backend, local_request, tmp_path):
+def test_changed_source_after_binding_does_not_change_execution_bytes(
+    local_backend, local_request, tmp_path
+):
     (Path(local_request.project.root) / "initialize.m").write_text("changed")
     result = local_backend.execute(local_request, tmp_path / "run")
-    assert not result.valid
-    assert "changed" in " ".join(result.diagnostics).lower()
-    assert not (tmp_path / "run" / "engine-starts.txt").exists()
+    assert result.valid, result.diagnostics
+    assert (tmp_path / "run" / "engine-starts.txt").read_text() == "1"
 
 
 def test_permission_is_required_even_with_engine_installed(
@@ -369,7 +448,7 @@ def test_resume_is_offline_and_does_not_probe_or_require_execution_permission(
     directory = tmp_path / "run"
     first = local_backend.execute(local_request, directory)
     monkeypatch.delenv("MATLAB_ALLOW_TRUSTED_PROJECTS")
-    offline = type(local_backend)("/not/an/interpreter")
+    offline = type(local_backend)("/not/an/interpreter", snapshots=local_backend.snapshots)
     assert offline.execute(local_request, directory, resume=True) == first
 
 
@@ -379,10 +458,12 @@ def test_unsupported_signature_stops_before_dispatch(local_backend, local_reques
     project = discover_matlab_project(str(root))
     data = local_request.model_dump(mode="json")
     data["project"] = project.model_dump(mode="json")
+    data.pop("project_snapshot")
     data["inputs"]["entry"] = next(
         item.model_dump(mode="json") for item in project.entries if item.path == "analyze.m"
     )
-    result = local_backend.execute(LocalMatlabRequest.model_validate(data), tmp_path / "run")
+    request = bind_request(LocalMatlabRequest.model_validate(data), local_backend.snapshots)
+    result = local_backend.execute(request, tmp_path / "run")
     assert result.execution_status == "failed"
     assert "signature" in " ".join(result.diagnostics).lower()
     assert not (tmp_path / "run" / "engine-starts.txt").exists()
@@ -402,12 +483,14 @@ def test_fixed_multi_output_functions_keep_declared_arity(
     project = discover_matlab_project(str(root))
     data = local_request.model_dump(mode="json")
     data["project"] = project.model_dump(mode="json")
+    data.pop("project_snapshot")
     selected = next(item for item in project.entries if item.path == f"{name}.m")
     data["inputs"][role] = selected.model_copy(update={"arguments": arguments}).model_dump(
         mode="json"
     )
     directory = tmp_path / "run"
-    result = local_backend.execute(LocalMatlabRequest.model_validate(data), directory)
+    request = bind_request(LocalMatlabRequest.model_validate(data), local_backend.snapshots)
+    result = local_backend.execute(request, directory)
     assert result.valid, result.diagnostics
     execution = json.loads((directory / "execution.json").read_text())
     assert execution[role + "_nargin"] == 1
@@ -419,8 +502,11 @@ def test_optional_input_proof_cannot_be_forged(local_backend, local_request, tmp
     root = Path(local_request.project.root)
     (root / "initialize.m").write_text("function initialize(required)\nend\n")
     project = discover_matlab_project(str(root))
+    with local_backend.snapshots.guard():
+        binding = local_backend.snapshots.ensure(project)
     data = local_request.model_dump(mode="json")
     data["project"] = project.model_dump(mode="json")
+    data["project_snapshot"] = binding.model_dump(mode="json")
     data["project"]["settings"]["function_defaults"] = [
         {
             "path": "initialize.m",
@@ -433,9 +519,11 @@ def test_optional_input_proof_cannot_be_forged(local_backend, local_request, tmp
         item.model_dump(mode="json") for item in project.entries if item.path == "initialize.m"
     )
     directory = tmp_path / "run"
-    result = local_backend.execute(LocalMatlabRequest.model_validate(data), directory)
-    assert result.execution_status == "failed" and not result.valid
+    request = LocalMatlabRequest.model_validate(data)
+    result = local_backend.execute(request, directory)
+    assert result.execution_status == "unknown" and not result.valid
     assert not (directory / "engine-starts.txt").exists()
+    assert "Prepared snapshot changed" in (directory / "matlab.log").read_text()
 
 
 @pytest.mark.parametrize(
@@ -466,6 +554,353 @@ def test_worker_revalidates_execution_locators_before_engine_start(
     result = local_backend.execute(local_request, directory)
     assert not result.valid
     assert not (directory / "engine-starts.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+def test_cleanup_returns_output_and_explicit_failure_when_signals_are_denied(monkeypatch, caplog):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("partial result", "original engine error")
+
+    def deny_signal(group, sig):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(module.os, "killpg", deny_signal)
+    result = module._stop_worker(process)
+    assert result.stdout == "partial result"
+    assert result.stderr == "original engine error"
+    assert "cleanup incomplete" in result.error
+    assert "43210" in result.error
+    assert "Operation not permitted" in result.error
+    assert "43210" in caplog.text
+    process.communicate.assert_called_once_with(timeout=2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group lifecycle")
+def test_cleanup_reports_unterminated_worker_after_bounded_waits(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.side_effect = subprocess.TimeoutExpired(
+        "test-worker", 2, output=b"partial result", stderr=b"original engine error"
+    )
+
+    def deny_signal(group, sig):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(module.os, "killpg", deny_signal)
+    result = module._stop_worker(process)
+    assert result.stdout == "partial result"
+    assert result.stderr == "original engine error"
+    assert "43210" in result.error
+    assert "did not exit" in result.error
+    assert "Check" in result.error
+    assert process.communicate.call_args_list == [call(timeout=2), call(timeout=2)]
+
+
+def test_windows_cleanup_terminates_and_verifies_entire_process_tree(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    processes = {
+        43210: module._WindowsProcess(1, "10"),
+        43211: module._WindowsProcess(43210, "20"),
+        43212: module._WindowsProcess(43211, "30"),
+    }
+    terminated = []
+
+    monkeypatch.setattr(module, "_windows_processes", lambda: dict(processes))
+
+    def terminate(pid, creation_time):
+        terminated.append((pid, creation_time))
+        processes.pop(pid)
+        return None
+
+    monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
+    assert module._stop_windows_tree(43210, "10") is None
+    assert terminated == [
+        (43212, "30"),
+        (43211, "20"),
+        (43210, "10"),
+    ]
+
+
+def test_windows_process_enumeration_rejects_empty_cim_error_success(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    completed = subprocess.CompletedProcess(
+        ["powershell.exe"],
+        0,
+        stdout="",
+        stderr="Get-CimInstance : Access denied",
+    )
+    run = Mock(return_value=completed)
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    with pytest.raises(OSError, match="Access denied|empty"):
+        module._windows_processes()
+
+    command = run.call_args.args[0][-1]
+    assert "$ErrorActionPreference='Stop'" in command
+    assert "-ErrorAction Stop" in command
+
+
+def test_windows_cleanup_does_not_kill_reused_descendant_pid(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+
+    def process(parent_pid, creation_time):
+        return module._WindowsProcess(parent_pid, creation_time)
+
+    snapshots = iter(
+        [
+            {
+                43210: process(1, "10"),
+                43211: process(43210, "20"),
+            },
+            {43211: process(999, "30")},
+        ]
+    )
+    terminated = []
+    monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: terminated.append((pid, creation_time)),
+    )
+
+    assert module._stop_windows_tree(43210, "10") is None
+    assert terminated == [(43211, "20"), (43210, "10")]
+
+
+def test_windows_cleanup_never_adopts_reused_root_pid(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    terminate = Mock(return_value=None)
+    monkeypatch.setattr(
+        module,
+        "_windows_processes",
+        lambda: {43210: module._WindowsProcess(1, "200")},
+    )
+    monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
+
+    assert module._stop_windows_tree(43210, "100") is None
+    terminate.assert_not_called()
+
+
+def test_windows_cleanup_keeps_original_descendant_after_parent_pid_reuse(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    snapshots = iter(
+        [
+            {
+                43210: module._WindowsProcess(1, "10"),
+                43211: module._WindowsProcess(43210, "20"),
+            },
+            {
+                43211: module._WindowsProcess(999, "30"),
+                43212: module._WindowsProcess(43211, "25"),
+                43213: module._WindowsProcess(43211, "35"),
+                43214: module._WindowsProcess(43211, "5"),
+            },
+            {
+                43211: module._WindowsProcess(999, "30"),
+                43213: module._WindowsProcess(43211, "35"),
+                43214: module._WindowsProcess(43211, "5"),
+            },
+            {
+                43211: module._WindowsProcess(999, "30"),
+                43213: module._WindowsProcess(43211, "35"),
+                43214: module._WindowsProcess(43211, "5"),
+            },
+        ]
+    )
+    terminated = []
+    monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: terminated.append((pid, creation_time)),
+    )
+
+    assert module._stop_windows_tree(43210, "10") is None
+    assert terminated == [(43211, "20"), (43210, "10"), (43212, "25")]
+
+
+def test_windows_cleanup_rejects_child_after_unobserved_root_pid_reuse(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    snapshots = iter(
+        [
+            {43210: module._WindowsProcess(1, "10")},
+            {43211: module._WindowsProcess(43210, "30")},
+            {},
+        ]
+    )
+    terminated = []
+    monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: terminated.append((pid, creation_time)),
+    )
+
+    error = module._stop_windows_tree(43210, "10")
+
+    assert error is not None
+    assert "ancestry is uncertain" in error
+    assert terminated == [(43210, "10")]
+
+
+def test_stop_worker_binds_root_identity_from_process_handle(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("stdout", "stderr")
+    root_identity = Mock(return_value="100")
+    stop_tree = Mock(return_value=None)
+    monkeypatch.setattr(module, "_windows_process_creation_time", root_identity)
+    monkeypatch.setattr(module, "_stop_windows_tree", stop_tree)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    result = module._stop_worker(process)
+
+    assert result.error is None
+    root_identity.assert_called_once_with(process)
+    stop_tree.assert_called_once_with(43210, "100")
+
+
+def test_stop_worker_fails_closed_when_root_identity_cannot_be_bound(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("stdout", "stderr")
+    stop_tree = Mock(return_value=None)
+    monkeypatch.setattr(
+        module,
+        "_windows_process_creation_time",
+        Mock(side_effect=OSError("process handle unavailable")),
+    )
+    monkeypatch.setattr(module, "_stop_windows_tree", stop_tree)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    result = module._stop_worker(process)
+
+    assert result.error is not None
+    assert "cannot bind" in result.error
+    assert "process handle unavailable" in result.error
+    stop_tree.assert_not_called()
+
+
+def test_windows_cleanup_fails_closed_without_process_identity(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = SimpleNamespace(parent_pid=1, creation_time="")
+    terminate = Mock(return_value=None)
+    monkeypatch.setattr(module, "_windows_processes", lambda: {43210: process})
+    monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
+
+    error = module._stop_windows_tree(43210, "10")
+
+    assert error is not None
+    assert "identity" in error
+    terminate.assert_not_called()
+
+
+def test_windows_cleanup_reports_process_tree_that_cannot_be_verified(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    monkeypatch.setattr(
+        module,
+        "_windows_processes",
+        lambda: {
+            43210: module._WindowsProcess(1, "10"),
+            43211: module._WindowsProcess(43210, "20"),
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: "access denied" if pid == 43211 else None,
+    )
+    error = module._stop_windows_tree(43210, "10")
+    assert error is not None
+    assert "43211" in error
+    assert "access denied" in error
+    assert "still running" in error
+
+
+def test_windows_cleanup_converts_termination_timeout_to_uncertainty(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    monkeypatch.setattr(
+        module,
+        "_windows_processes",
+        lambda: {43210: module._WindowsProcess(1, "10")},
+    )
+
+    def timeout(pid, creation_time):
+        raise subprocess.TimeoutExpired(["taskkill.exe"], 5)
+
+    monkeypatch.setattr(module, "_windows_terminate_pid", timeout)
+    error = module._stop_windows_tree(43210, "10")
+    assert error is not None
+    assert "43210" in error
+    assert "timed out" in error
+
+
+def test_windows_cleanup_final_verification_detects_late_descendant(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    snapshots = iter(
+        [
+            {43210: module._WindowsProcess(1, "10")},
+            {43210: module._WindowsProcess(1, "10")},
+            {43210: module._WindowsProcess(1, "10")},
+            {43211: module._WindowsProcess(43210, "20")},
+        ]
+    )
+    monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: None,
+    )
+
+    error = module._stop_windows_tree(43210, "10")
+
+    assert error is not None
+    assert "43211" in error
+    assert "still running" in error
+
+
+def test_stop_worker_uses_verified_windows_tree_cleanup(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("stdout", "stderr")
+    stop_tree = Mock(return_value=None)
+    monkeypatch.setattr(module, "_windows_process_creation_time", Mock(return_value="10"))
+    monkeypatch.setattr(module, "_stop_windows_tree", stop_tree)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    result = module._stop_worker(process)
+
+    assert result.error is None
+    assert (result.stdout, result.stderr) == ("stdout", "stderr")
+    stop_tree.assert_called_once_with(43210, "10")
+    process.terminate.assert_not_called()
+    process.kill.assert_not_called()
+
+
+def test_stop_worker_reports_unverified_windows_tree_cleanup(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("stdout", "stderr")
+    monkeypatch.setattr(module, "_windows_process_creation_time", Mock(return_value="10"))
+    monkeypatch.setattr(
+        module,
+        "_stop_windows_tree",
+        Mock(return_value="child 43211 is still running"),
+    )
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    result = module._stop_worker(process)
+
+    assert result.error is not None
+    assert "cleanup incomplete" in result.error
+    assert "child 43211 is still running" in result.error
 
 
 def test_uncertain_owned_cleanup_is_durable_not_reconciled_to_success(
@@ -602,11 +1037,13 @@ def test_script_pfile_is_rejected_before_engine_start(local_backend, local_reque
     project = discover_matlab_project(str(root))
     data = local_request.model_dump(mode="json")
     data["project"] = project.model_dump(mode="json")
+    data.pop("project_snapshot")
     data["inputs"][role] = next(
         item.model_dump(mode="json") for item in project.entries if item.path == path
     )
     directory = tmp_path / "run"
-    result = local_backend.execute(LocalMatlabRequest.model_validate(data), directory)
+    request = bind_request(LocalMatlabRequest.model_validate(data), local_backend.snapshots)
+    result = local_backend.execute(request, directory)
     assert not (directory / "engine-starts.txt").exists()
     assert result.execution_status == "failed" and not result.valid
     assert "P-file" in " ".join(result.diagnostics)
@@ -614,14 +1051,17 @@ def test_script_pfile_is_rejected_before_engine_start(local_backend, local_reque
 
 
 @pytest.fixture
-def real_local_backend(monkeypatch):
+def real_local_backend(monkeypatch, tmp_path):
     if os.environ.get("RUN_MATLAB_TESTS") != "1":
         pytest.skip("Live MATLAB is opt-in")
     assert os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") == "1"
     from flight_agent.verification.local_matlab import LocalMatlabBackend
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
 
     monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
-    return LocalMatlabBackend.from_environment()
+    return LocalMatlabBackend.from_environment(
+        snapshots=ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    )
 
 
 @pytest.mark.matlab
@@ -647,6 +1087,7 @@ def test_real_packaged_bridge_preserves_json_provenance(real_local_backend, tmp_
         timeout_seconds=120,
     )
     directory = tmp_path / "run"
+    request = bind_request(request, real_local_backend.snapshots)
     result = real_local_backend.execute(request, directory)
     assert result.valid, result.diagnostics
     metadata = json.loads((directory / "metadata.json").read_text())
@@ -694,6 +1135,7 @@ def test_real_multi_output_optional_functions_preserve_initialization(real_local
         timeout_seconds=120,
     )
     directory = tmp_path / "run"
+    request = bind_request(request, real_local_backend.snapshots)
     result = real_local_backend.execute(request, directory)
     assert result.valid, result.diagnostics
     assert json.loads((directory / "return.json").read_text()) == {"result": 42}
@@ -725,6 +1167,7 @@ def test_real_packaged_bridge_rejects_initializer_created_pfile(real_local_backe
         timeout_seconds=120,
     )
     directory = tmp_path / "run"
+    request = bind_request(request, real_local_backend.snapshots)
     result = real_local_backend.execute(request, directory)
     assert (directory / "project" / "analyze.p").is_file(), result.diagnostics
     assert not (directory / "project" / "unintended.txt").exists(), result.diagnostics
@@ -906,11 +1349,10 @@ def test_real_stepinfo_bridge_preserves_artifact_descriptor_and_legacy_default(
     assert real_local_backend.execute(request, directory, resume=True) == result
 
     # Check the unchanged historical five-argument default in the actual language.
-    import matlab.engine
+    matlab = importlib.import_module("matlab")
+    matlab_engine = importlib.import_module("matlab.engine")
 
-    import matlab
-
-    engine = matlab.engine.start_matlab()
+    engine = matlab_engine.start_matlab()
     try:
         engine.cd(
             str(Path(__file__).resolve().parents[1] / "src/flight_agent/matlab_support"), nargout=0

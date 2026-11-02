@@ -9,8 +9,8 @@ from zipfile import BadZipFile, ZipFile
 
 from pydantic import JsonValue
 
+from ..models import MAX_RESULT
 from ..runtime.contracts import fingerprint
-from ..upload_models import MAX_RESULT
 from .contracts import ProjectConfig, relative_path
 from .intake import safe_directory
 from .matlab_contracts import MatlabEntry, MatlabProjectDescriptor

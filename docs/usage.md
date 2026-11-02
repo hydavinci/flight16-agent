@@ -3,9 +3,9 @@
 [返回项目首页](../README.md) · [项目架构](architecture.md) · [输入与输出](inputs-outputs.md)
 
 第一次使用，按“准备环境 → 配置模型 → 运行本机工程”的顺序阅读即可。
-只有需要远程执行、离线诊断或兼容入口时，再查看对应章节。
+只有一个通用 v2 运行时；远程工程与离线诊断是注册资源，没有 D1/D2 场景选择。
 
-[本机工程](#运行本机工程) · [Worker](#使用-worker) · [离线诊断](#离线诊断) · [目录 CLI](#目录-cli) · [兼容入口](#兼容入口) · [常见问题](#常见问题)
+[本机工程](#运行本机工程) · [Worker](#使用-worker) · [离线诊断](#离线诊断) · [目录 CLI](#目录-cli) · [历史清理](#历史清理) · [常见问题](#常见问题)
 
 ## 准备环境
 
@@ -16,7 +16,7 @@
 | 模型仿真 | Simulink 及工程实际使用的工具箱 |
 | `stepinfo` | Control System Toolbox |
 | Worker 裕度分析 | 另需 Simulink Control Design |
-| 大模型 | 支持工具调用的 OpenAI 兼容 API，或已登录的本机 Copilot CLI |
+| 大模型 | 支持工具调用的 OpenAI 兼容 API，或支持环境认证的本机 Copilot CLI |
 
 **Python 3.11+ 只是本项目的要求，不代表任意该版本以上的 Python 都能运行 Engine。**
 请先核对 MATLAB 发行版的 Python 兼容性。Web 与 MATLAB 可以使用不同的虚拟环境。
@@ -26,13 +26,69 @@
 在项目根目录执行，以下命令使用 macOS/Linux shell：
 
 ```bash
-python3 -m venv .venv
+python3 -m pip install uv==0.12.6
+uv sync --extra dev
 source .venv/bin/activate
-python -m pip install -e .
-cp .env.example .env
+test -e .env || cp .env.example .env
 ```
 
-已有 `.env` 时不要覆盖。安装项目不会自动安装 MATLAB、Engine 或大模型服务。
+开发依赖使用已提交的 uv.lock；CI 使用 `uv sync --locked --extra dev`，
+锁文件过期时直接失败，不在 CI 中重新解析依赖。更新依赖时先运行 `uv lock`，
+检查 uv.lock 差异并重新运行完整软件验证，再一起提交 pyproject.toml 与 uv.lock。
+`uv sync` 默认精确同步，可能移除锁文件之外安装的 MATLAB Engine。
+不要在已有 Engine 的环境中直接执行该命令；真实 MATLAB 验收使用单独的、
+已许可且 Python 版本匹配的专用环境，按开发验证章节的 `--inexact` 流程运行。
+安装 Python 依赖不代表已安装 MATLAB、Engine、工具箱或许可证。
+
+### 开发验证
+
+普通软件验证在工作树自己的 `.venv` 中执行；先按上节同步锁定依赖，再运行：
+
+```bash
+uv sync --extra dev
+uv lock --check
+RUN_BROWSER_TESTS=0 RUN_MATLAB_TESTS=0 \
+uv run --no-sync python -m pytest -m "not matlab and not browser" -q
+uv run --no-sync python -m ruff check .
+uv run --no-sync python -m mypy src
+uv run --no-sync python -m build --no-isolation
+```
+
+`--no-sync` 避免验证命令再次改动环境。浏览器测试和真实 MATLAB 验收是单独的 gate，
+不能由软件测试通过或测试跳过代替。
+
+真实 MATLAB 验收只能在管理员预先配置的专用环境中运行。`MATLAB_ACCEPTANCE_ENV`
+必须指向兼容 Python 虚拟环境的绝对路径；该环境预装与 MATLAB 发行版匹配的 Engine，
+并具备 MATLAB、Simulink、Control System Toolbox 和 Simulink Control Design 许可。
+不要把项目 `.venv`、源码目录或示例路径当作该变量的值。
+
+```bash
+test -n "$MATLAB_ACCEPTANCE_ENV"
+test -f "$MATLAB_ACCEPTANCE_ENV/pyvenv.cfg"
+test -x "$MATLAB_ACCEPTANCE_ENV/bin/python"
+export UV_PROJECT_ENVIRONMENT="$MATLAB_ACCEPTANCE_ENV"
+export MATLAB_PYTHON_EXECUTABLE="$MATLAB_ACCEPTANCE_ENV/bin/python"
+"$MATLAB_PYTHON_EXECUTABLE" -c 'import matlab.engine; print(matlab.engine.__file__)'
+uv sync --locked --extra dev --inexact --python "$MATLAB_PYTHON_EXECUTABLE"
+RUN_MATLAB_TESTS=1 MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
+uv run --no-sync python -m pytest \
+  tests/test_verification_matlab.py tests/test_local_matlab.py \
+  tests/test_local_matlab_integration.py -m matlab -v -s
+```
+
+`--inexact` 仅用于保留该专用环境中未进入 uv.lock 的 Engine，不用于常规软件 CI。
+真实 MATLAB 测试不会回退到 fake Engine；未设置 `RUN_MATLAB_TESTS=1` 时的跳过不代表
+验收通过。运行记录须包含 MATLAB 发行版、解释器、测试结果和失败原因。
+
+GitHub CI 的软件矩阵使用 Python 3.11/3.12，浏览器测试使用独立 Chromium 作业。
+真实 MATLAB 作业仅允许从默认分支手动勾选 `run_matlab`，运行于
+`[self-hosted, matlab]` runner 和受审批保护的 `matlab-acceptance` 环境；
+仓库变量 `MATLAB_ACCEPTANCE_ENV` 指向该 runner 的专用环境。PR 不触发真实 MATLAB。
+缓存仅用于 hosted job 的 uv 下载，不包含虚拟环境、浏览器、MATLAB、Engine 或证据产物；
+licensed MATLAB job 明确禁用 uv 缓存。
+
+本分支的真实 MATLAB 验收未运行；opt-in licensed gate 仍等待受保护环境、
+self-hosted runner、专用 Engine 环境、所需工具箱和许可证基础设施。
 
 ### 安装 MATLAB Engine
 
@@ -53,7 +109,6 @@ MATLAB Runtime 不能替代 MATLAB 安装与许可；工程依赖的工具箱和
 - Engine 安装：`https://www.mathworks.com/help/matlab/matlab_external/install-the-matlab-engine-for-python.html`
 - Python 兼容性：`https://www.mathworks.com/support/requirements/python-compatibility.html`
 - Engine 仓库：`https://github.com/mathworks/matlab-engine-for-python`
-- LangChain Agent：`https://docs.langchain.com/oss/python/langchain/agents`
 
 ## 配置大模型
 
@@ -78,7 +133,8 @@ LLM_TIMEOUT_SECONDS=60
 
 ### 本机 Copilot CLI
 
-macOS/Linux 上安装 GitHub Copilot CLI，执行 `copilot login` 完成登录，再修改 `.env`：
+macOS/Linux 上安装 GitHub Copilot CLI，并通过进程环境提供
+`COPILOT_GITHUB_TOKEN`、`GH_TOKEN` 或 `GITHUB_TOKEN` 之一，再修改 `.env`：
 
 ```dotenv
 LLM_PROVIDER=copilot-cli
@@ -87,15 +143,75 @@ LLM_TIMEOUT_SECONDS=180
 
 可按需设置 `LLM_MODEL` 为账户有权使用的模型；不设置时使用 CLI 自己的选择。
 若从 API 配置切换，记得检查或移除原来的 `LLM_MODEL` 占位值。
-此模式不使用 `LLM_BASE_URL` 和 `LLM_API_KEY`，也不需要复制登录凭据。
+此模式不使用 `LLM_BASE_URL` 和 `LLM_API_KEY`。规划进程不会读取用户现有的
+Copilot 配置目录或复制其中的保存登录状态；只有 CLI 支持的上述环境认证会原样传入。
+如果只有 `copilot login` 保存的本机登录状态，规划会在启动 CLI 前明确报告认证不可用；
+请改用受支持的环境认证，不要复制令牌文件、改写用户设置或降低隔离强度。
 
 CLI 须支持 JSON 输出和工具过滤。每次规划会创建新会话，使用当前账户的模型额度，
-不导入已有聊天记录。配置检查不会发起模型请求，也不会证明登录仍然有效。
+在空的临时工作目录和临时 `COPILOT_HOME` 中运行，不导入已有聊天记录、自定义指令或
+内置 MCP。文件读取、Shell、写入、URL 和 memory 工具被拒绝；会话同步、自动更新、
+客户端遥测和 Bash 环境加载被禁用，日志级别为 `none`，临时日志目标随目录删除。
+配置检查不会发起模型请求，也不会证明环境令牌仍然有效。
 
-此后端支持目录 Agent 的规划与证据解释。兼容 CLI `analyze` 和上传工作台的
-“Agent 分析”仍要求 API 后端；普通 MATLAB 执行则不依赖大模型。
+正常退出和已处理失败都会清理 `flight-agent-copilot-*` 临时目录。进程被 `SIGKILL`
+时无法保证清理；遗留目录可能包含敏感的 CLI 临时状态，须由本机管理员直接删除，
+不得收集、上传或放入支持包。
+
+此后端支持通用 Agent 的结构化规划与证据解释，不直接执行工程。
 
 全部环境变量见[配置项参考](inputs-outputs.md#环境变量)。
+
+## Copilot planning failures and isolation
+
+Copilot planning uses an empty temporary working directory and temporary
+`COPILOT_HOME`. Shell, file reads, writes, URL, and memory tools remain denied.
+Builtin MCP initialization and custom instructions are disabled; the temporary
+profile prevents unrelated user MCP/plugin configuration from being loaded.
+User configuration is never rewritten or copied.
+
+For the locally inspected Copilot CLI 1.0.105, use a supported environment
+authentication source: `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`.
+The adapter forwards authentication only to the child process, not to diagnostics
+or files. Do not paste credentials into a request or a support report.
+
+Operational limitation: no supported switch was established that both isolates
+all user MCP/plugins/session state and transparently reuses every saved-login
+profile. With saved-login-only authentication from `copilot login`, the adapter
+fails explicitly before inference; provide a supported environment authentication
+source. It does not copy saved credentials, edit settings, or retry with a less
+isolated profile. An installed CLI rejecting isolation flags is a
+`process_failure`; update the installation deliberately rather than removing
+restrictions automatically.
+
+Categories and next actions:
+
+- `authentication`: verify the supported environment authentication and account status.
+- `authorization`: verify account entitlement and requested model access.
+- `transport`: check DNS, proxy, WebSocket, and network connectivity.
+- `timeout`: inspect the remaining shared planning deadline and reduce request scope.
+- `invalid_response`: inspect the fixed summary and structured-response compatibility.
+- `process_failure`: verify installation, supported flags, and process cleanup.
+
+There is no automatic inference retry. A single existing structural correction
+may follow a complete JSON response that fails schema validation, a deterministic
+source-selection mismatch, or missing proposed delivery permission. It shares the
+original deadline and the same exact 120,000 UTF-8-byte logical-context ceiling,
+and cannot grant permission or execute a plan. Invalid JSONL, tool activity,
+incomplete responses, and provider failures are not retried. A provider failure
+during correction is terminal, so there is no third call.
+
+The authenticated conversation status API exposes durable `planning_telemetry`
+after SQLite restart. Share only its allowlisted metrics and optional six-field
+failure object, not prompts, raw CLI output, environment variables, credentials,
+or source documents.
+
+Temporary state is removed on success and handled failures. A forcibly killed
+parent can leave `flight-agent-copilot-*` directories in the operating-system
+temporary location. Treat orphaned directories as sensitive, remove them locally
+after confirming no associated process is active, and never attach them to a
+support bundle. Disabled application diagnostics do not imply any guarantee
+about the provider's own server-side retention policy.
 
 ## 运行本机工程
 
@@ -210,7 +326,7 @@ condition: bench
 规格、版本和哈希全部匹配时才复用数值证据，只改阈值不必重跑相同计算。
 
 已知失败可以显式重试。执行状态未知时只能核对原调用 ID，不能自动重发；
-关闭浏览器或客户端超时都不代表后台计算已停止。旧 v1 任务每个基线最多保留一次恢复提案。
+关闭浏览器或客户端超时都不代表后台计算已停止。
 解释失败原因不会自动把任务变成已完成，也不会清除原来的待办决定。
 
 完整 MATLAB 日志位于调用目录的 `local-matlab/matlab.log`；
@@ -228,8 +344,8 @@ condition: bench
 指标摘要最多显示 6 位有效数字，完整精度、条件和来源在详情中。
 聊天仅在显示时去除结构化输入的结束标记，服务器原文和报告来源不变。
 
-“运行环境”中的“MATLAB分析工作台”进入兼容上传页面；
-工作台顶部“返回 Flight Agent”可回到会话页。
+`/` 是通用 Agent 首页；`/workbench` 是独立的单文件 MATLAB 工作台。
+工作台只调用已配置的 Worker，不在 Web 进程或 Agent 主机启动 MATLAB，也没有本机回退。
 
 同一桌面 macOS 可启用系统目录选择器：
 
@@ -242,7 +358,7 @@ flight-agent web --native-directory-picker --port 8000
 
 ## 使用 Worker
 
-只有选择 `simulink_project` 或使用兼容上传后端时才需要 Worker。
+使用 `simulink_project` 注册资源或 `/workbench` 单文件执行时需要 Worker。
 Worker 可以与 Web 同机，也可以部署在另一台有 MATLAB 的计算机器上。
 远程路径不会自动上传工程。
 
@@ -251,7 +367,6 @@ Worker 可以与 Web 同机，也可以部署在另一台有 MATLAB 的计算机
 ```dotenv
 MATLAB_WORKER_TOKEN=replace-with-at-least-32-random-ASCII-characters
 MATLAB_ALLOW_TRUSTED_PROJECTS=1
-MATLAB_ALLOW_TRUSTED_UPLOADS=0
 ```
 
 自行生成随机令牌并安全复制到两端，不要直接使用上面的占位值：
@@ -283,10 +398,38 @@ ssh -N -L 9001:127.0.0.1:9001 USER@MATLAB_HOST
 后者只内置已准备 F-16 布局，其他工程需提供 `flight-agent.project.json`。
 阶跃分析沿用初始化后的模型设置；裕度分析读取已有的 `openinput/openoutput` 点、
 工作点模式和反馈符号，不通过聊天猜断点或重写仿真参数。
-完整准备方式见 [D1 参考](d1-agent.md)。
+完整准备方式见 [Simulink Worker 参考](simulink-worker.md)。
 
-目录执行有 Windows 进程清理路径，但尚未在 Windows 实机验收；
-兼容上传与固定算例 CLI 仍要求 macOS/Linux。原生依赖必须匹配执行平台。
+目录执行有 Windows 进程清理路径，但尚未在 Windows 实机验收。
+原生依赖必须匹配执行平台。
+
+### 单文件工作台启动与信任边界
+
+如果 Worker 的专用 MATLAB Engine 环境是 `.venv-matlab`，Web 环境是 `.venv`，
+可从项目根目录运行：
+
+```bash
+MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
+MATLAB_WORKER_TOKEN='0123456789abcdef0123456789abcdef' \
+.venv-matlab/bin/flight-agent worker --port 9001
+
+MATLAB_WORKER_URL='http://127.0.0.1:9001' \
+MATLAB_WORKER_TOKEN='0123456789abcdef0123456789abcdef' \
+.venv/bin/flight-agent web --native-directory-picker --port 8000
+```
+
+示例令牌须替换为两端共享的随机私密值。访问 `/workbench` 后，可载入仓库中的
+`examples/web_script.m` 或 `examples/web_function.m`；前者读取 `params` 并赋值
+`result`，后者声明 `function result = web_function(params)`。两者都会创建图形。
+
+单文件源码是用户授权的可信代码，以 Worker 服务账户的文件、网络和进程权限执行，
+不是容器或安全沙箱。`MATLAB_ALLOW_TRUSTED_PROJECTS=1` 是部署级显式许可，
+不能证明任意上传代码安全。Worker 未配置或不可用时，页面明确失败；Web 不会改在本机执行。
+
+Worker 将请求、状态、执行日志、回执和图表保存在
+`runs/workbench-worker/<run-id>/`。Web 不复制或拥有这些运行记录。完成、失败或服务重启
+都不会自动删除它们；管理员应按组织的保留、备份和安全删除策略停止相关服务后清理。
+不要把运行目录提交到 Git 或作为未经审查的支持附件。
 
 ## 离线诊断
 
@@ -298,12 +441,15 @@ ssh -N -L 9001:127.0.0.1:9001 USER@MATLAB_HOST
 确认前核对版本、数据指纹、假设、只读能力、参数与预算。
 后续分析只能在已确认范围内变化，最多保留 8 个假设，不删除已有 ID 或改写原始基线。
 
-报告保留问题、定位、责任归属、假设演进、证据引用和停止原因。
+诊断成果包含最终 findings（问题、定位、责任归属、各假设的最终证据状态与引用）、
+停止原因和局限；
+假设演进与逐轮修订历史保留在内部 checkpoint 中，不等于最终交付内容。
+只有已确认请求要求 JSON / Word 时才生成相应报告，单独诊断不会自动追加报告。
 支持/反驳/未知是本次证据状态，不是唯一根因证明；
 高/中/低优先级表示分析顺序，不是置信度。建议不会自动修改设计或补跑 Simulink。
 
 恢复时有有效回执才复用；在途调用缺少可核验回执会以 `unknown_execution` 停止，
-不会自动补跑。格式、能力参数与恢复边界见 [D2 参考](d2-agent.md)。
+不会自动补跑。格式、能力参数与恢复边界见[离线诊断参考](offline-diagnostics.md)。
 
 ## 目录 CLI
 
@@ -329,72 +475,60 @@ flight-agent directory-task resume CONVERSATION_ID
 单消息形式仍可用 `--request`，不能和 `--analysis-request` 混用。
 `--output-root` 指定 Agent 成果根目录，空字符串恢复默认位置。
 
-旧 `--scenario d1/d2` 只分别映射 Worker 工程和 Agent 离线数据位置；
-`auto` 不选资源，均不会自动注入场景判据。
+使用明确注册的 `--location`；不支持 `--scenario`、场景别名或工作流选择。
 CLI 自行获取页面令牌，只连接本机 HTTP origin，不跟随重定向或环境代理。
 等待超时不会取消服务端任务，请先查询状态，勿重复提交。
 
-## 兼容入口
+## 支持的命令
 
-这些入口保留旧流程，与本机目录 Agent 的输入契约不同。
+| 命令 | 用途 |
+|---|---|
+| `doctor` | 只检查模型配置与 Engine 导入，不启动 MATLAB 或请求模型 |
+| `web` | 启动唯一的通用 Agent 工作台 |
+| `worker` | 启动受控 Simulink 工程计算服务 |
+| `directory-task propose/confirm/status/resume` | 连接本机 Web，共用确认、执行与恢复链路 |
+| `cleanup-legacy` | 默认只读预览，显式 `--apply` 才清理正面识别的旧记录 |
 
-### 单文件上传工作台
+不支持旧 `analyze`、上传/demo、工作流目录或恢复提案 `replan` 接口。
+目录 CLI 的退出码 0 不等于判据通过；1 表示失败/中断或请求错误，130 表示用户中断。
 
-打开 `/workbench`，在 Worker 端设置 `MATLAB_ALLOW_TRUSTED_UPLOADS=1`：
-选择单个 UTF-8 `.m` 文件，填写 JSON 参数，确认可信代码后运行。
-页面显示程序返回的 `result`、日志和 PNG，不自动导出整个工作区。
+## 历史清理
 
-函数形式：
+运行时将会话状态保存在 `runs/verification/conversations.sqlite3`，不读取或迁移
+旧 `conversation.json` 记录（包括 v1 和 v2）。首次切换前会验证并备份旧运行目录；
+旧记录与成果不会被自动删除，但不会出现在新的会话列表中。
 
-```matlab
-function result = example_function(params)
-result = struct('value', params.value * 2);
-end
-```
-
-脚本形式读取同一个 `params` 并赋值 `result`：
-
-```matlab
-result = struct('value', params.value * 2);
-```
-
-传入 `{"value": 3}` 时，上例返回 `{"value": 6}`。只有实际绘图才有图片。
-函数名须与文件名一致；脚本不能清掉 `params`，也不能依赖交互输入或未上传的配套文件。
-不支持 ZIP、多文件、`.mlx` 或 `.slx`；完整限制见[兼容入口契约](inputs-outputs.md#兼容入口契约)。
-
-“Agent 分析”复用已完成计算，不重跑 `.m`；只有符合演示指标契约的结果才可按演示规则判定。
-示例见 `examples/web_script.m`、`examples/web_function.m`、`examples/web_metrics.m`。
-普通波形结果不适用飞行器演示规则，显示 `undetermined` 是预期行为。
-
-上传源码发送给 Worker，不作为源码附件发送给模型；请求分析时，结果可能进入模型上下文。
-重启后旧上传任务标记为 `interrupted`，不自动重跑。
-网络中断不表示远端终止，应按页面记录的远程 ID 核查。
-
-### 固定算例 CLI
+在停止相关服务并核对备份后，从项目根目录运行：
 
 ```bash
-flight-agent doctor
-flight-agent analyze examples/parameters.json \
-  --request "检查演示要求，并引用知识库解释结果。"
+flight-agent cleanup-legacy --project-root /absolute/path/to/flight-agent
+flight-agent cleanup-legacy --project-root /absolute/path/to/flight-agent --apply
 ```
 
-`doctor` 只检查配置和演示文件，不启动 MATLAB 或请求模型。
-`analyze` 只读取 JSON 参数，调用固定的 `matlab/analyze_demo.m`；
-它不是已有工程目录入口，也不执行用户上传文件。
+第一条是 dry-run，仅报告 `runs/verification/` 下的 `v1/v2/unknown/deleted`，
+不修改运行目录；第二条才删除正面识别为 v1 的会话目录。要求该运行目录已存在。
+未知/损坏记录、v2、符号链接和外部成果目录不会被删除。
+清理先盘点全部记录，保留任何记录引用的源工程，以及保留记录引用的任务资源和成果位置。
+清理通过 Python `tempfile` 在系统临时目录创建并移除私有快照，且拒绝把快照放在
+实时数据库目录内；当前工作目录无需可写，也可以位于数据库目录之内。快照检查 SQLite
+数据库及其当前、归档任务的源和成果所有权，不打开或修改运行目录内的数据库和
+sidecar 文件。所有源定位器会逐段跟踪绝对或相对符号链接；链路经过待删目录时会保留
+该目录，循环、缺失、非普通文件或遍历期间变化都会令整次删除失败关闭。
+启动拒绝损坏或不支持的数据库之前，也会在私有快照上验证。启动在首次可能恢复或写入
+SQLite 的操作完成前持有数据库目录的协作式独占锁和已盘点文件描述符，并在按路径打开
+SQLite 后、执行第一条 SQL 前再次核对主文件和 sidecar 的身份与内容。
+快照或启动期间检测到文件变化时会拒绝操作。
+数据库损坏、版本不支持或所有权无法确定时，不删除任何候选目录。
+若这些路径与待删目录重叠，则保留该目录；必需存在的源或成果路径无法严格解析、
+或跨记录归属证据无法解析时，整次清理不执行删除，须人工处理后重试。
+尚未确认且没有已发布证据的任务目录可以不存在。
+清理不猜测路径，也不递归清理外部交付目录。
+只有 `deleted` 列出的目录实际被删除，不能把全部 `v1` 都当作已删。
 
-可指定 `--project-root`、`--matlab-timeout` 和 `--max-steps`。
-参数相对路径以项目根目录为基准；未激活环境时，可用 `.venv/bin/flight-agent`
-或该环境的 `python -m flight_agent`。
-
-退出码 0 表示报告生成，不代表通过；1 表示执行/报告失败，130 表示用户中断。
-实际结论在 `assessment.json`，字段与文件说明见[兼容入口契约](inputs-outputs.md#兼容入口契约)。
-
-其工具循环可重复检索并复用同次计算，但不能修改输入、固定入口或规则。
-检索使用中文双字词项和英文词项匹配，不是向量检索；无匹配返回空结果。
-解释的引用完整性检查不等于已证明模型文字正确，仍需人工复核。
-
-超时会清理本次 worker 及同进程组后代。若出现 `MATLAB cleanup incomplete`，
-原失败原因与进程组 ID 会保留；须人工核查，不应视作已清理成功。
+SQLite 启动按离线、单所有者契约设计：同一运行目录的维护者必须遵守目录锁，启动期间
+不得由非协作进程替换数据库路径。标准库 `sqlite3` 不能从预先打开的文件描述符创建连接，
+也不暴露 SQLite VFS/file-control；因此非协作进程仍可在“打开后身份复核”和第一条 SQL
+之间再次替换路径。完全消除此剩余威胁需要受控原生 VFS/适配器，而不是 Python 标准库。
 
 ## 常见问题
 
@@ -422,3 +556,71 @@ flight-agent analyze examples/parameters.json \
 
 自带算例和离线数据是软件演示。仓库不包含真实 F-16 模型或审核过的航空标准；
 合成回归、报告生成和数值判据均不能代替具体工程的独立验收。
+
+## Scheduler isolation
+
+Independent conversations can plan concurrently. The default planning limit is
+four active jobs plus 32 queued jobs. A conversation admits one operation at a
+time; sending another request does not create a second active turn or authorize
+a new baseline. A conflict response does not append another user message.
+
+Local MATLAB defaults to **one** slot. `FLIGHT_LOCAL_MATLAB_SLOTS` accepts 1–8.
+`FLIGHT_REMOTE_WORKER_SLOTS` defaults to 1 and accepts 1–16.
+`FLIGHT_READ_ONLY_SLOTS` defaults to 4 and accepts 1–32. Delivery still requires
+its confirmed write permission even though it uses the general/read-only lane.
+The server selects lanes from registered effects and scheduling metadata;
+requests and model plans cannot select a lane.
+
+`FLIGHT_PLANNING_WORKERS` accepts 1–32; `FLIGHT_PLANNING_QUEUE` accepts 0–256.
+`FLIGHT_EXECUTION_TURNS` defaults to 32, accepts 1–64, and must cover the sum of
+the three execution-lane limits. It bounds coordination threads, including
+threads waiting for a lane. These are per-process limits, not distributed
+quotas. Run one Web process per writable state root. A remote limit does not
+override the remote Worker's independent capacity.
+
+Queued requests return HTTP 202 and remain visible as `queued`; the CLI and
+workbench continue polling. Full admission capacity returns HTTP 429 with
+`detail.code=scheduler_capacity` and `Retry-After: 1`, without creating a
+conversation or appending a message. Shutdown refuses new work with HTTP 503
+and drains admitted work so all thread-owned SQLite contexts have exited. No cancellation
+or automatic inference retry is introduced.
+
+After an abrupt restart, queued work is not replayed. A queued confirmation
+returns to its original confirmation state. Interrupted follow-up planning
+restores the original task state. A confirmed task waiting for a lane can be
+explicitly resumed; no dispatched call existed until the permit was acquired.
+An already dispatched unknown call retains its identity and budget charge and
+cannot be retried until the original operation is reconciled. Existing evidence
+and source project directories are not removed by scheduler recovery.
+
+### Snapshot confirmation and cleanup
+
+A changed source fingerprint before confirmation requires rediscovery and a new
+confirmation. After confirmation, local operations use the selected immutable
+snapshot even if the original source is edited or removed. Worker project and
+offline diagnostic resource verification retain their existing behavior.
+
+Historical v2 confirmations and invocation hashes remain readable. A historical
+local task without a snapshot binding cannot dispatch new project work; propose
+and confirm a new baseline. An unresolved historical call must first reconcile
+its original receipt and is never resubmitted automatically.
+New invocation receipts keep compact snapshot lineage only; the confirmed
+baseline remains the authoritative full manifest. Historical receipts that
+already contain a full manifest are verified in place and are not rewritten.
+
+From the application checkout, preview snapshot cleanup for the default store:
+
+    python -c "from pathlib import Path; from flight_agent.verification.store import ConversationStore; print(ConversationStore(Path('runs/verification').resolve()).cleanup_project_snapshots())"
+
+After reviewing the report, delete only verified unreferenced managed objects:
+
+    python -c "from pathlib import Path; from flight_agent.verification.store import ConversationStore; print(ConversationStore(Path('runs/verification').resolve()).cleanup_project_snapshots(dry_run=False))"
+
+Use the actual conversation-store root if the application runs in another state
+directory. A database error prevents deletion. Corrupt or ambiguous objects are
+reported for manual investigation. Completion alone never releases evidence
+retention, and deleting external files is not a request to release their snapshot.
+The report may list exact internal `.publish-*` or `.quarantine-*` residue names
+in `would_delete`, `deleted`, or `staging`. These entries are reclaimed only when
+their name, containment, ownership, manifest identity, and inventory all verify;
+retained, malformed, linked, symlinked, reparse, or special entries are skipped.

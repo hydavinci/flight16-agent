@@ -4,6 +4,7 @@
 
 本文是字段和文件参考。首次运行请先看使用指南；
 接入客户端或核对结果时，再按下面的主题查阅。
+所有请求进入同一个通用 v2 运行时；Worker 工程与离线数据是注册资源，不是场景产品。
 
 [请求](#会话请求) · [判据](#判据与确认) · [预算](#方案与预算) · [结果](#输出状态) · [文件](#报告与证据文件) · [接口](#状态与下载接口)
 
@@ -58,10 +59,10 @@ Worker 工程路径支持 POSIX、Windows 盘符及 UNC，成果路径始终以 
 | `location` | 可选，最多 128 字符 | 注册资源位置 ID |
 | `project_root` | 可选，最多 4096 字符 | 对应资源主机上的目录 |
 | `output_root` | 可选，最多 4096 字符 | Agent 成果根目录，显式空字符串恢复默认 |
-| `scenario` | 可选 `auto/d1/d2` | 历史资源别名；新客户端优先用 `location` |
 
 结构化输入合并后总长度也不得超过 4000 字符，包含内部边界标记；
 不能理解为两栏同时各有 4000 字符额度。未知字段、空白需求和冲突形式会被拒绝。
+不接收场景选择或场景别名；使用明确的注册位置 ID，不使用有歧义的 `agent` 主机别名。
 
 分析要求和判据原文会保留。页面隐藏外层结束标记只影响显示，不改变来源引用。
 目录、阈值、范围或交付变化后须确认新基线，不能沿用旧确认。
@@ -98,7 +99,8 @@ prepared-project/
 调节带是 `0 < 值 < 1` 的比例，5% 应填 `0.05`；它不是验收阈值。
 
 完整模型见 [matlab_contracts.py](../src/flight_agent/verification/matlab_contracts.py)。
-Worker 准备契约见 [D1 参考](d1-agent.md)，离线清单与数据格式见 [D2 参考](d2-agent.md)。
+Worker 准备契约见 [Simulink Worker 参考](simulink-worker.md)，
+离线清单与数据格式见[离线诊断参考](offline-diagnostics.md)。
 
 ### 本机线性化与裕度
 
@@ -181,7 +183,7 @@ draft 中不手填工件，而写：
 来源可为用户消息、标准文件或明确采纳的示例；文件/示例来源还须有 SHA-256 身份。
 示例里的节点名和消息引用必须替换为本次方案的真实来源。
 
-没有自动生效的“常用阈值”。旧演示的 10%、3 s、0 dB、0° 也只有明确采纳才可使用。
+没有自动生效的“常用阈值”。10%、3 s、0 dB、0° 等值也只有明确来源才可使用。
 稳态窗口、波动与漂移筛选是数值有效性策略，不是验收标准。
 
 确认接口为 `POST /api/conversations/{id}/confirm`：
@@ -224,7 +226,6 @@ v2 基线固定 `requirements/resources/nodes`、能力快照、`allowed_effects
 | `MATLAB_PYTHON_EXECUTABLE` | 本机探测与执行的兼容 Python；省略时使用 Web 解释器 |
 | `MATLAB_ALLOW_TRUSTED_PROJECTS` | 设为 `1` 才允许可信目录工程执行 |
 | `MATLAB_WORKER_URL`、`MATLAB_WORKER_TOKEN` | Worker 地址与两端一致的令牌 |
-| `MATLAB_ALLOW_TRUSTED_UPLOADS` | 只用于兼容上传，与工程开关独立 |
 
 这些配置不会安装 MATLAB、工具箱或原生依赖。“已配置”或“导入通过”均不保证真实调用成功。
 
@@ -244,7 +245,6 @@ v2 基线固定 `requirements/resources/nodes`、能力快照、`allowed_effects
 
 v2 请求总体结论时，任一所需项无法判定，则总体为 `undetermined`；
 否则有失败项为 `fail`，全部通过才为 `pass`。未请求总体结论时状态为空，纯分析没有评价结果。
-固定算例 CLI 的历史优先级不同，见文末兼容契约。
 
 ## 通用结果字段
 
@@ -326,8 +326,7 @@ Word 保留条件、有效性、判据原文与身份、单项/总体评价、�
 它必须来自确认的直接依赖工件，不能用模型编写的数组代替。
 
 `raw.mat`、`runtime-metadata.json`、可序列化函数返回值等按实际执行保存。
-诊断及旧 v1 任务可能使用 `diagnosis.docx`、`delivery-v<version>/` 等命名；
-请按 `artifacts` 清单下载，不猜文件名。
+诊断内部证据与检查点按能力保存；请按通用 `artifacts` 清单下载，不猜文件名。
 
 ## 成果存放位置
 
@@ -335,15 +334,13 @@ Word 保留条件、有效性、判据原文与身份、单项/总体评价、�
 
 ```text
 runs/
-|-- verification/<conversation_id>/
-|   |-- conversation.json
-|   `-- tasks/<task_id>/
+|-- verification/
+|   |-- conversations.sqlite3
+|   `-- <conversation_id>/tasks/<task_id>/
 |       |-- agent/
 |       |-- calls/
 |       `-- delivery/
-|-- verification-worker/<run_id>/  # Worker 记录及 project/ 副本
-|-- web/<job_id>/                  # 兼容上传 Web 记录
-`-- worker/<job_id>/               # Worker 上传记录
+`-- verification-worker/<run_id>/  # Worker 记录及 project/ 副本
 ```
 
 设置 `output_root=/absolute/path/to/results` 后，该任务成果目录改为：
@@ -352,7 +349,7 @@ runs/
 /absolute/path/to/results/flight-agent-<task_id>/
 ```
 
-会话索引仍位于默认 `verification/<conversation_id>/conversation.json`。
+会话索引位于默认 `verification/conversations.sqlite3`。
 新任务获得新 ID/目录，旧交付不变。两种位置均由
 [ConversationStore](../src/flight_agent/verification/store.py) 核对路径与所有权。
 没有执行到的阶段不生成对应假结果文件。
@@ -376,66 +373,15 @@ runs/
 | POST | `/api/conversations/{id}/retry` | 已知失败后显式重试，仍需版本与可信确认 |
 | GET | `/api/conversations/{id}/tasks/{task_id}/artifacts/{name}` | 下载登记文件 |
 
-`name` 是清单内的完整相对路径，可包含子目录。下载检查文件身份和摘要，旧任务也保留入口。
+`name` 是清单内的完整相对路径，可包含子目录。下载检查文件身份和摘要，归档 v2 任务保留入口。
 202、报告生成或 CLI 返回 0，均不单独证明工程判据通过。
 
-## 兼容入口契约
+## 不支持的历史与入口
 
-### 单文件上传
+旧上传/demo、场景与工作流选择、保存恢复提案及 v1 历史均不受支持。
+v1 记录不执行、不恢复、不生成兼容投影。`/workbench` 只展示同一个通用 Agent，
+不是上传页面；旧上传 API 不存在。
 
-输入为一个 UTF-8 `.m` 和 JSON 对象 `params`，输出为程序明确返回的可 JSON 序列化 `result`。
-函数使用 `result = 函数名(params)`，脚本读取 `params` 并赋值 `result`。
-普通波形示例用 `frequency_hz/amplitude/samples`，演示指标示例使用
-[parameters.json](../examples/parameters.json)。
-
-| 限制 | 上限 |
-|---|---|
-| 源文件 / 参数 / 整体请求 | 1 MB / 100 KB / 2 MB |
-| JSON 结果 / 日志 | 约 4 MB / 1 MB |
-| PNG | 最多 5 张，每张 2 MB、1600 万像素 |
-| 超时 | 1～600 秒 |
-
-结果不含 NaN/Infinity；图形通过 `exportgraphics` 导出，不支持的对象/UI 图形会失败。
-轮询和超时不是系统级资源配额。浏览器保留原始 JSON 数字文本，避免额外 JavaScript 舍入，
-但不会改变 MATLAB 数值类型或提供任意精度计算。
-
-Web 与 Worker 任务 ID 分开记录。切换任务时先禁用旧结果的分析/下载，确认新身份与内容后才恢复。
-最近任务保留 20 项；目录与普通上传的恢复规则不同，详见[使用指南](usage.md#单文件上传工作台)。
-
-### 固定算例 CLI
-
-`analyze` 输入见 [models.py](../src/flight_agent/models.py)，只接受固定演示契约：
-
-| 字段 | 单位/约束 |
-|---|---|
-| `schema_version` | `1.0` |
-| `aircraft_type` | `demo_fixed_wing` |
-| `condition` | `demo_cruise` |
-| `mass_kg` | kg，有限正数 |
-| `wing_area_m2` | m²，有限正数 |
-| `airspeed_mps` | m/s，有限正数 |
-| `air_density_kg_m3` | kg/m³，有限正数 |
-| `thrust_n` | N，有限非负数 |
-
-未知字段、数值字符串、布尔值、NaN/Infinity 和不合要求的数值会被拒绝。
-其结果位于 `runs/<UTC时间>-<随机ID>/`，不同于目录任务：
-
-| 文件 | 内容 |
-|---|---|
-| `input.json`、`metadata.json` | 参数、执行状态、摘要与版本 |
-| `rules.json`、`matlab_source.m` | 规则和入口快照 |
-| `result.json`、`matlab.log` | 计算结果与日志 |
-| `assessment.json` | 全量规则检查与覆盖 |
-| `evidence.json`、`messages.json` | 检索证据与工具循环记录 |
-| `report.md` | 程序判定、独立模型解释和来源 |
-
-旧规则支持 `< <= > >=`，不做单位转换、不暗加容差。
-实测 `value_unit` 与判据 `unit` 分别保存，旧记录缺实测单位时显示未知，不补造或改写旧报告。
-
-旧状态优先级为：有失败项则 `fail`；否则缺项为 `undetermined`；
-全部适用项通过为 `pass`；没有适用项为 `not_applicable`，不能当作通过。
-这与 v2 总体判定的“无法判定优先”不同。
-
-失败保留已有结果，不伪造未完成阶段；日志不是跨进程自动续算或 exactly-once 保证。
-模型解释和建议需要人工复核。知识引用形如 `[KB:文档ID]`，同文档不同片段累积保留，
-完全重复片段去重；引用完整性检查不证明文字一定忠实或正确。
+历史清理通过 CLI `cleanup-legacy --project-root ...` 预览，
+显式加 `--apply` 才删除正面识别的 v1 会话目录。保留 v2、未知记录、源工程与外部成果；
+源路径无法严格解析时不删。完整行为见[历史清理](usage.md#历史清理)。

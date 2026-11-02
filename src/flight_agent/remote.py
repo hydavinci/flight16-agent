@@ -1,20 +1,16 @@
 import os
 import time
-from collections.abc import Callable
-from pathlib import Path
 from typing import Self
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
+from pydantic import TypeAdapter
 
-from .upload_engine import validate_png
-from .upload_models import (
-    MAX_FIGURE,
-    MAX_LOG,
-    MAX_RESPONSE,
-    ExecutionOutput,
-    JobRecord,
-    UploadRequest,
+from .workbench_contracts import (
+    MAX_WORKBENCH_FIGURE_BYTES,
+    WorkbenchRunRecord,
+    WorkbenchRunRequest,
+    workbench_artifact_path,
 )
 
 
@@ -22,7 +18,13 @@ class RemoteError(RuntimeError):
     pass
 
 
-class RemoteWorker:
+class RemoteHTTPError(RemoteError):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+
+
+class RemoteClient:
     def __init__(self, url: str, token: str, client: httpx.Client | None = None):
         parts = urlsplit(url)
         if (
@@ -59,7 +61,8 @@ class RemoteWorker:
         path: str,
         deadline: float,
         payload: dict[str, object] | None = None,
-        limit: int = MAX_RESPONSE,
+        *,
+        limit: int = 8_000_000,
     ) -> bytes:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -73,7 +76,8 @@ class RemoteWorker:
             follow_redirects=False,
         ) as response:
             if not response.is_success:
-                raise RemoteError(
+                raise RemoteHTTPError(
+                    response.status_code,
                     f"Worker returned HTTP {response.status_code}; submission not retried"
                 )
             chunks: list[bytes] = []
@@ -87,56 +91,51 @@ class RemoteWorker:
                 chunks.append(chunk)
             return b"".join(chunks)
 
-    def run(
+    def _workbench_request(
         self,
-        directory: Path,
-        request: UploadRequest,
-        on_submitted: Callable[[str], None],
-    ) -> ExecutionOutput:
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+        *,
+        limit: int = 8_000_000,
+    ) -> bytes:
         client = self.client or httpx.Client(trust_env=False)
-        remote_id: str | None = None
-        deadline = time.monotonic() + request.timeout_seconds + 30
         try:
-            record = JobRecord.model_validate_json(
-                self._request(client, "POST", "/jobs", deadline, request.model_dump())
+            return self._request(
+                client,
+                method,
+                path,
+                time.monotonic() + 30,
+                payload,
+                limit=limit,
             )
-            remote_id = record.id
-            on_submitted(remote_id)
-            while record.status in ("queued", "running"):
-                time.sleep(0.25)
-                record = JobRecord.model_validate_json(
-                    self._request(client, "GET", f"/jobs/{remote_id}", deadline)
-                )
-                if record.id != remote_id:
-                    raise RemoteError("Worker returned a different job ID")
-            directory.mkdir(parents=True, exist_ok=True)
-            if len(record.log.encode("utf-8")) > MAX_LOG:
-                raise RemoteError("Worker log exceeds size limit")
-            (directory / "matlab.log").write_text(record.log, encoding="utf-8")
-            if record.status != "completed":
-                raise RemoteError(f"Worker {record.status}: {record.error or 'no error detail'}")
-            output = ExecutionOutput(
-                result=record.result,
-                matlab_version=record.matlab_version or "",
-                log=record.log,
-                figures=record.figures,
-            )
-            for name in output.figures:
-                content = self._request(
-                    client, "GET", f"/jobs/{remote_id}/artifacts/{name}", deadline, limit=MAX_FIGURE
-                )
-                path = directory / name
-                path.write_bytes(content)
-                validate_png(path)
-            (directory / "matlab.log").write_text(output.log, encoding="utf-8")
-            (directory / "output.json").write_text(output.model_dump_json(), encoding="utf-8")
-            return output
-        except (httpx.HTTPError, ValueError, RemoteError) as exc:
-            location = remote_id or "unknown (submission acknowledgement not received)"
-            raise RemoteError(
-                f"{exc}. Remote job: {location}. Execution was not automatically retried "
-                "or cancelled; check the worker before resubmitting."
-            ) from exc
         finally:
             if self.client is None:
                 client.close()
+
+    def submit_workbench(self, request: WorkbenchRunRequest) -> WorkbenchRunRecord:
+        return WorkbenchRunRecord.model_validate_json(
+            self._workbench_request(
+                "POST",
+                "/workbench/runs",
+                request.model_dump(mode="json"),
+            )
+        )
+
+    def recent_workbench(self) -> list[WorkbenchRunRecord]:
+        return TypeAdapter(list[WorkbenchRunRecord]).validate_json(
+            self._workbench_request("GET", "/workbench/runs")
+        )
+
+    def workbench_status(self, run_id: str) -> WorkbenchRunRecord:
+        return WorkbenchRunRecord.model_validate_json(
+            self._workbench_request("GET", f"/workbench/runs/{run_id}")
+        )
+
+    def workbench_artifact(self, run_id: str, path: str) -> bytes:
+        path = workbench_artifact_path(path)
+        return self._workbench_request(
+            "GET",
+            f"/workbench/runs/{run_id}/artifacts/{quote(path, safe='/')}",
+            limit=MAX_WORKBENCH_FIGURE_BYTES,
+        )

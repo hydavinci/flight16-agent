@@ -21,14 +21,15 @@ from flight_agent.verification.agent_runtime import (
 )
 from flight_agent.verification.local_matlab import LocalMatlabBackend
 from flight_agent.verification.matlab_contracts import StepinfoInput
+from flight_agent.verification.project_snapshots import ProjectSnapshotStore
 from tests.matlab_project_helpers import prepared_project
 
 
 class RecordingBackend(LocalMatlabBackend):
     """Real local lifecycle with the subprocess's explicitly fake Engine only."""
 
-    def __init__(self):
-        super().__init__(sys.executable)
+    def __init__(self, snapshots):
+        super().__init__(sys.executable, snapshots=snapshots)
         self.requests = []
         self.lose_ack = False
         self.checkpoint = lambda: None
@@ -58,6 +59,9 @@ def local_adapter_case(tmp_path, monkeypatch):
         ),
     )
     project = discover_matlab_project(str(prepared_project(tmp_path / "source")))
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    with snapshots.guard():
+        binding = snapshots.ensure(project)
     resource = ResourceReference(
         id="local_project",
         kind="matlab_project",
@@ -86,8 +90,10 @@ def local_adapter_case(tmp_path, monkeypatch):
         load_checkpoint=lambda: saved.get("checkpoint"),
         save_checkpoint=lambda value: saved.update(checkpoint=value),
         _resource_roles={"project": resource},
+        work_directory=tmp_path / "managed" / "work" / "calls" / ("a" * 32),
+        _project_snapshots={resource.id: binding},
     )
-    backend = RecordingBackend()
+    backend = RecordingBackend(snapshots)
     backend.checkpoint = context.load_checkpoint
     tools = CapabilityRegistry(agent_mode=True)
     module = importlib.import_module("flight_agent.verification.adapters.local_matlab")
@@ -117,6 +123,7 @@ def metric_case(case, band=0.05):
         load_checkpoint=lambda: saved.get("checkpoint"),
         save_checkpoint=lambda value: saved.update(checkpoint=value),
         _resource_roles={},
+        work_directory=context.work_directory.parent / ("b" * 32),
     )
     backend.checkpoint = metric_context.load_checkpoint
     return (
@@ -129,6 +136,20 @@ def metric_case(case, band=0.05):
         backend,
         tools,
     )
+
+
+def test_all_local_matlab_capabilities_record_one_backend_owner(tmp_path):
+    module = importlib.import_module("flight_agent.verification.adapters.local_matlab")
+    backend = LocalMatlabBackend(
+        sys.executable,
+        snapshots=ProjectSnapshotStore(tmp_path / "managed" / "snapshots"),
+    )
+    capabilities = module.local_matlab_capabilities(backend)
+
+    assert tuple(capability.name for capability in capabilities) == (
+        module.LOCAL_MATLAB_CAPABILITY_NAMES
+    )
+    assert all(capability.runtime_owner is backend for capability in capabilities)
 
 
 def test_execution_publishes_series_with_actual_producer_and_call(local_adapter_case):
@@ -146,6 +167,20 @@ def test_execution_publishes_series_with_actual_producer_and_call(local_adapter_
     assert request.id == context.call_id and not resume
     assert request.project.fingerprint == context.resource("project").fingerprint
     assert context.load_checkpoint()["request"] == request.model_dump(mode="json")
+
+
+def test_adapter_uses_internal_work_not_external_evidence_directory(local_adapter_case):
+    context, inputs, backend, tools = local_adapter_case
+    output = CapabilityOutcome.model_validate(
+        tools.invoke("matlab_execute_project", inputs, context, context.scope)
+    )
+    run = context.work_directory / "local-matlab"
+    assert (run / "request.json").is_file()
+    assert not list(context.directory.rglob("request.json"))
+    assert not list(context.directory.rglob("state.json"))
+    assert not list(context.directory.rglob("execution.json"))
+    assert all((context.directory / item.path).is_file() for item in output.artifacts)
+    assert backend.requests[0][0].project_snapshot == context.project_snapshot("project")
 
 
 def test_entry_without_paired_selectors_retains_only_real_nonmetric_outputs(
@@ -197,13 +232,17 @@ def test_stepinfo_band_and_source_are_forwarded(local_adapter_case, band):
 
 
 @pytest.mark.parametrize(
-    "change", ["source", "entry", "signature", "resource", "version", "permission", "flag"]
+    "change", ["snapshot", "entry", "signature", "resource", "version", "permission", "flag"]
 )
 def test_execution_refuses_unconfirmed_or_changed_binding(local_adapter_case, monkeypatch, change):
     context, inputs, backend, tools = local_adapter_case
     resource = context.resource("project")
-    if change == "source":
-        (Path(resource.locator) / "initialize.m").write_text("changed = 1;")
+    if change == "snapshot":
+        tree = backend.snapshots.verify(context.project_snapshot("project"))
+        path = tree / "initialize.m"
+        path.chmod(0o644)
+        path.write_text("changed = 1;\n")
+        path.chmod(0o444)
     elif change == "entry":
         inputs["entry"]["path"] = "unselected.m"
     elif change == "signature":
@@ -310,6 +349,29 @@ def test_lost_ack_reconciles_original_request_offline(local_adapter_case, monkey
     output = tools.reconcile(operation, inputs, context, context.scope)
     assert output is not None
     assert backend.requests[-2:] == [(original, False), (original, True)]
+
+
+def test_historical_metric_checkpoint_reconciles_original_location(
+    local_adapter_case, tmp_path
+):
+    context, inputs, backend, tools = metric_case(local_adapter_case)
+    original_directory = context.directory / f"calls/{context.call_id}"
+    historical = replace(context, work_directory=original_directory)
+    backend.checkpoint = historical.load_checkpoint
+    backend.lose_ack = True
+    with pytest.raises(ExecutionUncertain):
+        tools.invoke("matlab_stepinfo", inputs, historical, historical.scope)
+    original_request = backend.requests[-1][0]
+    historical.load_checkpoint().pop("backend_directory")
+    restored = replace(
+        historical, work_directory=tmp_path / "managed" / "restored-call"
+    )
+    backend.lose_ack = False
+    output = tools.reconcile("matlab_stepinfo", inputs, restored, restored.scope)
+    assert output is not None
+    assert backend.requests[-2:] == [(original_request, False), (original_request, True)]
+    assert (original_directory / "local-matlab" / "engine-starts.txt").read_text() == "1"
+    assert not restored.work_directory.exists()
 
 
 @pytest.mark.parametrize("mode", ["startup_error", "missing_receipt"])

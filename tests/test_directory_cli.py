@@ -10,7 +10,7 @@ from tests.agent_helpers import draft_data, make_agent_web
 from tests.helpers import serve_app
 
 
-def test_directory_task_cli_help_has_auto_and_both_scenarios():
+def test_directory_task_cli_help_uses_registered_locations_without_scenarios():
     result = subprocess.run(
         [sys.executable, "-m", "flight_agent", "directory-task", "propose", "--help"],
         capture_output=True,
@@ -18,13 +18,13 @@ def test_directory_task_cli_help_has_auto_and_both_scenarios():
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert "--scenario" in result.stdout
-    assert all(mode in result.stdout for mode in ("auto", "d1", "d2"))
+    assert "--scenario" not in result.stdout
+    assert "--location" in result.stdout
     assert "--output-root" in result.stdout
 
 
 @pytest.mark.parametrize("existing", [False, True])
-def test_directory_cli_defaults_new_requests_to_auto_but_preserves_existing_mode(
+def test_directory_cli_does_not_inject_resource_selection_on_new_or_existing_requests(
     monkeypatch, capsys, existing
 ):
     identifier = "b" * 32
@@ -35,11 +35,7 @@ def test_directory_cli_defaults_new_requests_to_auto_but_preserves_existing_mode
             return httpx.Response(200, json={"token": "local-test-token"})
         assert request.headers["X-Flight-Token"] == "local-test-token"
         body = json.loads(request.content)
-        assert body == (
-            {"message": "Explain gain margin."}
-            if existing
-            else {"message": "Explain gain margin.", "scenario": "auto"}
-        )
+        assert body == {"message": "Explain gain margin."}
         return httpx.Response(202, json={"id": identifier, "status": "completed", "task": None})
 
     monkeypatch.setattr(
@@ -67,10 +63,11 @@ def test_directory_cli_uses_authenticated_api_and_preserves_async_task_identity(
             return httpx.Response(200, json={"token": "local-test-token"})
         assert request.headers["X-Flight-Token"] == "local-test-token"
         if request.method == "POST":
-            assert json.loads(request.content)["scenario"] == "d2"
+            assert json.loads(request.content)["location"] == "diagnostic_data"
             return httpx.Response(202, json={"id": identifier, "status": "planning"})
         return httpx.Response(
-            200, json={"id": identifier, "scenario": "d2", "status": "waiting_for_user"}
+            200, json={"id": identifier, "resource_location": "diagnostic_data",
+                       "status": "waiting_for_user"}
         )
 
     monkeypatch.setattr(
@@ -83,8 +80,8 @@ def test_directory_cli_uses_authenticated_api_and_preserves_async_task_identity(
             [
                 "directory-task",
                 "propose",
-                "--scenario",
-                "d2",
+                "--location",
+                "diagnostic_data",
                 "--project-root",
                 "/registered/data",
                 "--request",
@@ -191,25 +188,23 @@ def test_default_directory_cli_uses_generic_plan_and_explicit_confirmation(tmp_p
     [
         (
             ["--analysis-request", "  Existing entry 中文  ", "--criteria", "超调量 ≤10%"],
-            {"analysis_request": "  Existing entry 中文  ", "evaluation_criteria": "超调量 ≤10%",
-             "location": "matlab_project", "scenario": "auto"},
+            {"analysis_request": "  Existing entry 中文  ", "evaluation_criteria": "超调量 ≤10%"},
         ),
         (
-            ["--request", "Keep legacy text", "--criteria", "RMSE <= 2 m"],
-            {"analysis_request": "Keep legacy text", "evaluation_criteria": "RMSE <= 2 m",
-             "location": "matlab_project", "scenario": "auto"},
+            ["--request", "Keep original text", "--criteria", "RMSE <= 2 m"],
+            {"analysis_request": "Keep original text", "evaluation_criteria": "RMSE <= 2 m"},
         ),
         (
-            ["--analysis-request", "Existing entry", "--scenario", "d1"],
-            {"analysis_request": "Existing entry", "scenario": "d1"},
+            ["--analysis-request", "Existing entry", "--location", "matlab_project"],
+            {"analysis_request": "Existing entry", "location": "matlab_project"},
         ),
         (
-            ["--request", "Worker request", "--scenario", "d1"],
-            {"message": "Worker request", "scenario": "d1"},
+            ["--request", "Worker request", "--location", "simulink_project"],
+            {"message": "Worker request", "location": "simulink_project"},
         ),
         (
-            ["--analysis-request", "Data analysis", "--location", "agent"],
-            {"analysis_request": "Data analysis", "location": "agent", "scenario": "auto"},
+            ["--analysis-request", "Data analysis", "--location", "diagnostic_data"],
+            {"analysis_request": "Data analysis", "location": "diagnostic_data"},
         ),
         (
             ["--analysis-request", "Follow up", "--conversation", "b" * 32],
@@ -217,7 +212,7 @@ def test_default_directory_cli_uses_generic_plan_and_explicit_confirmation(tmp_p
         ),
     ],
 )
-def test_directory_cli_structured_and_legacy_resource_payloads(
+def test_directory_cli_structured_and_registered_resource_payloads(
     monkeypatch, capsys, arguments, expected,
 ):
     real_client = httpx.Client
