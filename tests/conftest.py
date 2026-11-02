@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import expect
 
-expect.set_options(timeout=10_000)
+expect.set_options(timeout=30_000)
 
 
 @pytest.fixture

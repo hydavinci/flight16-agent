@@ -26,7 +26,7 @@ def test_browser_assertions_allow_slow_ci_updates():
                 """() => {
                     setTimeout(() => {
                         document.querySelector("#status").textContent = "ready";
-                    }, 5500);
+                    }, 10500);
                 }"""
             )
             expect(page.locator("#status")).to_have_text("ready")
