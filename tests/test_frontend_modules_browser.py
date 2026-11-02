@@ -13,6 +13,50 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_importing_bootstrap_alone_has_no_network_or_handler_side_effects(tmp_path):
+    app, _, calls, _ = make_agent_web(tmp_path, [])
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.route(
+            "**/static/agent.js",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/javascript",
+                body="",
+            ),
+        )
+        try:
+            page.goto(url)
+            result = page.evaluate(
+                """async () => {
+                    const requests = [];
+                    const handlers = [];
+                    const savedFetch = window.fetch;
+                    const savedAdd = EventTarget.prototype.addEventListener;
+                    window.fetch = (...args) => {
+                        requests.push(args);
+                        return savedFetch(...args);
+                    };
+                    EventTarget.prototype.addEventListener = function (...args) {
+                        handlers.push(args[0]);
+                        return savedAdd.apply(this, args);
+                    };
+                    try {
+                        await import("/static/bootstrap.js?isolated");
+                        return {requests: requests.length, handlers};
+                    } finally {
+                        window.fetch = savedFetch;
+                        EventTarget.prototype.addEventListener = savedAdd;
+                    }
+                }"""
+            )
+            assert result == {"requests": 0, "handlers": []}
+            assert calls == []
+        finally:
+            browser.close()
+
+
 def test_native_imports_and_exported_state_transport_interfaces(tmp_path):
     app, _, calls, _ = make_agent_web(tmp_path, [])
     with serve_app(app) as url, sync_playwright() as playwright:
