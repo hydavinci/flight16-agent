@@ -18,6 +18,7 @@ MAX_WORKBENCH_FIGURES = 5
 
 _MATLAB_FILENAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,62}\.m")
 _MATLAB_KEYWORDS = {
+    "arguments",
     "break",
     "case",
     "catch",
@@ -84,6 +85,20 @@ def _safe_artifact_path(value: str) -> str:
     return value
 
 
+def _matlab_code_without_comments(source: str) -> str:
+    code = []
+    in_block_comment = False
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped == "%{":
+            in_block_comment = True
+        elif stripped == "%}":
+            in_block_comment = False
+        elif not in_block_comment and not line.lstrip().startswith("%"):
+            code.append(line)
+    return "\n".join(code)
+
+
 class WorkbenchRunRequest(Contract):
     id: RunId
     filename: str
@@ -138,7 +153,7 @@ class WorkbenchRunRequest(Contract):
                 rf"\s*=\s*{re.escape(stem)}\s*\(\s*params\s*\)",
                 re.MULTILINE,
             )
-            if declaration.search(self.source) is None:
+            if declaration.search(_matlab_code_without_comments(self.source)) is None:
                 raise ValueError(
                     "function source must declare the matching filename and single params signature"
                 )

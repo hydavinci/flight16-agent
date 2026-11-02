@@ -62,6 +62,59 @@ def test_workbench_function_requires_matching_single_params_signature():
 
 
 @pytest.mark.parametrize(
+    "keyword",
+    [
+        "arguments",
+        "break",
+        "case",
+        "catch",
+        "classdef",
+        "continue",
+        "else",
+        "elseif",
+        "end",
+        "enumeration",
+        "events",
+        "for",
+        "function",
+        "global",
+        "if",
+        "methods",
+        "otherwise",
+        "parfor",
+        "persistent",
+        "properties",
+        "return",
+        "spmd",
+        "switch",
+        "try",
+        "while",
+    ],
+)
+def test_workbench_request_rejects_matlab_keyword_filename(keyword):
+    data = request_data()
+    data["filename"] = f"{keyword}.m"
+    with pytest.raises(ValidationError, match="keyword"):
+        WorkbenchRunRequest.model_validate(data)
+
+
+def test_workbench_function_ignores_declarations_inside_block_comments():
+    data = request_data()
+    data.update(
+        kind="function",
+        source=(
+            "%{\n"
+            "function result = calculation(params)\n"
+            "result = params;\n"
+            "end\n"
+            "%}\n"
+        ),
+    )
+    with pytest.raises(ValidationError, match="function"):
+        WorkbenchRunRequest.model_validate(data)
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("filename", "../calculation.m"),
