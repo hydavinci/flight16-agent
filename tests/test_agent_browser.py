@@ -1,4 +1,5 @@
 import os
+from threading import Event, Timer
 
 import pytest
 from playwright.sync_api import expect, sync_playwright
@@ -22,6 +23,42 @@ pytestmark = [
         reason="Browser tests are opt-in",
     ),
 ]
+
+
+def test_slow_bootstrap_cannot_clear_a_message_before_submission(tmp_path, monkeypatch):
+    app, runtime, _, _ = make_agent_web(
+        tmp_path,
+        [{"action": "plan", "text": "Analyze supplied arrays.", "plan": draft_data()}],
+    )
+    release = Event()
+    locations = runtime.resources.locations
+
+    def delayed_locations():
+        assert release.wait(timeout=5)
+        return locations()
+
+    monkeypatch.setattr(runtime.resources, "locations", delayed_locations)
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        requests = []
+        page.on(
+            "request",
+            lambda request: requests.append(request.post_data_json)
+            if request.method == "POST" and request.url.endswith("/api/conversations") else None,
+        )
+        timer = Timer(0.5, release.set)
+        timer.start()
+        try:
+            page.goto(url)
+            page.get_by_label("任务需求", exact=True).fill("Analyze supplied synthetic arrays.")
+            page.locator("#send").click()
+            expect(page.locator("#baseline")).to_contain_text("v1")
+            assert requests == [{"message": "Analyze supplied synthetic arrays."}]
+        finally:
+            release.set()
+            timer.join()
+            browser.close()
 
 
 def test_queued_state_keeps_polling_and_disables_confirmation(tmp_path):
@@ -119,29 +156,12 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
         page.set_default_timeout(10000)
         errors = []
         requests = []
-        responses = []
-        request_failures = []
-        navigations = []
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.on(
             "request",
             lambda request: requests.append(request.post_data_json)
             if request.method == "POST" and request.url.endswith("/api/conversations") else None,
         )
-        page.on(
-            "response",
-            lambda response: responses.append(
-                (response.request.method, response.url, response.status)
-            )
-            if "/api/" in response.url else None,
-        )
-        page.on(
-            "requestfailed",
-            lambda request: request_failures.append(
-                (request.method, request.url, request.failure)
-            ),
-        )
-        page.on("framenavigated", lambda frame: navigations.append(frame.url))
         try:
             page.goto(url)
             if width <= 1100:
@@ -151,18 +171,7 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
             expect(page.locator("#baseline-heading")).to_have_text("执行方案")
             page.get_by_label("任务需求", exact=True).fill("Analyze supplied synthetic arrays.")
             page.locator("#send").click()
-            try:
-                expect(page.locator("#confirm")).to_be_visible()
-            except AssertionError as exc:
-                raise AssertionError(
-                    f"{exc}\nrequests={requests!r}\nresponses={responses!r}"
-                    f"\nrequest_failures={request_failures!r}"
-                    f"\nnavigations={navigations!r}"
-                    f"\nrecent={[(item.id, item.status) for item in runtime.store.recent()]!r}"
-                    f"\nmessage={page.get_by_label('任务需求', exact=True).input_value()!r}"
-                    f"\nnotice={page.locator('#notice').text_content()!r}"
-                    f"\nsend_disabled={page.locator('#send').is_disabled()!r}"
-                ) from exc
+            expect(page.locator("#confirm")).to_be_visible()
             expect(page.locator("#conversation-status")).to_be_visible()
             expect(page.locator("#confirm")).to_be_disabled()
             expect(page.locator("#baseline")).to_contain_text("offline_rmse")
