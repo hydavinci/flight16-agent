@@ -14,7 +14,7 @@ Worker 工程与离线诊断数据都是注册资源，不是独立产品。
 
 | 层次 | 主要职责 | 代码位置 |
 |---|---|---|
-| 入口与展示 | Web、CLI、请求校验、下载 | `web.py`、`cli.py`、`static/` |
+| 入口与展示 | Web 组合、CLI、请求校验、下载 | `web.py`、`application.py`、`web_routes/`、`cli.py` |
 | 会话协调 | 需求、任务归档、确认与恢复 | `verification/coordinator.py`、`store.py` |
 | 规划与契约 | 类型化方案、来源和资源绑定 | `agent_planner.py`、`runtime/` |
 | 执行与证据 | 依赖图、权限、预算、回执与复用 | `agent_runtime.py`、`runtime/evidence.py` |
@@ -23,6 +23,18 @@ Worker 工程与离线诊断数据都是注册资源，不是独立产品。
 
 表内相对模块名以 `src/flight_agent/` 或对应的 `verification/` 目录为基准，
 完整分布见下方源码树。前端是原生 HTML/CSS/JavaScript，无需 Node 构建。
+
+`create_web_app` 保持公开入口、`scheduler_settings` 参数和 HTTP 路径，仅负责 Web 组合。
+`application.py` 负责默认运行时装配；测试可按对象身份注入 `EngineeringRuntime`，
+也可通过 `conversation_manager` 注入带 planning/execution 调度器的
+`ConversationManager`。外部注入的 manager 和 store 由调用者管理；默认 manager
+在应用退出时排空并关闭其调度器。store 没有虚构的 close 生命周期，退出后仍可读取。
+`app.state.conversation_manager` 保持可用。
+
+所有路由继续经过同源、Host、令牌、请求体大小和严格 schema 校验。
+下载继续核对任务目录身份、工件登记和 SHA-256，不暴露任意文件目录。
+前端由浏览器直接加载原生 ES modules，不需要 Node、npm、打包器或编译。
+模块 URL 使用显式白名单和 JavaScript MIME；CSP 不增加 `unsafe-inline` 或 `unsafe-eval`。
 
 桌面三栏独立滚动，左右默认宽度为 260/340px，最小为 200/240px，对话区至少 480px。
 方向键每次调整 10px，Shift 加方向键为 50px；Enter 或双击恢复默认。
@@ -227,7 +239,14 @@ messages, task state, or telemetry.
 ```text
 src/flight_agent/
 |-- cli.py                       # 命令行入口
-|-- web.py                       # Web 装配、页面与 API
+|-- web.py                       # Web 组合、同源/令牌校验、安全响应头与生命周期
+|-- application.py               # 运行时、计算后端与后台调度器装配和注入
+|-- web_routes/
+|   |-- pages.py                 # 页面和显式静态资源白名单
+|   |-- configuration.py         # bootstrap 与目录配置
+|   |-- metadata.py              # 能力与资源元数据
+|   |-- artifacts.py             # 哈希校验后的工件下载
+|   `-- errors.py                # HTTP 错误映射
 |-- worker.py                    # Worker 服务与共享执行槽
 |-- config.py                    # 模型配置与 API 客户端
 |-- copilot.py                   # Copilot CLI 传输
@@ -285,7 +304,14 @@ src/flight_agent/
 |   |-- flight_agent_margin_metrics.m
 |   `-- flight_agent_verify.m
 `-- static/
-    |-- agent.html / agent.css / agent.js
+    |-- agent.html / agent.css
+    |-- agent.js                 # 稳定 URL 的原生 ES module 入口
+    |-- api.js                   # API 传输与令牌头
+    |-- state.js                 # 单一会话/UI 状态
+    |-- render.js                # 会话、进度与控件的文本 DOM 渲染
+    |-- task-evidence.js         # 基线、授权、评价、证据与工件下载
+    |-- resize-preferences.js    # 三栏调整、键盘交互与本地偏好
+    |-- bootstrap.js             # 初始化、事件、轮询、历史、目录与请求时序
     `-- favicon.svg
 ```
 
@@ -294,40 +320,62 @@ src/flight_agent/
 
 ## 开发与验证
 
-在项目根目录激活虚拟环境后执行：
+在项目根目录执行锁定的软件 gate：
 
 ```bash
-python -m pip install -e '.[dev]'
-python -m pytest -m "not matlab" -q
-python -m ruff check .
-python -m mypy src
-python -m build
+uv sync --extra dev
+uv lock --check
+RUN_BROWSER_TESTS=0 RUN_MATLAB_TESTS=0 \
+uv run --no-sync python -m pytest -m "not matlab and not browser" -q
+uv run --no-sync python -m ruff check .
+uv run --no-sync python -m mypy src
+uv run --no-sync python -m build --no-isolation
 ```
 
 默认测试不需要真实 MATLAB，也不请求真实模型；测试替身只在 `tests/`。
 浏览器回归需先安装 Playwright Chromium：
 
 ```bash
-python -m playwright install chromium --only-shell
-RUN_BROWSER_TESTS=1 python -m pytest \
-  tests/test_agent_browser.py \
-  tests/test_matlab_project_browser.py tests/test_agent_layout_browser.py \
-  tests/test_agent_column_resize_browser.py -v
+uv run --no-sync python -m playwright install chromium --only-shell
+RUN_BROWSER_TESTS=1 RUN_MATLAB_TESTS=0 \
+uv run --no-sync python -m pytest -m "browser and not matlab" -q
 ```
 
-在已安装匹配 Engine 和许可证的环境中，可显式运行真实集成：
+Linux CI 使用 `playwright install --with-deps chromium --only-shell`。
+测试通过 `serve_app` 启动各自的临时本地应用，不要求单独常驻开发服务器。
+
+真实 MATLAB 验收使用管理员预先配置的专用兼容环境。变量必须由运行环境提供，
+不能把下面的变量名当成可直接粘贴的示例路径：
 
 ```bash
-RUN_MATLAB_TESTS=1 python -m pytest \
-  tests/test_verification_matlab.py -m matlab -v
-
+test -n "$MATLAB_ACCEPTANCE_ENV"
+test -f "$MATLAB_ACCEPTANCE_ENV/pyvenv.cfg"
+test -x "$MATLAB_ACCEPTANCE_ENV/bin/python"
+export UV_PROJECT_ENVIRONMENT="$MATLAB_ACCEPTANCE_ENV"
+export MATLAB_PYTHON_EXECUTABLE="$MATLAB_ACCEPTANCE_ENV/bin/python"
+"$MATLAB_PYTHON_EXECUTABLE" -c 'import matlab.engine; print(matlab.engine.__file__)'
+uv sync --locked --extra dev --inexact --python "$MATLAB_PYTHON_EXECUTABLE"
 RUN_MATLAB_TESTS=1 MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
-MATLAB_PYTHON_EXECUTABLE=/absolute/path/to/compatible/python \
-/absolute/path/to/compatible/python -m pytest \
-  tests/test_local_matlab.py tests/test_local_matlab_integration.py -m matlab -v
+uv run --no-sync python -m pytest \
+  tests/test_verification_matlab.py tests/test_local_matlab.py \
+  tests/test_local_matlab_integration.py -m matlab -v -s
 ```
 
-本机集成包含解析响应、真正非线性闭环、不同初始化工作区、5%/2% 调节带、错误与报告下载。
+`MATLAB_ACCEPTANCE_ENV` 须预装匹配发行版的 Engine，并拥有 MATLAB、Simulink、
+Control System Toolbox 和 Simulink Control Design 许可。`--inexact` 只用于保留
+专用环境中的非锁定 Engine，不用于常规软件 CI。真实 MATLAB 不回退到 fake Engine；
+未显式启用的 matlab 测试会跳过，跳过不代表验收通过。记录中须保存 MATLAB 发行版、
+解释器、测试结果与失败原因。
+
+GitHub CI 的 software job 使用 Python 3.11/3.12 矩阵；browser job 单独运行 Chromium。
+licensed MATLAB job 仅允许从默认分支手动勾选 `run_matlab`，使用
+`[self-hosted, matlab]` 与受审批保护的 `matlab-acceptance` 环境；
+仓库变量 `MATLAB_ACCEPTANCE_ENV` 指向该 runner 的专用环境。PR 不触发真实 MATLAB。
+hosted jobs 只缓存 uv 下载；不缓存虚拟环境、浏览器、MATLAB、Engine 或证据产物，
+licensed MATLAB job 禁用 uv 缓存。
+
+本机集成包含解析响应、真正非线性闭环、不同初始化工作区、5%/2% 调节带、错误、
+报告下载、线性化与 `allmargin` 证据链。
 独立参考与容差见 [Simulink Worker 参考](simulink-worker.md)。
 这些测试准备夹具，不让生产 Agent 生成缺少的模型。
 如需用 `--basetemp` 保留产物，只能指定新的专用目录，因为 pytest 会清空该目录。

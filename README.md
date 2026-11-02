@@ -163,11 +163,13 @@ flight-agent web --port 8000
 
 | 模块 | 职责 |
 |---|---|
-| `web.py`、`cli.py` | Web 与命令行入口 |
+| `web.py`、`cli.py` | Web 组合、安全边界与命令行入口 |
+| `application.py` | 运行时、计算后端和后台调度器装配 |
+| `web_routes/` | 页面、配置、元数据、工件和会话路由分组 |
 | `runtime/` | 需求契约、能力注册、预算和证据 |
 | `verification/` | 会话、规划、执行、资源及计算适配器 |
 | `matlab_support/` | 受控 MATLAB 桥接函数 |
-| `static/` | 唯一的三栏通用 Agent 工作台 |
+| `static/` | 原生 ES modules 组成的三栏通用 Agent 工作台 |
 
 完整执行链路、模块职责、源码树和扩展方式见[项目架构](docs/architecture.md)。
 
@@ -236,13 +238,15 @@ v2、未知记录、外部交付目录与源工程保留；源路径无法严格
 
 ```bash
 uv sync --extra dev
-uv run --no-sync python -m pytest -m "not matlab" -q
+uv lock --check
+RUN_BROWSER_TESTS=0 RUN_MATLAB_TESTS=0 \
+uv run --no-sync python -m pytest -m "not matlab and not browser" -q
 uv run --no-sync python -m ruff check .
 uv run --no-sync python -m mypy src
 uv run --no-sync python -m build --no-isolation
 ```
 
-默认测试不需要真实 MATLAB，也不调用真实模型。
+默认软件测试不需要真实 MATLAB、浏览器或真实模型。
 浏览器与 MATLAB 集成的运行方法见[开发验证](docs/architecture.md#开发与验证)。
 合成测试夹具不是真实工程验收；仓库不包含真实 F-16 模型或审核过的航空标准。
 

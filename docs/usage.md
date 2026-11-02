@@ -46,15 +46,46 @@ test -e .env || cp .env.example .env
 
 ```bash
 uv sync --extra dev
-uv run --no-sync python -m pytest -m "not matlab" -q
+uv lock --check
+RUN_BROWSER_TESTS=0 RUN_MATLAB_TESTS=0 \
+uv run --no-sync python -m pytest -m "not matlab and not browser" -q
 uv run --no-sync python -m ruff check .
 uv run --no-sync python -m mypy src
 uv run --no-sync python -m build --no-isolation
 ```
 
-`--no-sync` 避免验证命令再次改动环境。真实 MATLAB 验收只能在单独的、已许可且
-Python 版本匹配的 Engine 专用环境中运行；为保留锁文件之外安装的 Engine，先使用
-`uv sync --locked --extra dev --inexact`，不要对该环境执行默认的精确同步。
+`--no-sync` 避免验证命令再次改动环境。浏览器测试和真实 MATLAB 验收是单独的 gate，
+不能由软件测试通过或测试跳过代替。
+
+真实 MATLAB 验收只能在管理员预先配置的专用环境中运行。`MATLAB_ACCEPTANCE_ENV`
+必须指向兼容 Python 虚拟环境的绝对路径；该环境预装与 MATLAB 发行版匹配的 Engine，
+并具备 MATLAB、Simulink、Control System Toolbox 和 Simulink Control Design 许可。
+不要把项目 `.venv`、源码目录或示例路径当作该变量的值。
+
+```bash
+test -n "$MATLAB_ACCEPTANCE_ENV"
+test -f "$MATLAB_ACCEPTANCE_ENV/pyvenv.cfg"
+test -x "$MATLAB_ACCEPTANCE_ENV/bin/python"
+export UV_PROJECT_ENVIRONMENT="$MATLAB_ACCEPTANCE_ENV"
+export MATLAB_PYTHON_EXECUTABLE="$MATLAB_ACCEPTANCE_ENV/bin/python"
+"$MATLAB_PYTHON_EXECUTABLE" -c 'import matlab.engine; print(matlab.engine.__file__)'
+uv sync --locked --extra dev --inexact --python "$MATLAB_PYTHON_EXECUTABLE"
+RUN_MATLAB_TESTS=1 MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
+uv run --no-sync python -m pytest \
+  tests/test_verification_matlab.py tests/test_local_matlab.py \
+  tests/test_local_matlab_integration.py -m matlab -v -s
+```
+
+`--inexact` 仅用于保留该专用环境中未进入 uv.lock 的 Engine，不用于常规软件 CI。
+真实 MATLAB 测试不会回退到 fake Engine；未设置 `RUN_MATLAB_TESTS=1` 时的跳过不代表
+验收通过。运行记录须包含 MATLAB 发行版、解释器、测试结果和失败原因。
+
+GitHub CI 的软件矩阵使用 Python 3.11/3.12，浏览器测试使用独立 Chromium 作业。
+真实 MATLAB 作业仅允许从默认分支手动勾选 `run_matlab`，运行于
+`[self-hosted, matlab]` runner 和受审批保护的 `matlab-acceptance` 环境；
+仓库变量 `MATLAB_ACCEPTANCE_ENV` 指向该 runner 的专用环境。PR 不触发真实 MATLAB。
+缓存仅用于 hosted job 的 uv 下载，不包含虚拟环境、浏览器、MATLAB、Engine 或证据产物；
+licensed MATLAB job 明确禁用 uv 缓存。
 
 ### 安装 MATLAB Engine
 

@@ -30,7 +30,38 @@ def test_documented_bootstrap_uses_existing_dev_extra():
         assert "uv sync --extra dev" in text
         assert "python3 -m pip install uv==0.12.6" in text
         assert "uv sync --locked --extra dev" in text
-        assert 'uv run --no-sync python -m pytest -m "not matlab" -q' in text
+        assert (
+            'uv run --no-sync python -m pytest -m "not matlab and not browser" -q'
+            in text
+        )
         assert "uv run --no-sync python -m ruff check ." in text
         assert "uv run --no-sync python -m mypy src" in text
         assert "uv run --no-sync python -m build --no-isolation" in text
+
+
+def test_docs_describe_actual_modules_jobs_and_engine_opt_in():
+    architecture = (ROOT / "docs/architecture.md").read_text("utf-8")
+    for name in (
+        "application.py",
+        "web_routes/",
+        "api.js",
+        "state.js",
+        "render.js",
+        "task-evidence.js",
+        "resize-preferences.js",
+        "bootstrap.js",
+        "not matlab and not browser",
+        "browser and not matlab",
+        "uv run --no-sync python -m build --no-isolation",
+        "MATLAB_ACCEPTANCE_ENV",
+        "--inexact",
+        "RUN_MATLAB_TESTS=1",
+    ):
+        assert name in architecture
+    usage = (ROOT / "docs/usage.md").read_text("utf-8")
+    assert "MATLAB_ACCEPTANCE_ENV" in usage
+    assert "--inexact" in usage
+    assert "RUN_MATLAB_TESTS=1" in usage
+    readme = (ROOT / "README.md").read_text("utf-8")
+    assert "not matlab and not browser" in readme
+    assert "application.py" in readme
