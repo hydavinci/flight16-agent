@@ -61,13 +61,54 @@ def _windows_processes() -> dict[int, _WindowsProcess]:
         if not isinstance(record, dict):
             raise ValueError("Invalid Windows process enumeration record")
         creation_time = str(record.get("CreationTime", ""))
-        if not creation_time:
+        if not creation_time or not creation_time.isdecimal():
             raise ValueError("Windows process identity is unavailable")
         processes[int(record["ProcessId"])] = _WindowsProcess(
             parent_pid=int(record["ParentProcessId"]),
             creation_time=creation_time,
         )
     return processes
+
+
+def _windows_process_creation_time(process: subprocess.Popen[str]) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [
+            ("low", wintypes.DWORD),
+            ("high", wintypes.DWORD),
+        ]
+
+    handle = getattr(process, "_handle", None)
+    if handle is None:
+        raise OSError("Windows worker process handle is unavailable")
+    win_dll = getattr(ctypes, "WinDLL")
+    get_last_error = getattr(ctypes, "get_last_error")
+    kernel = win_dll("kernel32", use_last_error=True)
+    kernel.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+        ctypes.POINTER(FileTime),
+    ]
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    created = FileTime()
+    exited = FileTime()
+    kernel_time = FileTime()
+    user_time = FileTime()
+    if not kernel.GetProcessTimes(
+        int(handle),
+        ctypes.byref(created),
+        ctypes.byref(exited),
+        ctypes.byref(kernel_time),
+        ctypes.byref(user_time),
+    ):
+        raise OSError(
+            f"GetProcessTimes({process.pid}) failed with Windows error {get_last_error()}"
+        )
+    return str((created.high << 32) | created.low)
 
 
 def _windows_terminate_pid(pid: int, creation_time: str) -> str | None:
@@ -135,63 +176,86 @@ def _windows_terminate_pid(pid: int, creation_time: str) -> str | None:
 def _update_windows_tree(
     processes: dict[int, _WindowsProcess],
     depths: dict[int, int],
-    identities: dict[int, str | None],
-    reused: set[int],
+    identities: dict[int, str],
+    reused_at: dict[int, int],
+    root_pid: int,
 ) -> tuple[dict[int, int], str | None]:
     for pid, process in processes.items():
-        if not process.creation_time:
+        if not process.creation_time or not process.creation_time.isdecimal():
             return {}, f"Windows process identity is unavailable for PID {pid}"
         if pid not in identities:
             continue
         expected = identities[pid]
-        if expected is None:
-            identities[pid] = process.creation_time
-        elif expected != process.creation_time:
-            reused.add(pid)
+        if expected != process.creation_time:
+            replacement_time = int(process.creation_time)
+            reused_at[pid] = min(reused_at.get(pid, replacement_time), replacement_time)
     changed = True
     while changed:
         changed = False
         for pid, process in processes.items():
-            if (
-                process.parent_pid in depths
-                and process.parent_pid not in reused
-                and pid not in depths
-            ):
-                depths[pid] = depths[process.parent_pid] + 1
-                identities[pid] = process.creation_time
-                changed = True
+            parent_pid = process.parent_pid
+            if parent_pid not in depths or pid in depths:
+                continue
+            child_time = int(process.creation_time)
+            parent_time = int(identities[parent_pid])
+            if child_time == parent_time:
+                return {}, (
+                    f"Windows process ancestry is uncertain for PID {pid}; "
+                    f"it has the same creation time as parent PID {parent_pid}"
+                )
+            if child_time < parent_time:
+                continue
+            if parent_pid in reused_at:
+                replacement_time = reused_at[parent_pid]
+                if child_time == replacement_time:
+                    return {}, (
+                        f"Windows process ancestry is uncertain for PID {pid} "
+                        f"after parent PID {parent_pid} reuse"
+                    )
+                if child_time > replacement_time:
+                    continue
+            elif parent_pid not in processes and parent_pid != root_pid:
+                return {}, (
+                    f"Windows process ancestry is uncertain for PID {pid}; "
+                    f"parent PID {parent_pid} is unavailable"
+                )
+            depths[pid] = depths[parent_pid] + 1
+            identities[pid] = process.creation_time
+            changed = True
     return (
         {
             pid: depth
             for pid, depth in depths.items()
             if pid in processes
-            and pid not in reused
+            and pid not in reused_at
             and identities[pid] == processes[pid].creation_time
         },
         None,
     )
 
 
-def _stop_windows_tree(root_pid: int) -> str | None:
+def _stop_windows_tree(root_pid: int, root_creation_time: str) -> str | None:
+    if not root_creation_time.isdecimal():
+        return "Windows root process identity is unavailable"
     depths = {root_pid: 0}
-    identities: dict[int, str | None] = {root_pid: None}
-    reused: set[int] = set()
+    identities = {root_pid: root_creation_time}
+    reused_at: dict[int, int] = {}
     termination_errors: dict[int, str] = {}
     for _ in range(3):
         try:
             processes = _windows_processes()
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return f"cannot enumerate the Windows process tree: {exc}"
-        live, identity_error = _update_windows_tree(processes, depths, identities, reused)
+        live, identity_error = _update_windows_tree(
+            processes, depths, identities, reused_at, root_pid
+        )
         if identity_error is not None:
             return identity_error
         if not live:
             return None
         for pid in sorted(live, key=live.__getitem__, reverse=True):
             try:
-                creation_time = identities[pid]
-                assert creation_time is not None
-                error = _windows_terminate_pid(pid, creation_time)
+                error = _windows_terminate_pid(pid, identities[pid])
             except (OSError, subprocess.SubprocessError) as exc:
                 error = str(exc)
             if error is not None:
@@ -201,7 +265,9 @@ def _stop_windows_tree(root_pid: int) -> str | None:
         processes = _windows_processes()
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return f"cannot verify the Windows process tree termination: {exc}"
-    live, identity_error = _update_windows_tree(processes, depths, identities, reused)
+    live, identity_error = _update_windows_tree(
+        processes, depths, identities, reused_at, root_pid
+    )
     if identity_error is not None:
         return identity_error
     remaining = sorted(live)
@@ -236,17 +302,24 @@ def _stop_worker(process: subprocess.Popen[str], *, label: str = "MATLAB") -> _C
             if detail not in errors:
                 errors.append(detail)
 
+    windows_creation_time: str | None = None
     if os.name == "nt":
-        if error := _stop_windows_tree(process.pid):
-            errors.append(error)
+        try:
+            windows_creation_time = _windows_process_creation_time(process)
+        except (OSError, TypeError, ValueError) as exc:
+            errors.append(f"cannot bind the Windows worker process identity: {exc}")
+        if windows_creation_time is not None:
+            if error := _stop_windows_tree(process.pid, windows_creation_time):
+                errors.append(error)
     else:
         send_signal(signal.SIGTERM)
     try:
         stdout, stderr = process.communicate(timeout=2)
     except subprocess.TimeoutExpired:
         if os.name == "nt":
-            if error := _stop_windows_tree(process.pid):
-                errors.append(error)
+            if windows_creation_time is not None:
+                if error := _stop_windows_tree(process.pid, windows_creation_time):
+                    errors.append(error)
         else:
             send_signal(signal.SIGKILL)
         try:

@@ -602,9 +602,9 @@ def test_cleanup_reports_unterminated_worker_after_bounded_waits(monkeypatch):
 def test_windows_cleanup_terminates_and_verifies_entire_process_tree(monkeypatch):
     module = importlib.import_module("flight_agent.matlab")
     processes = {
-        43210: module._WindowsProcess(1, "root"),
-        43211: module._WindowsProcess(43210, "child"),
-        43212: module._WindowsProcess(43211, "grandchild"),
+        43210: module._WindowsProcess(1, "10"),
+        43211: module._WindowsProcess(43210, "20"),
+        43212: module._WindowsProcess(43211, "30"),
     }
     terminated = []
 
@@ -616,11 +616,11 @@ def test_windows_cleanup_terminates_and_verifies_entire_process_tree(monkeypatch
         return None
 
     monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
-    assert module._stop_windows_tree(43210) is None
+    assert module._stop_windows_tree(43210, "10") is None
     assert terminated == [
-        (43212, "grandchild"),
-        (43211, "child"),
-        (43210, "root"),
+        (43212, "30"),
+        (43211, "20"),
+        (43210, "10"),
     ]
 
 
@@ -652,10 +652,10 @@ def test_windows_cleanup_does_not_kill_reused_descendant_pid(monkeypatch):
     snapshots = iter(
         [
             {
-                43210: process(1, "root-a"),
-                43211: process(43210, "child-a"),
+                43210: process(1, "10"),
+                43211: process(43210, "20"),
             },
-            {43211: process(999, "child-b")},
+            {43211: process(999, "30")},
         ]
     )
     terminated = []
@@ -666,8 +666,100 @@ def test_windows_cleanup_does_not_kill_reused_descendant_pid(monkeypatch):
         lambda pid, creation_time: terminated.append((pid, creation_time)),
     )
 
-    assert module._stop_windows_tree(43210) is None
-    assert terminated == [(43211, "child-a"), (43210, "root-a")]
+    assert module._stop_windows_tree(43210, "10") is None
+    assert terminated == [(43211, "20"), (43210, "10")]
+
+
+def test_windows_cleanup_never_adopts_reused_root_pid(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    terminate = Mock(return_value=None)
+    monkeypatch.setattr(
+        module,
+        "_windows_processes",
+        lambda: {43210: module._WindowsProcess(1, "200")},
+    )
+    monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
+
+    assert module._stop_windows_tree(43210, "100") is None
+    terminate.assert_not_called()
+
+
+def test_windows_cleanup_keeps_original_descendant_after_parent_pid_reuse(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    snapshots = iter(
+        [
+            {
+                43210: module._WindowsProcess(1, "10"),
+                43211: module._WindowsProcess(43210, "20"),
+            },
+            {
+                43211: module._WindowsProcess(999, "30"),
+                43212: module._WindowsProcess(43211, "25"),
+                43213: module._WindowsProcess(43211, "35"),
+                43214: module._WindowsProcess(43211, "5"),
+            },
+            {
+                43211: module._WindowsProcess(999, "30"),
+                43213: module._WindowsProcess(43211, "35"),
+                43214: module._WindowsProcess(43211, "5"),
+            },
+            {
+                43211: module._WindowsProcess(999, "30"),
+                43213: module._WindowsProcess(43211, "35"),
+                43214: module._WindowsProcess(43211, "5"),
+            },
+        ]
+    )
+    terminated = []
+    monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid, creation_time: terminated.append((pid, creation_time)),
+    )
+
+    assert module._stop_windows_tree(43210, "10") is None
+    assert terminated == [(43211, "20"), (43210, "10"), (43212, "25")]
+
+
+def test_stop_worker_binds_root_identity_from_process_handle(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("stdout", "stderr")
+    root_identity = Mock(return_value="100")
+    stop_tree = Mock(return_value=None)
+    monkeypatch.setattr(module, "_windows_process_creation_time", root_identity)
+    monkeypatch.setattr(module, "_stop_windows_tree", stop_tree)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    result = module._stop_worker(process)
+
+    assert result.error is None
+    root_identity.assert_called_once_with(process)
+    stop_tree.assert_called_once_with(43210, "100")
+
+
+def test_stop_worker_fails_closed_when_root_identity_cannot_be_bound(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("stdout", "stderr")
+    stop_tree = Mock(return_value=None)
+    monkeypatch.setattr(
+        module,
+        "_windows_process_creation_time",
+        Mock(side_effect=OSError("process handle unavailable")),
+    )
+    monkeypatch.setattr(module, "_stop_windows_tree", stop_tree)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    result = module._stop_worker(process)
+
+    assert result.error is not None
+    assert "cannot bind" in result.error
+    assert "process handle unavailable" in result.error
+    stop_tree.assert_not_called()
 
 
 def test_windows_cleanup_fails_closed_without_process_identity(monkeypatch):
@@ -677,7 +769,7 @@ def test_windows_cleanup_fails_closed_without_process_identity(monkeypatch):
     monkeypatch.setattr(module, "_windows_processes", lambda: {43210: process})
     monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
 
-    error = module._stop_windows_tree(43210)
+    error = module._stop_windows_tree(43210, "10")
 
     assert error is not None
     assert "identity" in error
@@ -690,8 +782,8 @@ def test_windows_cleanup_reports_process_tree_that_cannot_be_verified(monkeypatc
         module,
         "_windows_processes",
         lambda: {
-            43210: module._WindowsProcess(1, "root"),
-            43211: module._WindowsProcess(43210, "child"),
+            43210: module._WindowsProcess(1, "10"),
+            43211: module._WindowsProcess(43210, "20"),
         },
     )
     monkeypatch.setattr(
@@ -699,7 +791,7 @@ def test_windows_cleanup_reports_process_tree_that_cannot_be_verified(monkeypatc
         "_windows_terminate_pid",
         lambda pid, creation_time: "access denied" if pid == 43211 else None,
     )
-    error = module._stop_windows_tree(43210)
+    error = module._stop_windows_tree(43210, "10")
     assert error is not None
     assert "43211" in error
     assert "access denied" in error
@@ -711,14 +803,14 @@ def test_windows_cleanup_converts_termination_timeout_to_uncertainty(monkeypatch
     monkeypatch.setattr(
         module,
         "_windows_processes",
-        lambda: {43210: module._WindowsProcess(1, "root")},
+        lambda: {43210: module._WindowsProcess(1, "10")},
     )
 
     def timeout(pid, creation_time):
         raise subprocess.TimeoutExpired(["taskkill.exe"], 5)
 
     monkeypatch.setattr(module, "_windows_terminate_pid", timeout)
-    error = module._stop_windows_tree(43210)
+    error = module._stop_windows_tree(43210, "10")
     assert error is not None
     assert "43210" in error
     assert "timed out" in error
@@ -728,10 +820,10 @@ def test_windows_cleanup_final_verification_detects_late_descendant(monkeypatch)
     module = importlib.import_module("flight_agent.matlab")
     snapshots = iter(
         [
-            {43210: module._WindowsProcess(1, "root")},
-            {43210: module._WindowsProcess(1, "root")},
-            {43210: module._WindowsProcess(1, "root")},
-            {43211: module._WindowsProcess(43210, "late-child")},
+            {43210: module._WindowsProcess(1, "10")},
+            {43210: module._WindowsProcess(1, "10")},
+            {43210: module._WindowsProcess(1, "10")},
+            {43211: module._WindowsProcess(43210, "20")},
         ]
     )
     monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
@@ -741,7 +833,7 @@ def test_windows_cleanup_final_verification_detects_late_descendant(monkeypatch)
         lambda pid, creation_time: None,
     )
 
-    error = module._stop_windows_tree(43210)
+    error = module._stop_windows_tree(43210, "10")
 
     assert error is not None
     assert "43211" in error
@@ -754,6 +846,7 @@ def test_stop_worker_uses_verified_windows_tree_cleanup(monkeypatch):
     process.pid = 43210
     process.communicate.return_value = ("stdout", "stderr")
     stop_tree = Mock(return_value=None)
+    monkeypatch.setattr(module, "_windows_process_creation_time", Mock(return_value="10"))
     monkeypatch.setattr(module, "_stop_windows_tree", stop_tree)
     monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
 
@@ -761,7 +854,7 @@ def test_stop_worker_uses_verified_windows_tree_cleanup(monkeypatch):
 
     assert result.error is None
     assert (result.stdout, result.stderr) == ("stdout", "stderr")
-    stop_tree.assert_called_once_with(43210)
+    stop_tree.assert_called_once_with(43210, "10")
     process.terminate.assert_not_called()
     process.kill.assert_not_called()
 
@@ -771,6 +864,7 @@ def test_stop_worker_reports_unverified_windows_tree_cleanup(monkeypatch):
     process = Mock(spec=subprocess.Popen)
     process.pid = 43210
     process.communicate.return_value = ("stdout", "stderr")
+    monkeypatch.setattr(module, "_windows_process_creation_time", Mock(return_value="10"))
     monkeypatch.setattr(
         module,
         "_stop_windows_tree",
