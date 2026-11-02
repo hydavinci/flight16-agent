@@ -10,7 +10,7 @@ from tests.verification_helpers import project_tree, verification_module
 
 
 @pytest.mark.parametrize("uploads_enabled", [False, True])
-def test_worker_rejects_removed_upload_endpoint(tmp_path, monkeypatch, uploads_enabled):
+def test_worker_keeps_removed_jobs_endpoint_unavailable(tmp_path, monkeypatch, uploads_enabled):
     monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
     if uploads_enabled:
         monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_UPLOADS", "1")
@@ -24,7 +24,7 @@ def test_worker_rejects_removed_upload_endpoint(tmp_path, monkeypatch, uploads_e
         ).status_code == 404
 
 
-def test_worker_health_is_project_only(tmp_path, monkeypatch):
+def test_worker_health_reports_project_and_single_file_execution(tmp_path, monkeypatch):
     from flight_agent.matlab import engine_available
 
     monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
@@ -35,6 +35,7 @@ def test_worker_health_is_project_only(tmp_path, monkeypatch):
             "engine_package": engine_available(),
             "trusted_code_only": True,
             "project_execution": True,
+            "single_file_execution": True,
         }
 
 
