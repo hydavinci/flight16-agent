@@ -53,7 +53,7 @@ def test_slow_bootstrap_cannot_clear_a_message_before_submission(tmp_path, monke
             page.goto(url)
             page.get_by_label("任务需求", exact=True).fill("Analyze supplied synthetic arrays.")
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v1")
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
             assert requests == [{"message": "Analyze supplied synthetic arrays."}]
         finally:
             release.set()
@@ -174,6 +174,8 @@ def test_single_generic_entry_and_readonly_analysis_without_acceptance(tmp_path,
             expect(page.locator("#confirm")).to_be_visible()
             expect(page.locator("#conversation-status")).to_be_visible()
             expect(page.locator("#confirm")).to_be_disabled()
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
+            expect(page.locator("#baseline")).not_to_contain_text("执行方案 v1")
             expect(page.locator("#baseline")).to_contain_text("offline_rmse")
             expect(page.locator("#trust-warning")).not_to_contain_text("工程初始化代码")
             expect(page.locator("#evaluation-card")).to_be_hidden()
@@ -287,11 +289,10 @@ def test_capability_gap_is_displayed_without_execution_and_old_consent_is_reset(
             page.goto(url)
             page.get_by_label("任务需求", exact=True).fill("Analyze supplied arrays.")
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v1")
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
             page.locator("#trusted").check()
             page.get_by_label("任务需求", exact=True).fill("Revise the requested arrays.")
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v2")
             expect(page.locator("#trusted")).not_to_be_checked()
             expect(page.locator("#confirm")).to_be_disabled()
             page.locator("#trusted").check()
@@ -412,7 +413,7 @@ def test_accepted_submission_survives_view_failure_without_duplicate_post(tmp_pa
             assert len(runtime.store.recent()) == 1
             assert len(pending) == 1
             pending.pop().continue_()
-            expect(page.locator("#baseline")).to_contain_text("v1")
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
             expect(page.get_by_label("任务需求", exact=True)).to_have_value("")
             assert len(runtime.store.recent()) == 1
             assert not calls
@@ -446,7 +447,7 @@ def test_browser_reconfirms_sourced_acceptance_and_runs_another_registered_metri
                 "Analyze synthetic arrays [0,2] and [0,0]; JSON only, no acceptance.",
             )
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v1")
+            expect(page.locator("#baseline")).to_contain_text("执行方案 · 尚未确认")
             assert not rmse_calls
             page.locator("#trusted").check()
             page.locator("#confirm").click()
@@ -472,7 +473,6 @@ def test_browser_reconfirms_sourced_acceptance_and_runs_another_registered_metri
             ]
             page.get_by_label("任务需求", exact=True).fill(message)
             page.locator("#send").click()
-            expect(page.locator("#baseline")).to_contain_text("v2")
             expect(page.locator("#baseline")).to_contain_text(source["reference"])
             expect(page.locator("#trusted")).not_to_be_checked()
             expect(page.locator("#confirm")).to_be_disabled()

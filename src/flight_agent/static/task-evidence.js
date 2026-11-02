@@ -126,7 +126,7 @@ export function createTaskEvidence(state, {$, element, notice, table, details, r
       ? "工程初始化代码以 Worker 用户权限在隔离副本中执行。只允许你已审查并信任的工程。"
       : "只授权本方案列出的能力与权限；只读分析不执行源工程代码，不沿用其他方案的授权。";
     $("baseline").replaceChildren(
-      element("p", `执行方案 v${view.baseline_version} · ${view.confirmation.confirmed ? "已确认" : "尚未确认"} · ${view.title}`),
+      element("p", `执行方案 · ${view.confirmation.confirmed ? "已确认" : "尚未确认"} · ${view.title}`),
       element("p", view.requirements.objective),
       element("p", `权限：${view.permissions.join("、")}`),
       element("p", view.budget ? `预算：${view.budget.max_rounds} 轮 / ${
