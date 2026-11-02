@@ -108,3 +108,43 @@ def test_workbench_store_create_existing_id_raises(tmp_path):
 
     with pytest.raises(FileExistsError):
         store.create(request)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"id": "b" * 32},
+        {"source": "result = struct('value', params.value * 3);"},
+    ],
+)
+def test_workbench_store_rejects_request_that_does_not_match_status(tmp_path, changes):
+    store = WorkbenchRunStore(tmp_path / "runs")
+    record = store.create(workbench_request("a" * 32))
+    path = store.directory(record.id) / "request.json"
+    data = json.loads(path.read_text("utf-8"))
+    data.update(changes)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not match"):
+        store.request(record.id)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", "b" * 32),
+        ("request_sha256", "c" * 64),
+        ("filename", "replacement.m"),
+        ("kind", "function"),
+    ],
+)
+def test_workbench_store_rejects_updates_to_immutable_request_fields(
+    tmp_path, field, value
+):
+    store = WorkbenchRunStore(tmp_path / "runs")
+    record = store.create(workbench_request("a" * 32))
+
+    with pytest.raises(ValueError, match="immutable"):
+        store.update(record.id, **{field: value})
+
+    assert store.get(record.id) == record

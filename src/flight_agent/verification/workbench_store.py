@@ -73,11 +73,19 @@ class WorkbenchRunStore:
         path = self.directory(run_id) / "request.json"
         if path.is_symlink():
             raise ValueError("Unsafe run request")
-        return WorkbenchRunRequest.model_validate_json(path.read_text("utf-8"))
+        request = WorkbenchRunRequest.model_validate_json(path.read_text("utf-8"))
+        record = self.get(run_id)
+        if request.id != record.id or workbench_request_digest(request) != record.request_sha256:
+            raise ValueError("Stored workbench request does not match its recorded identity")
+        return request
 
     def update(self, run_id: str, **changes: object) -> WorkbenchRunRecord:
         with self.lock:
             data = self.get(run_id).model_dump(mode="json")
+            if any(
+                field in changes for field in ("id", "request_sha256", "filename", "kind")
+            ):
+                raise ValueError("Workbench run identity fields are immutable")
             data.update(changes)
             data["updated_at"] = now()
             record = WorkbenchRunRecord.model_validate(data)
