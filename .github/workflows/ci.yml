@@ -19,7 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  UV_CACHE_DIR: /tmp/flight-agent-uv-cache
   UV_PYTHON_DOWNLOADS: never
 
 jobs:
@@ -32,6 +31,7 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     env:
+      UV_CACHE_DIR: /tmp/flight-agent-uv-cache
       RUN_BROWSER_TESTS: "0"
       RUN_MATLAB_TESTS: "0"
       MATLAB_ALLOW_TRUSTED_PROJECTS: "0"
@@ -71,6 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
+      UV_CACHE_DIR: /tmp/flight-agent-uv-cache
       RUN_BROWSER_TESTS: "1"
       RUN_MATLAB_TESTS: "0"
       MATLAB_ALLOW_TRUSTED_PROJECTS: "0"
@@ -134,9 +135,6 @@ jobs:
           "$MATLAB_PYTHON_EXECUTABLE" -c 'import sys; import matlab.engine; assert sys.version_info >= (3, 11); print(sys.executable)'
       - name: Validate committed lock
         run: uv lock --check
-      - name: Install locked tools without removing the preinstalled Engine
-        shell: bash
-        run: uv sync --locked --extra dev --inexact --python "$MATLAB_PYTHON_EXECUTABLE"
       - name: Check actual MATLAB and required licenses
         shell: bash
         run: |
@@ -152,6 +150,9 @@ jobs:
           finally:
               engine.quit()
           PY
+      - name: Install locked tools without removing the preinstalled Engine
+        shell: bash
+        run: uv sync --locked --extra dev --inexact --python "$MATLAB_PYTHON_EXECUTABLE"
       - name: Real project stepinfo linearization allmargin and evidence acceptance
         run: >-
           uv run --no-sync python -m pytest

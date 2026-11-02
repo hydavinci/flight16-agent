@@ -64,6 +64,7 @@ def test_hosted_ci_has_matrix_quality_gates_and_separate_browser_job():
 
 def test_matlab_requires_manual_trusted_licensed_runner_and_preserves_engine():
     data = workflow()
+    assert "UV_CACHE_DIR" not in data.get("env", {})
     option = data["on"]["workflow_dispatch"]["inputs"]["run_matlab"]
     assert option["type"] == "boolean"
     assert option["default"] == "false"
@@ -75,6 +76,11 @@ def test_matlab_requires_manual_trusted_licensed_runner_and_preserves_engine():
     assert job["environment"] == "matlab-acceptance"
     assert job["env"]["RUN_MATLAB_TESTS"] == "1"
     assert job["env"]["MATLAB_ALLOW_TRUSTED_PROJECTS"] == "1"
+    assert "UV_CACHE_DIR" not in job["env"]
+    names = [step.get("name", "") for step in job["steps"]]
+    assert names.index("Check actual MATLAB and required licenses") < names.index(
+        "Install locked tools without removing the preinstalled Engine"
+    )
     command = runs(job)
     assert "uv sync --locked --extra dev --inexact" in command
     assert "import matlab.engine" in command
