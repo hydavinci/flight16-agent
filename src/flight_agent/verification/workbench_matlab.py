@@ -28,7 +28,9 @@ from ..workbench_contracts import (
 )
 from .intake import safe_directory
 
-_RECEIPT_BYTES = MAX_WORKBENCH_RESULT_BYTES
+# Covers the fixed digest, bounded MATLAB version, and five-name figure manifest.
+MAX_WORKBENCH_RECEIPT_METADATA_BYTES = 4_096
+_RECEIPT_BYTES = MAX_WORKBENCH_RESULT_BYTES + MAX_WORKBENCH_RECEIPT_METADATA_BYTES
 _ENVIRONMENT_PREFIXES = (
     "LLM_",
     "OPENAI_",

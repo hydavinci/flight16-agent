@@ -451,8 +451,12 @@ async function submitRun() {
     state.selectedRunId = record.id;
     const selectionVersion = state.selectionVersion;
     await renderRecord(record);
-    await refreshHistory();
     schedulePoll(record, selectionVersion);
+    try {
+      await refreshHistory();
+    } catch (error) {
+      if (selectionVersion === state.selectionVersion) showNotice(errorMessage(error));
+    }
   } catch (error) {
     showNotice(errorMessage(error));
   } finally {
@@ -518,7 +522,11 @@ async function bootstrap() {
     if (state.workerConfigured) {
       elements.workerStatus.textContent = "MATLAB Worker 已配置";
       elements.workerStatus.dataset.state = "available";
-      await refreshHistory();
+      try {
+        await refreshHistory();
+      } catch (error) {
+        showNotice(errorMessage(error));
+      }
     } else {
       elements.workerStatus.textContent = "MATLAB Worker 不可用";
       elements.workerStatus.dataset.state = "unavailable";

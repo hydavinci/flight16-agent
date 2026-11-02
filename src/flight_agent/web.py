@@ -83,7 +83,7 @@ def create_web_app(
     app.state.services = services
     app.state.conversation_manager = manager
     app.include_router(pages_router(Path(__file__).parent / "static"))
-    app.include_router(workbench_router(token, authorize, root / "examples"))
+    app.include_router(workbench_router(token, authorize))
     app.include_router(
         configuration_router(
             services,

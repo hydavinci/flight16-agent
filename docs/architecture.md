@@ -315,6 +315,7 @@ src/flight_agent/
 |-- models.py                    # 共用严格契约与有限数值
 |-- service.py                   # HTTP 校验、鉴权与文件访问
 |-- directories.py               # 目录选择
+|-- examples/                    # 随 wheel 打包的两份不可由工程目录覆盖的工作台示例
 |-- matlab_support/
 |   |-- flight_agent_execute_workbench.m
 |   |-- flight_agent_run_project.m
@@ -338,7 +339,8 @@ src/flight_agent/
     `-- favicon.svg
 ```
 
-其他目录：`examples/` 放合成诊断数据，`tests/` 放各层回归。
+仓库根目录的 `examples/` 保留可直接运行的示例与合成诊断数据；Web 工作台只读取
+`flight_agent/examples/` 中随应用打包的两份白名单资源。`tests/` 放各层回归。
 `.env.example` 是配置模板，`pyproject.toml` 管理依赖、打包和开发工具。
 
 ## 开发与验证

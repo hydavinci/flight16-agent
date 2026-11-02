@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from pathlib import Path
 from threading import Event
 from urllib.parse import quote
 
@@ -13,6 +14,8 @@ from flight_agent.web_routes.workbench import workbench_router
 from flight_agent.workbench_contracts import WorkbenchRunRequest
 from tests.helpers import TOKEN, serve_app, wait_job
 from tests.test_workbench_matlab import workbench_request
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def record_data(**changes):
@@ -176,7 +179,6 @@ def test_web_workbench_rejects_invalid_artifact_path_without_worker_request(
             workbench_router(
                 "web-token",
                 authorize,
-                tmp_path,
                 remote_factory=lambda: remote,
             )
         )
@@ -341,3 +343,17 @@ def test_web_workbench_serves_only_named_examples(tmp_path, name, status):
             headers={"x-flight-token": token},
         )
         assert response.status_code == status
+
+
+def test_web_workbench_examples_are_packaged_and_ignore_project_overrides(tmp_path):
+    write_examples(tmp_path)
+    with TestClient(create_web_app(tmp_path), base_url="http://127.0.0.1") as client:
+        token = client.get("/api/workbench/bootstrap").json()["token"]
+        response = client.get(
+            "/api/workbench/examples/web_script.m",
+            headers={"x-flight-token": token},
+        )
+
+    assert response.status_code == 200
+    assert response.text == (ROOT / "examples" / "web_script.m").read_text(encoding="utf-8")
+    assert response.text != "result = params;\n"

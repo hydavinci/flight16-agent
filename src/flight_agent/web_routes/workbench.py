@@ -1,11 +1,11 @@
 import warnings
 from collections.abc import Callable
+from importlib.resources import files
 from io import BytesIO
-from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from PIL import Image
 from pydantic import ValidationError
 
@@ -42,7 +42,6 @@ def _verified_png(content: bytes) -> bytes:
 def workbench_router(
     token: str,
     authorize: Callable[[Request], None],
-    examples: Path,
     remote_factory: Callable[[], RemoteClient] = RemoteClient.from_environment,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/workbench")
@@ -71,13 +70,21 @@ def workbench_router(
         }
 
     @router.get("/examples/{name}", dependencies=auth)
-    def example(name: str) -> FileResponse:
+    def example(name: str) -> Response:
         if name not in EXAMPLES:
             raise HTTPException(status_code=404, detail="Unknown example")
-        path = examples / name
-        if not path.is_file():
-            raise HTTPException(status_code=404, detail="Example missing from project directory")
-        return FileResponse(path, media_type="text/plain", filename=name)
+        try:
+            content = files("flight_agent").joinpath("examples", name).read_bytes()
+        except (FileNotFoundError, OSError) as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="Example missing from application resources",
+            ) from exc
+        return Response(
+            content=content,
+            media_type="text/plain",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
 
     @router.get("/runs", dependencies=auth)
     def recent() -> list[WorkbenchRunRecord]:

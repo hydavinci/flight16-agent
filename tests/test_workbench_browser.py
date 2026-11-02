@@ -350,6 +350,86 @@ def test_polling_recovers_from_transient_http_error_and_stops_at_terminal(tmp_pa
             browser.close()
 
 
+def test_initial_history_failure_keeps_worker_available_and_submission_polling(
+    tmp_path, monkeypatch
+):
+    with (
+        workbench_server(tmp_path, monkeypatch, configured=False) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        run_id = []
+        history_requests = []
+        status_requests = []
+
+        def handler(route):
+            request = route.request
+            if request.method == "GET" and request.url.endswith("/runs"):
+                history_requests.append(request)
+                if len(history_requests) == 1:
+                    route.fulfill(status=503, json={"detail": "initial history unavailable"})
+                else:
+                    route.fulfill(json=[])
+            elif request.method == "POST":
+                run_id.append(request.post_data_json["id"])
+                route.fulfill(status=202, json=browser_record(run_id[0], status="queued"))
+            else:
+                status_requests.append(request)
+                route.fulfill(json=browser_record(run_id[0]))
+
+        install_workbench_api(page, handler)
+        try:
+            page.goto(url + "/workbench")
+            expect(page.locator("#worker-status")).to_contain_text("已配置")
+            expect(page.locator("#notice")).to_contain_text("initial history unavailable")
+            expect(page.locator("#run-button")).to_be_enabled()
+            submit(page)
+            expect(page.locator("#execution-status")).to_have_text("执行完成", timeout=5000)
+            assert len(run_id) == 1
+            assert len(status_requests) == 1
+        finally:
+            browser.close()
+
+
+def test_post_submit_history_failure_does_not_block_terminal_polling(tmp_path, monkeypatch):
+    with (
+        workbench_server(tmp_path, monkeypatch, configured=False) as url,
+        sync_playwright() as playwright,
+    ):
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        run_id = []
+        history_requests = []
+        status_requests = []
+
+        def handler(route):
+            request = route.request
+            if request.method == "GET" and request.url.endswith("/runs"):
+                history_requests.append(request)
+                if len(history_requests) == 1:
+                    route.fulfill(json=[])
+                else:
+                    route.fulfill(status=503, json={"detail": "post-submit history unavailable"})
+            elif request.method == "POST":
+                run_id.append(request.post_data_json["id"])
+                route.fulfill(status=202, json=browser_record(run_id[0], status="queued"))
+            else:
+                status_requests.append(request)
+                route.fulfill(json=browser_record(run_id[0]))
+
+        install_workbench_api(page, handler)
+        try:
+            page.goto(url + "/workbench")
+            submit(page)
+            expect(page.locator("#notice")).to_contain_text("post-submit history unavailable")
+            expect(page.locator("#execution-status")).to_have_text("执行完成", timeout=5000)
+            assert len(run_id) == 1
+            assert len(status_requests) == 1
+        finally:
+            browser.close()
+
+
 def test_selecting_history_cancels_active_run_polling(tmp_path, monkeypatch):
     with (
         workbench_server(tmp_path, monkeypatch, configured=False) as url,
