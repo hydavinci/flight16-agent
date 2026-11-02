@@ -1,4 +1,5 @@
 import os
+from threading import Event, Timer
 
 import pytest
 from playwright.sync_api import expect, sync_playwright
@@ -22,6 +23,42 @@ pytestmark = [
         reason="Browser tests are opt-in",
     ),
 ]
+
+
+def test_slow_bootstrap_cannot_clear_a_message_before_submission(tmp_path, monkeypatch):
+    app, runtime, _, _ = make_agent_web(
+        tmp_path,
+        [{"action": "plan", "text": "Analyze supplied arrays.", "plan": draft_data()}],
+    )
+    release = Event()
+    locations = runtime.resources.locations
+
+    def delayed_locations():
+        assert release.wait(timeout=5)
+        return locations()
+
+    monkeypatch.setattr(runtime.resources, "locations", delayed_locations)
+    with serve_app(app) as url, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        requests = []
+        page.on(
+            "request",
+            lambda request: requests.append(request.post_data_json)
+            if request.method == "POST" and request.url.endswith("/api/conversations") else None,
+        )
+        timer = Timer(0.5, release.set)
+        timer.start()
+        try:
+            page.goto(url)
+            page.get_by_label("任务需求", exact=True).fill("Analyze supplied synthetic arrays.")
+            page.locator("#send").click()
+            expect(page.locator("#baseline")).to_contain_text("v1")
+            assert requests == [{"message": "Analyze supplied synthetic arrays."}]
+        finally:
+            release.set()
+            timer.join()
+            browser.close()
 
 
 def test_queued_state_keeps_polling_and_disables_confirmation(tmp_path):

@@ -311,6 +311,7 @@ async function decide(action) {
 }
 
 export async function start() {
+  controls();
   $("composer").addEventListener("submit", send);
   $("resource-location").addEventListener("change", () => {
     if (state.sending || active() || state.nativePicker) return;
