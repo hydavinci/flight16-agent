@@ -17,6 +17,7 @@ MAX_WORKBENCH_FIGURE_BYTES = 2_000_000
 MAX_WORKBENCH_FIGURES = 5
 
 _MATLAB_FILENAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,62}\.m")
+_WORKBENCH_ARTIFACT = re.compile(r"figure-[1-5]\.png")
 _MATLAB_KEYWORDS = {
     "arguments",
     "break",
@@ -82,6 +83,13 @@ def _safe_artifact_path(value: str) -> str:
         raise ValueError("Artifact path must be relative and without traversal")
     if path.suffix.lower() != ".png":
         raise ValueError("Figure artifact name must end in .png")
+    return value
+
+
+def workbench_artifact_path(value: str) -> str:
+    _safe_artifact_path(value)
+    if _WORKBENCH_ARTIFACT.fullmatch(value) is None:
+        raise ValueError("Workbench artifact path must match figure-N.png")
     return value
 
 

@@ -10,7 +10,11 @@ from PIL import Image
 from pydantic import ValidationError
 
 from ..remote import RemoteClient, RemoteError, RemoteHTTPError
-from ..workbench_contracts import WorkbenchRunRecord, WorkbenchRunRequest
+from ..workbench_contracts import (
+    WorkbenchRunRecord,
+    WorkbenchRunRequest,
+    workbench_artifact_path,
+)
 
 EXAMPLES = {"web_script.m", "web_function.m"}
 _UNAVAILABLE = "MATLAB Worker is unavailable"
@@ -98,6 +102,10 @@ def workbench_router(
 
     @router.get("/runs/{run_id}/artifacts/{name:path}", dependencies=auth)
     def artifact(run_id: str, name: str) -> Response:
+        try:
+            name = workbench_artifact_path(name)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail="Unknown artifact") from exc
         try:
             content = _verified_png(remote().workbench_artifact(run_id, name))
         except (httpx.HTTPError, RemoteError, ValidationError, ValueError, OSError) as exc:

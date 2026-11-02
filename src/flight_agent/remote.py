@@ -10,6 +10,7 @@ from .workbench_contracts import (
     MAX_WORKBENCH_FIGURE_BYTES,
     WorkbenchRunRecord,
     WorkbenchRunRequest,
+    workbench_artifact_path,
 )
 
 
@@ -132,6 +133,7 @@ class RemoteClient:
         )
 
     def workbench_artifact(self, run_id: str, path: str) -> bytes:
+        path = workbench_artifact_path(path)
         return self._workbench_request(
             "GET",
             f"/workbench/runs/{run_id}/artifacts/{quote(path, safe='/')}",

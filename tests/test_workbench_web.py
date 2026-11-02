@@ -1,12 +1,15 @@
 from contextlib import contextmanager
 from threading import Event
+from urllib.parse import quote
 
 import httpx
 import pytest
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 from flight_agent.remote import RemoteClient, RemoteError
 from flight_agent.web import create_web_app
+from flight_agent.web_routes.workbench import workbench_router
 from flight_agent.workbench_contracts import WorkbenchRunRequest
 from tests.helpers import TOKEN, serve_app, wait_job
 from tests.test_workbench_matlab import workbench_request
@@ -110,6 +113,83 @@ def test_remote_workbench_bounds_json_and_artifact_responses():
             remote.recent_workbench()
         with pytest.raises(RemoteError, match="size limit"):
             remote.workbench_artifact("1" * 32, "figure-1.png")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "/health",
+        "../health",
+        "figure-1.png/../../health",
+        r"..\health.png",
+        "%2e%2e/health.png",
+        "nested/figure-1.png",
+        "figure-0.png",
+        "figure-6.png",
+        "figure-01.png",
+        "figure-1.jpg",
+    ],
+)
+def test_remote_workbench_rejects_invalid_artifact_path_without_request(name):
+    requests = []
+
+    def worker(request):
+        requests.append(request)
+        return httpx.Response(200, content=b"unreachable")
+
+    with httpx.Client(transport=httpx.MockTransport(worker)) as client:
+        remote = RemoteClient("http://127.0.0.1:9001", TOKEN, client=client)
+        with pytest.raises(ValueError, match="[Aa]rtifact"):
+            remote.workbench_artifact("1" * 32, name)
+
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../health.png",
+        r"..\health.png",
+        "%2e%2e%2fhealth.png",
+        "nested/figure-1.png",
+        "figure-6.png",
+        "figure-1.jpg",
+    ],
+)
+def test_web_workbench_rejects_invalid_artifact_path_without_worker_request(
+    tmp_path, name
+):
+    requests = []
+
+    def worker(request):
+        requests.append(request)
+        return httpx.Response(200, content=b"unreachable")
+
+    def authorize(request: Request) -> None:
+        pass
+
+    with httpx.Client(transport=httpx.MockTransport(worker)) as http_client:
+        remote = RemoteClient("http://127.0.0.1:9001", TOKEN, client=http_client)
+        app = FastAPI()
+        app.include_router(
+            workbench_router(
+                "web-token",
+                authorize,
+                tmp_path,
+                remote_factory=lambda: remote,
+            )
+        )
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            response = client.get(
+                "/api/workbench/runs/"
+                + "1" * 32
+                + "/artifacts/"
+                + quote(name, safe=""),
+            )
+
+    assert response.status_code == 404
+    assert requests == []
 
 
 def write_examples(root):
