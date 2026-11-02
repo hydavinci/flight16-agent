@@ -9,7 +9,12 @@ from fastapi.testclient import TestClient
 from flight_agent.runtime.agent_contracts import AgentPlanDraft
 from flight_agent.runtime.capability_metadata import Availability
 from flight_agent.runtime.contracts import fingerprint
-from flight_agent.verification.agent_planner import AgentDecision, AgentPlanner, bind_plan
+from flight_agent.verification.agent_planner import (
+    AgentDecision,
+    AgentPlanner,
+    _signal_table_declarations,
+    bind_plan,
+)
 from flight_agent.verification.local_matlab import LocalMatlabBackend
 from flight_agent.verification.matlab_contracts import LocalMatlabResult
 from flight_agent.web import create_web_app
@@ -753,6 +758,117 @@ SIGNAL_TABLE = (
     "| `response` | 真实被控对象响应 | deg/s |\n"
     "| `step_time_s` | 配置的阶跃时刻 | s |\n"
 )
+
+
+def test_f16_signal_table_meanings_identify_input_and_response_roles():
+    rows = _signal_table_declarations(
+        "## 信号记录\n\n"
+        "GUI 运行后的工作区变量为 `out`，只保存一个数据字段 `out.logsout`，"
+        "格式为 `Simulink.SimulationData.Dataset`。\n\n"
+        "| 日志名 | 含义 | 单位 |\n"
+        "| --- | --- | --- |\n"
+        "| `stick_lb` | 实际进入 CAS LONG 的纵向杆力 | lb |\n"
+        "| `q_deg_s` | 真实飞机俯仰角速度 | deg/s |\n"
+        "| `step_time_s` | 配置的阶跃时刻 | s |\n"
+    )
+
+    assert rows == [
+        ("logsout", "stick_lb", "lb", "input_signal"),
+        ("logsout", "q_deg_s", "deg/s", "response_signal"),
+        ("logsout", "step_time_s", "s", None),
+    ]
+
+
+def test_signal_table_rejects_conflicting_explicit_and_inferred_roles():
+    rows = _signal_table_declarations(
+        "Signals are recorded in `logsout`.\n\n"
+        "| Signal | Role | Meaning | Unit |\n"
+        "| --- | --- | --- | --- |\n"
+        "| command | response | Actual excitation | deg |\n"
+    )
+
+    assert rows == [("logsout", "command", "deg", "conflict")]
+
+
+def test_f16_signal_roles_correct_a_wrong_model_selection(
+    signal_table_case, monkeypatch
+):
+    def wrong_signal(payload):
+        inputs = payload["plan"]["nodes"][0]["inputs"]
+        inputs["input_signal"] = {
+            "source": "logsout",
+            "path": ["q_deg_s"],
+            "unit": "deg/s",
+        }
+        inputs["response_signal"] = {
+            "source": "logsout",
+            "path": ["q_deg_s"],
+            "unit": "deg/s",
+        }
+
+    def corrected_signals(payload):
+        inputs = payload["plan"]["nodes"][0]["inputs"]
+        inputs["input_signal"] = {
+            "source": "logsout",
+            "path": ["stick_lb"],
+            "unit": "lb",
+        }
+        inputs["response_signal"] = {
+            "source": "logsout",
+            "path": ["q_deg_s"],
+            "unit": "deg/s",
+        }
+
+    calls = structured_selection_model(
+        signal_table_case, monkeypatch, [wrong_signal, corrected_signals]
+    )
+    signal_table_document(
+        signal_table_case,
+        "## 信号记录\n\n"
+        "GUI 运行后的工作区变量为 `out`，只保存一个数据字段 `out.logsout`，"
+        "格式为 `Simulink.SimulationData.Dataset`。\n\n"
+        "| 日志名 | 含义 | 单位 |\n"
+        "| --- | --- | --- |\n"
+        "| `stick_lb` | 实际进入 CAS LONG 的纵向杆力 | lb |\n"
+        "| `q_deg_s` | 真实飞机俯仰角速度 | deg/s |\n"
+        "| `step_time_s` | 配置的阶跃时刻 | s |\n",
+    )
+
+    record = submit(
+        signal_table_case,
+        "Apply a Stick step and analyze the q response; condition: cruise. "
+        "Use stepinfo settling band 5%; overshoot <=10%; settling_time <=3 s. "
+        "Deliver JSON and Word.",
+    )
+
+    assert record.task is not None, record.messages[-1].content
+    assert calls[1]["context"]["validation_feedback"]["errors"] == [{
+        "location": ["input_signal"],
+        "code": "source_selection_mismatch",
+        "expected_selection": "stick_lb",
+    }]
+    assert record.task.baseline.nodes[0].inputs["input_signal"]["path"] == ["stick_lb"]
+    assert signal_table_case[3].requests == []
+
+
+def test_conflicting_signal_role_cannot_be_hidden_by_a_compatible_row(
+    signal_table_case,
+):
+    signal_table_document(
+        signal_table_case,
+        "Signals are recorded in `logsout`.\n\n"
+        "| Signal | Role | Meaning | Unit |\n"
+        "| --- | --- | --- | --- |\n"
+        "| command | response | Actual excitation | deg |\n"
+        "| command | input | Actual excitation | deg |\n"
+        "| response | response | Actual response | deg/s |\n",
+    )
+
+    record = submit(signal_table_case, SIGNAL_TABLE_REQUEST)
+
+    assert record.task is None
+    assert record.pending_decision.kind == "clarify"
+    assert signal_table_case[3].requests == []
 
 
 def signal_table_document(case, content):

@@ -336,6 +336,22 @@ def _signal_cell(value: str) -> str:
     return value
 
 
+def _signal_meaning_role(value: str) -> str | None:
+    input_role = re.search(
+        r"\b(?:input|excitation|command|reference)\b|输入|激励|命令|指令|给定|实际进入",
+        value,
+        re.IGNORECASE,
+    )
+    response_role = re.search(
+        r"\b(?:response|output|measurement|measured)\b|响应|输出|测量|实测|真实(?:飞机|被控对象)",
+        value,
+        re.IGNORECASE,
+    )
+    if bool(input_role) == bool(response_role):
+        return None
+    return "input_signal" if input_role else "response_signal"
+
+
 def _signal_table_declarations(text: str) -> list[_SignalTableRow]:
     examples = r"\b(?:examples?|samples?|candidates?)\b|示例|例如|举例|候选|备选"
     aliases = {
@@ -343,6 +359,7 @@ def _signal_table_declarations(text: str) -> list[_SignalTableRow]:
         "unit": {"单位", "unit", "units"},
         "source": {"来源", "数据来源", "source", "namespace"},
         "role": {"角色", "role"},
+        "meaning": {"含义", "说明", "description", "meaning"},
     }
     roles = {
         "input": "input_signal",
@@ -460,7 +477,15 @@ def _signal_table_declarations(text: str) -> list[_SignalTableRow]:
                 "函数返回值": "return",
             }.get(source, source)
         role = cells[columns["role"]].casefold().replace("_", " ") if "role" in columns else ""
-        rows.append(_SignalTableRow(source, name, unit, roles.get(role, role) if role else None))
+        meaning_role = (
+            _signal_meaning_role(cells[columns["meaning"]]) if "meaning" in columns else None
+        )
+        explicit_role = roles.get(role, role) if role else None
+        if explicit_role is not None and meaning_role is not None and explicit_role != meaning_role:
+            explicit_role = "conflict"
+        rows.append(
+            _SignalTableRow(source, name, unit, explicit_role or meaning_role)
+        )
     return rows
 
 
@@ -673,6 +698,9 @@ def _validate_local_execution(
 ) -> None:
     texts, records, configuration = _local_facts(project, sources)
     signal_rows = [row for text in texts for row in _signal_table_declarations(text)]
+    user_text = "\n".join(
+        source.quote for source in sources.values() if source.kind == "user_message"
+    )
     if configuration.get("backend", "simulink") != "simulink":
         raise _LocalPlanningIssue("Unsupported explicit project backend", gap=True)
     if "working_directory" in configuration and (
@@ -733,6 +761,46 @@ def _validate_local_execution(
         if signal is None:
             continue
         configured = configuration.get(label)
+        path = ".".join(signal.path)
+        matching_rows = [row for row in signal_rows if row.name == path]
+        role_rows = [
+            row for row in signal_rows if row.role == label and row.source is not None
+        ]
+        role_names = {row.name for row in role_rows}
+        expected = next(iter(role_names)) if len(role_names) == 1 else None
+        expected_token = expected.rsplit(".", 1)[-1].split("_", 1)[0] if expected else None
+        generic_tokens = {"input", "output", "response", "command", "reference", "signal"}
+        request_candidates = {
+            candidate
+            for candidate in {expected, expected_token}
+            if candidate
+            and (
+                candidate.casefold() not in generic_tokens
+                or "_" in candidate
+                or "." in candidate
+            )
+        }
+        requested = expected is not None and any(
+            re.search(
+                r"(?<![A-Za-z0-9_])" + re.escape(candidate) + r"(?![A-Za-z0-9_])",
+                user_text,
+                re.IGNORECASE,
+            )
+            for candidate in request_candidates
+        )
+        if (
+            not isinstance(configured, dict)
+            and expected is not None
+            and requested
+            and path != expected
+        ):
+            raise _LocalPlanningIssue(
+                f"Proposed {label} differs from its unambiguous documented signal: {expected}",
+                selection=(label, expected),
+            )
+        for row in matching_rows:
+            if row.role is not None and row.role != label:
+                raise _LocalPlanningIssue(f"{label} conflicts with its documented signal role")
         if isinstance(configured, dict) and (
             configured.get("name") != ".".join(signal.path)
             or configured.get("unit") != signal.unit
@@ -742,11 +810,7 @@ def _validate_local_execution(
         declarations = [
             declaration for text in texts for declaration in _signal_declarations(text, label)
         ]
-        for row in signal_rows:
-            if row.name != ".".join(signal.path):
-                continue
-            if row.role is not None and row.role != label:
-                raise _LocalPlanningIssue(f"{label} conflicts with its documented signal role")
+        for row in matching_rows:
             declarations.append((row.source, row.name, row.unit))
         if any(
             path != ".".join(signal.path)
