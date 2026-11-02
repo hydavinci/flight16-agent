@@ -13,6 +13,7 @@ from starlette.middleware.base import RequestResponseEndpoint
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
+from .application import build_application
 from .config import ModelSettings, SchedulerSettings
 from .directories import (
     DirectoryListing,
@@ -21,25 +22,12 @@ from .directories import (
     choose_native_directory,
 )
 from .remote import RemoteError
-from .runtime.capabilities import CapabilityRegistry
-from .runtime.scheduling import (
-    ExecutionScheduler,
-    ExecutionTurnScheduler,
-    PlanningScheduler,
-)
 from .service import BodyLimitMiddleware, install_validation_handler
-from .verification.adapters.local_matlab import LOCAL_MATLAB_CAPABILITY_NAMES
 from .verification.agent_planner import AgentPlanner
-from .verification.agent_runtime import AgentContext, AgentExecutor
-from .verification.backend import AnalysisBackend, RemoteSimulinkBackend
+from .verification.backend import RemoteSimulinkBackend
 from .verification.coordinator import EngineeringRuntime
-from .verification.diagnostic_planner import DiagnosticReviewer
-from .verification.local_matlab import LocalMatlabBackend
-from .verification.plugins import register_builtin_plugins
-from .verification.project_snapshots import ProjectSnapshotStore
-from .verification.resources import ResourceLocation, ResourceRegistry, resolve_location
+from .verification.resources import ResourceLocation, resolve_location
 from .verification.routes import ConversationManager, verification_router
-from .verification.sqlite_store import SQLiteConversationStore
 
 
 class DirectorySelectionRequest(BaseModel):
@@ -50,113 +38,25 @@ class DirectorySelectionRequest(BaseModel):
     path: str = Field(default="", max_length=4096)
 
 
-def _bind_local_matlab_backend(
-    backend: LocalMatlabBackend, snapshots: ProjectSnapshotStore
-) -> LocalMatlabBackend:
-    if backend.snapshots is None:
-        backend.snapshots = snapshots
-    elif backend.snapshots is not snapshots:
-        raise ValueError("Local MATLAB backend and executor must share one snapshot store")
-    return backend
-
-
-def _registered_local_matlab_backend(
-    runtime: EngineeringRuntime,
-) -> LocalMatlabBackend | None:
-    tools = runtime.executor.tools
-    registered = [
-        name for name in LOCAL_MATLAB_CAPABILITY_NAMES if tools.registered(name)
-    ]
-    if not registered:
-        return None
-    owners = []
-    for name in registered:
-        owner = tools.runtime_owner(name, LocalMatlabBackend)
-        if owner is None:
-            raise ValueError(
-                f"Registered local MATLAB capability requires its backend owner: {name}"
-            )
-        owners.append(owner)
-    registered_owner = owners[0]
-    if any(owner is not registered_owner for owner in owners[1:]):
-        raise ValueError("Registered local MATLAB capabilities must share the same backend owner")
-    declared_owner = runtime.local_matlab_backend
-    if declared_owner is not None and declared_owner is not registered_owner:
-        raise ValueError(
-            "Declared local MATLAB backend differs from the registered backend owner"
-        )
-    return registered_owner
-
-
 def create_web_app(
     root: Path,
     *,
     engineering_runtime: EngineeringRuntime | None = None,
     native_directory_picker: bool = False,
     scheduler_settings: SchedulerSettings | None = None,
+    conversation_manager: ConversationManager | None = None,
 ) -> FastAPI:
-    settings = scheduler_settings if scheduler_settings is not None else (
-        engineering_runtime.executor.scheduler.settings
-        if engineering_runtime is not None
-        else SchedulerSettings.from_environment()
+    services = build_application(
+        root,
+        engineering_runtime=engineering_runtime,
+        scheduler_settings=scheduler_settings,
+        conversation_manager=conversation_manager,
     )
-    if (
-        engineering_runtime is not None
-        and engineering_runtime.executor.scheduler.settings != settings
-    ):
-        raise ValueError("Injected runtime and Web scheduler settings must match")
-    resources = (
-        engineering_runtime.resources if engineering_runtime is not None else ResourceRegistry()
-    )
-    try:
-        backend: AnalysisBackend | None = RemoteSimulinkBackend.from_environment()
-    except ValueError:
-        backend = None
-    conversations = (
-        engineering_runtime.store
-        if engineering_runtime is not None
-        else SQLiteConversationStore(root / "runs" / "verification")
-    )
-    snapshots = (
-        engineering_runtime.executor.snapshots
-        if engineering_runtime is not None
-        else ProjectSnapshotStore(conversations.root / "snapshots")
-    )
-    if engineering_runtime is None:
-        local_backend = _bind_local_matlab_backend(
-            LocalMatlabBackend.from_environment(), snapshots
-        )
-        tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
-        register_builtin_plugins(
-            tools, resources, backend=backend,
-            diagnostic_reviewer=DiagnosticReviewer(), local_backend=local_backend,
-        )
-        engineering_runtime = EngineeringRuntime(
-            conversations, AgentPlanner(),
-            AgentExecutor(
-                conversations,
-                tools,
-                resources,
-                scheduler=ExecutionScheduler(settings),
-                snapshots=snapshots,
-            ),
-            resources,
-            local_matlab_backend=local_backend,
-        )
-    else:
-        owned_local_backend = _registered_local_matlab_backend(engineering_runtime)
-        if owned_local_backend is None:
-            owned_local_backend = LocalMatlabBackend.from_environment()
-        local_backend = _bind_local_matlab_backend(
-            owned_local_backend,
-            snapshots,
-        )
-    runtime = engineering_runtime
-    manager = ConversationManager(
-        runtime,
-        PlanningScheduler(settings.planning_workers, settings.planning_queue),
-        ExecutionTurnScheduler(settings.execution_turns),
-    )
+    runtime = services.runtime
+    resources = services.resources
+    local_backend = services.local_backend
+    backend = services.backend
+    manager = services.manager
     token = secrets.token_urlsafe(32)
     static = Path(__file__).parent / "static"
     native_picker_lock = Lock()
@@ -166,7 +66,7 @@ def create_web_app(
         try:
             yield
         finally:
-            manager.close()
+            services.close()
 
     def same_origin(request: Request) -> None:
         origin = request.headers.get("origin")
@@ -194,6 +94,7 @@ def create_web_app(
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
     install_validation_handler(app)
     auth = [Depends(authorize)]
+    app.state.services = services
     app.state.conversation_manager = manager
     app.include_router(verification_router(manager, authorize))
 

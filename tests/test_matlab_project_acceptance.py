@@ -174,7 +174,7 @@ def acceptance_draft(context, case):
 
 
 def acceptance_app(directory, monkeypatch, case, backend=None, mutate=None):
-    import flight_agent.web as web
+    import flight_agent.application as application
 
     planner = AgentPlanner(model=ScriptedModel(responses=[]))
     contexts = []
@@ -190,20 +190,20 @@ def acceptance_app(directory, monkeypatch, case, backend=None, mutate=None):
         )
 
     monkeypatch.setattr(planner, "_decision", decision)
-    monkeypatch.setattr(web, "AgentPlanner", lambda: planner)
+    monkeypatch.setattr(application, "AgentPlanner", lambda: planner)
     if backend is not None:
         monkeypatch.setattr(
             LocalMatlabBackend, "from_environment", classmethod(lambda cls: backend),
         )
     assembled = []
-    runtime_class = web.EngineeringRuntime
+    runtime_class = application.EngineeringRuntime
 
     def capture(*args, **kwargs):
         runtime = runtime_class(*args, **kwargs)
         assembled.append(runtime)
         return runtime
 
-    monkeypatch.setattr(web, "EngineeringRuntime", capture)
+    monkeypatch.setattr(application, "EngineeringRuntime", capture)
     app = create_web_app(directory)
     return app, assembled[0], contexts
 

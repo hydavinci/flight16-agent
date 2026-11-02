@@ -158,7 +158,7 @@ def local_draft(context):
 def local_planning_case(tmp_path, monkeypatch):
     import sys
 
-    import flight_agent.web as web
+    import flight_agent.application as application
     from tests.helpers import ScriptedModel
 
     def forbidden(*args, **kwargs):
@@ -187,16 +187,16 @@ def local_planning_case(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(planner, "_decision", decision)
-    monkeypatch.setattr(web, "AgentPlanner", lambda: planner)
+    monkeypatch.setattr(application, "AgentPlanner", lambda: planner)
     assembled = []
-    original = web.EngineeringRuntime
+    original = application.EngineeringRuntime
 
     def capture(*args, **kwargs):
         runtime = original(*args, **kwargs)
         assembled.append(runtime)
         return runtime
 
-    monkeypatch.setattr(web, "EngineeringRuntime", capture)
+    monkeypatch.setattr(application, "EngineeringRuntime", capture)
     app = create_web_app(tmp_path)
     runtime = assembled[0]
     # Keep registration failures as behavior failures rather than fixture errors.

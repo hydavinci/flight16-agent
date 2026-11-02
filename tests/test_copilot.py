@@ -691,6 +691,7 @@ def test_copilot_corrects_missing_output_binding_without_executing(
 def test_copilot_shared_catalog_preserves_source_correction_and_confirmation(
     copilot_cli, monkeypatch, tmp_path
 ):
+    import flight_agent.application as application
     import flight_agent.web as web
     from flight_agent.runtime.requirements import CriterionSource
     from flight_agent.verification.local_matlab import LocalMatlabBackend
@@ -705,14 +706,14 @@ def test_copilot_shared_catalog_preserves_source_correction_and_confirmation(
     monkeypatch.setattr(LocalMatlabBackend, "from_environment", classmethod(lambda cls: backend))
     monkeypatch.setattr(LocalMatlabBackend, "_spawn", forbidden)
     runtimes = []
-    original_runtime = web.EngineeringRuntime
+    original_runtime = application.EngineeringRuntime
 
     def capture(*args, **kwargs):
         runtime = original_runtime(*args, **kwargs)
         runtimes.append(runtime)
         return runtime
 
-    monkeypatch.setattr(web, "EngineeringRuntime", capture)
+    monkeypatch.setattr(application, "EngineeringRuntime", capture)
     web.create_web_app(tmp_path / "web")
     runtime = runtimes[0]
     project = prepared_project(tmp_path / "project")
