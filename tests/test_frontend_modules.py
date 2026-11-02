@@ -16,6 +16,10 @@ MODULES = {
     "resize-preferences.js",
     "bootstrap.js",
 }
+WORKBENCH_ASSETS = {
+    "matlab-workbench.js": "text/javascript",
+    "matlab-workbench.css": "text/css",
+}
 
 
 def test_workbench_loads_native_modules_from_explicit_allowlist(tmp_path):
@@ -32,6 +36,11 @@ def test_workbench_loads_native_modules_from_explicit_allowlist(tmp_path):
             assert response.status_code == 200
             assert response.headers["content-type"].split(";")[0] == "text/javascript"
             assert response.headers["x-content-type-options"] == "nosniff"
+        for name, content_type in WORKBENCH_ASSETS.items():
+            response = client.get("/static/" + name)
+            assert response.status_code == 200
+            assert response.headers["content-type"].split(";")[0] == content_type
+            assert response.headers["x-content-type-options"] == "nosniff"
         for name in (
             "agent.html",
             "unknown.js",
@@ -40,6 +49,34 @@ def test_workbench_loads_native_modules_from_explicit_allowlist(tmp_path):
             "api.js.map",
         ):
             assert client.get("/static/" + name).status_code == 404
+
+
+def test_workbench_page_has_dedicated_csp_safe_controls(tmp_path):
+    app, _, _, _ = make_agent_web(tmp_path, [])
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        response = client.get("/workbench")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "<title>MATLAB 分析工作台</title>" in html
+    assert re.search(r'<input\b[^>]*\bid="file"[^>]*\btype="file"', html)
+    assert re.search(r'<select\b[^>]*\bid="kind"', html)
+    assert re.search(r'<input\b[^>]*\bid="timeout"', html)
+    assert re.search(r'<textarea\b[^>]*\bid="parameters"', html)
+    assert re.search(r'<input\b[^>]*\bid="trusted"[^>]*\btype="checkbox"', html)
+    assert re.search(r'<button\b[^>]*\bid="run-button"', html)
+    for element_id in ("result-data", "figures", "execution-log", "history"):
+        assert f'id="{element_id}"' in html
+    assert re.search(r'<a\b[^>]*\bhref="/"', html)
+    assert 'id="messages"' not in html
+    assert 'id="composer"' not in html
+    assert "Agent 分析" not in html
+    assert "<style" not in html
+    assert re.search(
+        r'<script\b(?=[^>]*\bdefer\b)(?=[^>]*\bsrc="/static/matlab-workbench\.js")[^>]*>',
+        html,
+    )
+    assert '<link rel="stylesheet" href="/static/matlab-workbench.css">' in html
 
 
 def test_import_graph_is_local_complete_and_acyclic():

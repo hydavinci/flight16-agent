@@ -71,7 +71,7 @@ def test_chat_hides_only_structured_user_closing_labels_and_keeps_source_text(
 
 
 @pytest.mark.parametrize("path,title", [
-    ("/", "Flight Agent"), ("/workbench", "Flight Agent"),
+    ("/", "Flight Agent"), ("/workbench", "MATLAB 分析工作台"),
 ])
 def test_browser_tab_title_and_local_favicon_render_correctly(tmp_path, path, title):
     app, runtime, calls, _ = make_agent_web(tmp_path, [])
@@ -113,7 +113,7 @@ def test_browser_tab_title_and_local_favicon_render_correctly(tmp_path, path, ti
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_generic_workbench_restores_the_selected_agent_conversation(tmp_path, width):
+def test_agent_conversation_stays_on_homepage_and_workbench_is_dedicated(tmp_path, width):
     app, runtime, calls, _ = make_agent_web(
         tmp_path, [{"action": "plan", "text": "Confirm analysis.", "plan": draft_data()}],
     )
@@ -140,15 +140,11 @@ def test_generic_workbench_restores_the_selected_agent_conversation(tmp_path, wi
             expect(page.locator("#conversation-status")).to_have_text("等待确认或补充")
             page.goto(url + "/workbench")
             expect(page).to_have_url(url + "/workbench")
-            expect(page).to_have_title("Flight Agent")
-            expect(page.locator('input[type="file"]')).to_have_count(0)
-            expect(page.locator("#messages")).to_contain_text("Analyze supplied arrays.")
-            expect(page.locator("#conversation-status")).to_have_text("等待确认或补充")
-            expect(page.locator("#conversation-status")).to_be_visible()
-            expect(page.locator("#history-panel")).not_to_have_attribute("open", "")
-            expect(
-                page.locator(f'#conversation-history button[data-id="{saved.id}"]'),
-            ).to_have_attribute("aria-current", "true")
+            expect(page).to_have_title("MATLAB 分析工作台")
+            expect(page.locator('input[type="file"]')).to_have_count(1)
+            expect(page.locator("#messages")).to_have_count(0)
+            expect(page.locator("#conversation-status")).to_have_count(0)
+            expect(page.locator("#history-panel")).to_have_count(0)
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             assert len(runtime.store.recent()) == 1
             assert calls == []
