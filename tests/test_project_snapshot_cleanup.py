@@ -335,14 +335,19 @@ def test_reparse_object_is_never_followed_or_deleted(tmp_path, monkeypatch):
 
 
 def test_unknown_managed_entries_are_reported_without_traversal(tmp_path):
-    source, _, snapshots, _ = snapshot_case(tmp_path)
+    source, _, snapshots, binding = snapshot_case(tmp_path)
     store = ConversationStore(tmp_path / "managed")
     unknown_shard = snapshots.root / "objects" / "zz"
     unknown_shard.mkdir()
     (unknown_shard / "external").symlink_to(source, target_is_directory=True)
     special_shard = snapshots.root / "objects" / "00"
     special_shard.write_bytes(b"not a directory")
-    invalid_object = snapshots.root / "objects" / "aa" / "not-a-digest"
+    invalid_shard = next(
+        f"{value:02x}"
+        for value in range(1, 256)
+        if f"{value:02x}" != binding.snapshot_id[:2]
+    )
+    invalid_object = snapshots.root / "objects" / invalid_shard / "not-a-digest"
     invalid_object.parent.mkdir()
     invalid_object.mkdir()
 
