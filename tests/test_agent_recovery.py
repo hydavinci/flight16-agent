@@ -1,13 +1,19 @@
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
+from threading import Event
 
 import pytest
 
 from flight_agent.runtime.agent_contracts import AgentPlan
 from flight_agent.runtime.capabilities import CapabilityRegistry
 from flight_agent.runtime.evidence import agent_receipt_name
+from flight_agent.runtime.scheduling_contracts import SchedulingMetadata
+from flight_agent.verification.contracts import ConversationState, PendingDecision
 from flight_agent.verification.store import ConversationStore
 from tests.agent_helpers import analysis_plan_data, register_rmse
 from tests.test_agent_runtime import confirm, propose, runtime_module, setup
+from tests.test_scheduler_runtime import assert_conversation_lock_available
 
 
 def restarted(runtime, store, tools=None):
@@ -140,9 +146,8 @@ def test_changed_confirmed_baseline_is_not_recovered_under_its_old_confirmation(
     done = confirm(runtime, propose(runtime, conversation))
     done.task.baseline.nodes[0].inputs["observed"] = [100, 200]
     done.status = "interrupted"
-    store.save(done)
-    with pytest.raises(ValueError, match="baseline|confirmation|scope"):
-        restarted(runtime, store).resume(done.id)
+    with pytest.raises(ValueError, match="terminal|immutable"):
+        store.save(done)
     assert len(calls) == 1
 
 
@@ -155,6 +160,8 @@ def test_checkpoint_reconciliation_reads_only_original_call_and_verifies_digest(
 
     calls = []
     lookups = []
+    identifier = None
+    recovery = None
 
     def operation(context, inputs):
         calls.append(context.call_id)
@@ -162,6 +169,7 @@ def test_checkpoint_reconciliation_reads_only_original_call_and_verifies_digest(
         raise KeyboardInterrupt("After durable tool completion checkpoint")
 
     def reconcile(context, inputs):
+        assert_conversation_lock_available(recovery, identifier)
         lookups.append(context.call_id)
         data = context.load_checkpoint()
         if data is None:
@@ -196,13 +204,15 @@ def test_checkpoint_reconciliation_reads_only_original_call_and_verifies_digest(
     )
     runtime, store, conversation, _ = setup(tmp_path, tools=tools)
     pending = propose(runtime, conversation)
+    identifier = pending.id
     with pytest.raises(KeyboardInterrupt):
         confirm(runtime, pending)
     if tamper:
         saved = store.get(pending.id).task
         checkpoint = Path(saved.result_directory) / saved.checkpoints[calls[0]]
         checkpoint.write_text('{"value":999}')
-    recovered = restarted(runtime, store).resume(pending.id)
+    recovery = restarted(runtime, store)
+    recovered = recovery.resume(pending.id)
     if tamper:
         assert recovered.status == "interrupted"
         assert "digest" in recovered.error.lower()
@@ -213,6 +223,220 @@ def test_checkpoint_reconciliation_reads_only_original_call_and_verifies_digest(
     assert lookups == calls
     assert len(calls) == 1
     assert recovered.task.budget_state.calls == 1
+
+
+def reconciliation_case(tmp_path, reconcile):
+    from flight_agent.runtime.capabilities import Capability
+    from flight_agent.runtime.capability_metadata import (
+        CapabilityMetadata,
+        MetricDefinition,
+    )
+    from flight_agent.runtime.observations import CapabilityOutcome
+    from tests.agent_helpers import RmseInput
+
+    calls = []
+
+    def operation(context, inputs):
+        calls.append(context.call_id)
+        context.save_checkpoint({"value": 1.0, "terminal": True})
+        raise KeyboardInterrupt("After durable tool completion checkpoint")
+
+    tools = CapabilityRegistry(agent_mode=True)
+    tools.register(
+        Capability(
+            name="offline_rmse",
+            version="1",
+            description="Reconcile bounded durable measurement.",
+            input_model=RmseInput,
+            output_model=CapabilityOutcome,
+            effect="read_only",
+            operation=operation,
+            reconcile=reconcile,
+            metadata=CapabilityMetadata(
+                metrics=[MetricDefinition(id="rmse", label="RMSE", unit="m")]
+            ),
+        )
+    )
+    runtime, store, conversation, _ = setup(tmp_path, tools=tools)
+    pending = propose(runtime, conversation)
+    with pytest.raises(KeyboardInterrupt):
+        confirm(runtime, pending)
+    return restarted(runtime, store), pending.id, calls
+
+
+@pytest.mark.parametrize("mutation", ["definition", "scheduling"])
+def test_reconciliation_revalidates_registry_before_callback(
+    tmp_path, monkeypatch, mutation
+):
+    lookups = []
+
+    def reconcile(context, inputs):
+        lookups.append(context.call_id)
+        return None
+
+    recovery, identifier, calls = reconciliation_case(tmp_path, reconcile)
+    definition = recovery.tools.definition("offline_rmse")
+    scheduling = recovery.tools.scheduling("offline_rmse")
+    queued = Event()
+    original_save = recovery.store.save
+
+    def observe(record):
+        original_save(record)
+        if record.status == "queued" and record.task.stage.startswith("queued:"):
+            queued.set()
+
+    recovery.store.save = observe
+    with ThreadPoolExecutor(1) as pool:
+        with ExitStack() as stack:
+            for _ in range(4):
+                stack.enter_context(
+                    recovery.scheduler.slot(definition, scheduling)
+                )
+            future = pool.submit(recovery.resume, identifier)
+            assert queued.wait(5)
+            queued_record = recovery.store.get(identifier)
+            call = queued_record.task.calls[0].model_copy(deep=True)
+            budget = queued_record.task.budget_state.model_copy(deep=True)
+            if mutation == "definition":
+                monkeypatch.setattr(
+                    recovery.tools,
+                    "definition",
+                    lambda name: definition.model_copy(
+                        update={"version": "changed"}
+                    ),
+                )
+            else:
+                monkeypatch.setattr(
+                    recovery.tools,
+                    "scheduling",
+                    lambda name: SchedulingMetadata("local_matlab"),
+                )
+        result = future.result(timeout=5)
+    saved = recovery.store.get(identifier)
+    assert result.status == "interrupted"
+    assert lookups == []
+    assert saved.task.calls[0] == call
+    assert saved.task.budget_state == budget
+    assert saved.task.analysis_runs == []
+    assert calls == [call.id]
+
+
+@pytest.mark.parametrize("mutation", ["origin", "definition", "scheduling"])
+def test_reconciliation_rejects_state_changed_during_callback(
+    tmp_path, monkeypatch, mutation
+):
+    from flight_agent.runtime.observations import CapabilityOutcome, Observation
+
+    entered, release = Event(), Event()
+
+    def reconcile(context, inputs):
+        entered.set()
+        assert release.wait(5)
+        return CapabilityOutcome(
+            observations=[
+                Observation(
+                    node_id=context.node_id,
+                    metric_id="rmse",
+                    label="RMSE",
+                    value=1.0,
+                    unit="m",
+                )
+            ]
+        )
+
+    recovery, identifier, calls = reconciliation_case(tmp_path, reconcile)
+    definition = recovery.tools.definition("offline_rmse")
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(recovery.resume, identifier)
+        assert entered.wait(5)
+        with recovery.locks.hold(identifier):
+            newer = recovery.store.get(identifier)
+            call = newer.task.calls[0].model_copy(deep=True)
+            budget = newer.task.budget_state.model_copy(deep=True)
+            if mutation == "origin":
+                newer.error = "newer reconciliation state"
+                newer.queue_origin = ConversationState(
+                    status="waiting_for_user",
+                    pending_decision=None,
+                    error="newer reconciliation state",
+                )
+                recovery.store.save(newer)
+            elif mutation == "definition":
+                monkeypatch.setattr(
+                    recovery.tools,
+                    "definition",
+                    lambda name: definition.model_copy(
+                        update={"version": "changed"}
+                    ),
+                )
+            else:
+                monkeypatch.setattr(
+                    recovery.tools,
+                    "scheduling",
+                    lambda name: SchedulingMetadata("local_matlab"),
+                )
+        release.set()
+        result = future.result(timeout=5)
+    saved = recovery.store.get(identifier)
+    assert saved.task.calls[0] == call
+    assert saved.task.budget_state == budget
+    assert saved.task.analysis_runs == []
+    assert saved.task.outputs == {}
+    assert calls == [call.id]
+    if mutation == "origin":
+        assert result.error == saved.error == "newer reconciliation state"
+    else:
+        assert result.status == saved.status == "running"
+        assert result.queued_action == saved.queued_action == "resume"
+        assert saved.task.stage == call.node_id
+
+
+def test_stale_reconciliation_exception_cannot_apply_failure_cleanup(
+    tmp_path,
+):
+    entered, release = Event(), Event()
+
+    def reconcile(context, inputs):
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError("Stale reconciliation failure")
+
+    recovery, identifier, calls = reconciliation_case(tmp_path, reconcile)
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(recovery.resume, identifier)
+        assert entered.wait(5)
+        with recovery.locks.hold(identifier):
+            newer = recovery.store.get(identifier)
+            budget = newer.task.budget_state.model_copy(deep=True)
+            outputs = newer.task.outputs.copy()
+            runs = list(newer.task.analysis_runs)
+            pending_specs = newer.task.pending_specs.copy()
+            newer.error = "newer reconciliation state"
+            newer.pending_decision = PendingDecision(
+                kind="clarify", message="Newer reconciliation follow-up"
+            )
+            newer.task.calls[0].error = "newer call state"
+            newer.task.nodes[0].error = "newer node state"
+            stage = newer.task.stage
+            recovery.store.save(newer)
+            call = newer.task.calls[0].model_copy(deep=True)
+            node = newer.task.nodes[0].model_copy(deep=True)
+        release.set()
+        result = future.result(timeout=5)
+    saved = recovery.store.get(identifier)
+    assert result.status == saved.status == "running"
+    assert saved.queued_action == "resume"
+    assert result.error == saved.error == "newer reconciliation state"
+    assert saved.pending_decision.message == "Newer reconciliation follow-up"
+    assert saved.task.calls[0] == call
+    assert saved.task.nodes[0] == node
+    assert saved.task.stage == stage
+    assert saved.task.budget_state == budget
+    assert saved.task.outputs == outputs
+    assert saved.task.analysis_runs == runs
+    assert saved.task.pending_specs == pending_specs
+    assert saved.task.result is None
+    assert calls == [call.id]
 
 
 def test_receipt_publication_error_stays_unknown_until_original_id_is_reconciled(
@@ -310,10 +534,10 @@ def test_recovery_accounts_for_progress_when_crash_follows_receipt_acceptance(
     runtime, store, conversation, _ = setup(tmp_path, operation=operation)
     accept = runtime._accept
 
-    def crash(conversation, task, node, call, run):
-        accept(conversation, task, node, call, run)
+    def crash(conversation, task, node, call, run, budget):
+        accept(conversation, task, node, call, run, budget)
         if node.id == "next":
-            raise KeyboardInterrupt("Crash after receipt acceptance, before progress checkpoint")
+            raise KeyboardInterrupt("Crash after atomic receipt/progress acceptance")
 
     monkeypatch.setattr(runtime, "_accept", crash)
     data = analysis_plan_data()
@@ -322,7 +546,9 @@ def test_recovery_accounts_for_progress_when_crash_follows_receipt_acceptance(
     pending = propose(runtime, conversation, data)
     with pytest.raises(KeyboardInterrupt):
         confirm(runtime, pending)
-    assert store.get(pending.id).task.budget_state.no_progress == 1
+    saved = store.get(pending.id)
+    assert saved.task.budget_state.no_progress == 0
+    assert saved.task.analysis_runs[-1].id in saved.task.progress_calls
     recovered = restarted(runtime, store).resume(pending.id)
     assert recovered.status == "completed", recovered.error
     assert calls == ["compute", "next"]

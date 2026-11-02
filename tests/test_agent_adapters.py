@@ -12,8 +12,7 @@ from flight_agent.verification.resources import ResourceRegistry
 from flight_agent.verification.store import ConversationStore
 from tests.agent_helpers import analysis_plan_data, register_rmse
 from tests.diagnosis_helpers import AdaptivePlanner, diagnostic_project
-from tests.test_verification_runtime import ControlledBackend
-from tests.verification_helpers import project_tree
+from tests.verification_helpers import ControlledBackend, project_tree
 
 
 def plugins():
@@ -24,7 +23,7 @@ def assembled(tmp_path, backend=None, planner=None):
     tools = CapabilityRegistry(agent_mode=True)
     resources = ResourceRegistry()
     plugins().register_builtin_plugins(
-        tools, resources, backend=backend, planner=planner or AdaptivePlanner()
+        tools, resources, backend=backend, diagnostic_reviewer=planner or AdaptivePlanner()
     )
     store = ConversationStore(tmp_path / "state")
     return AgentExecutor(store, tools, resources), store
@@ -190,6 +189,51 @@ def test_simulink_requires_effect_permission_even_with_confirmation(tmp_path):
     assert not backend.calls
 
 
+@pytest.mark.parametrize("elapsed", [59.5, 61])
+def test_simulink_budget_exhaustion_before_worker_checkpoint_is_known_failure(
+    tmp_path, monkeypatch, elapsed
+):
+    from datetime import UTC, datetime, timedelta
+
+    from flight_agent.runtime import budget
+
+    clock = [datetime(2026, 10, 31, tzinfo=UTC)]
+    monkeypatch.setattr(budget, "utc_now", lambda: clock[0])
+    backend = ControlledBackend()
+    runtime, store = assembled(tmp_path, backend)
+    resource = runtime.resources.inspect(
+        "simulink_project", str(project_tree(tmp_path / "project"))
+    )
+    pending = runtime.propose(store.create(), simulink_plan(resource))
+    invoke = runtime.tools.invoke
+
+    def before_invoke(*args, **kwargs):
+        clock[0] += timedelta(seconds=elapsed)
+        return invoke(*args, **kwargs)
+
+    monkeypatch.setattr(runtime.tools, "invoke", before_invoke)
+    done = runtime.confirm(pending.id, 1, trusted=True)
+    saved = store.get(done.id)
+    assert done.status == "failed"
+    assert saved.task.calls[0].status == "failed"
+    assert saved.task.nodes[0].status == "failed"
+    assert saved.task.result.execution_status == "partial"
+    assert saved.pending_decision.kind == "clarify"
+    assert saved.task.pending_specs == {}
+    assert saved.task.checkpoints == {}
+    assert backend.calls == []
+    from flight_agent.verification.coordinator import EngineeringRuntime
+
+    coordinator = EngineeringRuntime(store, None, runtime, runtime.resources)
+    queued = coordinator.queue_message(saved.id, "Prepare a new plan with a revised budget")
+    assert queued.status == "queued"
+    queued.status = "planning"
+    queued.queued_action = None
+    store.save(queued)
+    next_proposal = runtime.propose(queued, simulink_plan(resource))
+    assert next_proposal.status == "waiting_for_user"
+
+
 def test_lost_worker_acknowledgement_reconciles_exact_original_request(tmp_path):
     backend = ControlledBackend()
     backend.fail_after_completion = True
@@ -231,7 +275,7 @@ def test_resource_adapters_reject_duplicate_registration_and_unknown_names(tmp_p
     runtime, _ = assembled(tmp_path)
     with pytest.raises(ValueError, match="registered"):
         plugins().register_builtin_plugins(
-            runtime.tools, runtime.resources, backend=None, planner=AdaptivePlanner()
+            runtime.tools, runtime.resources, backend=None, diagnostic_reviewer=AdaptivePlanner()
         )
     with pytest.raises(ValueError, match="registered"):
         runtime.resources.inspect("model_generated_import", str(tmp_path))

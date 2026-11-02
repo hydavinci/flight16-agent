@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -11,12 +12,8 @@ import httpx
 from dotenv import load_dotenv
 from pydantic import JsonValue, TypeAdapter
 
-from .agent import AgentError, execute_agent
-from .config import ModelSettings, create_model
-from .knowledge import KnowledgeBase
-from .matlab import MatlabRunner, engine_available
-from .models import Parameters, RuleSet
-from .session import AnalysisSession
+from .config import ModelSettings
+from .matlab import engine_available
 
 
 def doctor(root: Path) -> int:
@@ -38,15 +35,10 @@ def doctor(root: Path) -> int:
     except ValueError as exc:
         print(f"Model configuration: {exc}")
         ready = False
-    try:
-        rules = RuleSet.model_validate_json((root / "rules" / "demo.json").read_text("utf-8"))
-        KnowledgeBase(root / "knowledge").validate_sources(rules)
-        if not (root / "matlab" / "analyze_demo.m").is_file():
-            raise ValueError("matlab/analyze_demo.m is missing")
-        print("Demo assets: ready")
-    except (OSError, ValueError) as exc:
-        print(f"Demo assets: {exc}")
-        ready = False
+    print(
+        "MATLAB_WORKER_URL: "
+        + ("configured" if os.environ.get("MATLAB_WORKER_URL", "").strip() else "missing")
+    )
     print("No MATLAB process started and no model request sent.")
     return 0 if ready else 1
 
@@ -97,14 +89,10 @@ def directory_task(args: argparse.Namespace) -> int:
             )
             if args.criteria is not None:
                 body["evaluation_criteria"] = args.criteria
-            for field in ("project_root", "output_root", "scenario", "location"):
+            for field in ("project_root", "output_root", "location"):
                 value = getattr(args, field)
                 if value is not None:
                     body[field] = value
-            if identifier is None and args.scenario is None:
-                body["scenario"] = "auto"
-                if structured and args.location is None:
-                    body["location"] = "matlab_project"
             record = request(
                 "POST", f"{base}/{identifier}/messages" if identifier else base, body
             )
@@ -122,7 +110,9 @@ def directory_task(args: argparse.Namespace) -> int:
         ):
             raise ValueError("Server returned a mismatched conversation identity")
         deadline = time.monotonic() + args.timeout
-        while args.action != "status" and record.get("status") in ("planning", "running"):
+        while args.action != "status" and record.get("status") in (
+            "queued", "planning", "running"
+        ):
             if time.monotonic() >= deadline:
                 raise ValueError(
                     f"Task {actual_id} continues on the local server; use directory-task status"
@@ -130,7 +120,7 @@ def directory_task(args: argparse.Namespace) -> int:
             record = request("GET", f"{base}/{actual_id}")
             if record.get("id") != actual_id:
                 raise ValueError("Server returned a mismatched conversation identity")
-            if record.get("status") in ("planning", "running"):
+            if record.get("status") in ("queued", "planning", "running"):
                 time.sleep(0.2)
         print(json.dumps(record, ensure_ascii=False, indent=2, allow_nan=False))
         return 1 if record.get("status") in ("failed", "interrupted") else 0
@@ -140,9 +130,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local flight-engineering agent")
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("doctor", help="Inspect configuration without external calls")
-    analyze = commands.add_parser("analyze", help="Analyze a JSON file using the real agent")
     web = commands.add_parser("web", help="Serve the local Web interface")
     worker = commands.add_parser("worker", help="Serve the trusted-project MATLAB worker")
+    cleanup = commands.add_parser(
+        "cleanup-legacy", help="List legacy conversation records; delete v1 only with --apply",
+    )
+    cleanup.add_argument("--project-root", type=Path, required=True)
+    cleanup.add_argument("--apply", action="store_true")
     directory = commands.add_parser(
         "directory-task",
         help="Use the unified requirements-driven Web agent and saved conversations",
@@ -151,11 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     directory.add_argument("--timeout", type=int, default=360)
     actions = directory.add_subparsers(dest="action", required=True)
     propose = actions.add_parser(
-        "propose", help="Describe requirements; no scenario is needed and execution needs consent",
-    )
-    propose.add_argument(
-        "--scenario", choices=("auto", "d1", "d2"),
-        help="Legacy resource aliases: d1=Worker project, d2=Agent data; auto selects neither",
+        "propose", help="Describe requirements; execution needs consent",
     )
     propose.add_argument(
         "--project-root", help="Resource directory on its registered host, not an uploaded path",
@@ -163,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     propose.add_argument("--output-root", help="Agent-visible delivery directory")
     propose.add_argument("--conversation", help="Continue an existing conversation")
     propose.add_argument(
-        "--location", help="Explicit registered resource location or legacy host alias",
+        "--location", help="Explicit registered resource location",
     )
     request_form = propose.add_mutually_exclusive_group(required=True)
     request_form.add_argument("--request", help="Compatible single-message request")
@@ -180,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     status = actions.add_parser("status", help="Read durable state without modifying the task")
     for command in (confirm, resume, status):
         command.add_argument("conversation")
-    for command in (check, analyze, web, worker):
+    for command in (check, web, worker):
         command.add_argument("--project-root", type=Path, default=Path.cwd())
     web.add_argument("--port", type=int, default=8000)
     web.add_argument(
@@ -190,62 +180,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     worker.add_argument("--port", type=int, default=9001)
     worker.add_argument("--host", default="127.0.0.1")
-    analyze.add_argument("parameters", type=Path, help="JSON path, relative to the project root")
-    analyze.add_argument(
-        "--request", default="分析这份参数文件，检查所有适用要求，检索依据并解释结果。"
-    )
-    analyze.add_argument("--matlab-timeout", type=float, default=120)
-    analyze.add_argument("--max-steps", type=int, default=20)
     args = parser.parse_args(argv)
-    session: AnalysisSession | None = None
     try:
         if args.command == "directory-task":
             return directory_task(args)
+        if args.command == "cleanup-legacy":
+            from .verification.legacy_cleanup import cleanup_legacy_records
+
+            report = cleanup_legacy_records(
+                args.project_root.absolute() / "runs" / "verification", apply=args.apply,
+            )
+            print(json.dumps(asdict(report), ensure_ascii=False, indent=2))
+            return 0
         root = args.project_root.resolve()
         load_dotenv(root / ".env", override=False)
         if args.command == "doctor":
             return doctor(root)
-        if args.command in ("web", "worker"):
-            import uvicorn
+        import uvicorn
 
-            if not 1 <= args.port <= 65535:
-                raise ValueError("Port must be between 1 and 65535")
-            if args.command == "web":
-                from .web import create_web_app
+        if not 1 <= args.port <= 65535:
+            raise ValueError("Port must be between 1 and 65535")
+        if args.command == "web":
+            from .web import create_web_app
 
-                app = create_web_app(root, native_directory_picker=args.native_directory_picker)
-                host = "127.0.0.1"
-            else:
-                from .worker import create_worker_app
+            app = create_web_app(root, native_directory_picker=args.native_directory_picker)
+            host = "127.0.0.1"
+        else:
+            from .worker import create_worker_app
 
-                if os.name != "posix" and os.environ.get("MATLAB_ALLOW_TRUSTED_UPLOADS") == "1":
-                    raise ValueError("The upload worker currently supports macOS and Linux")
-                app = create_worker_app(root, os.environ.get("MATLAB_WORKER_TOKEN", ""))
-                host = args.host
-            uvicorn.run(app, host=host, port=args.port, workers=1)
-            return 0
-        parameter_path = (
-            args.parameters if args.parameters.is_absolute() else root / args.parameters
-        )
-        if parameter_path.stat().st_size > 1_000_000:
-            raise ValueError("Parameter JSON must not exceed 1 MB")
-        parameters = Parameters.model_validate_json(parameter_path.read_text(encoding="utf-8"))
-        runner = MatlabRunner(root, timeout_seconds=args.matlab_timeout)
-        session = AnalysisSession(root, parameters, runner)
-        model = create_model()
-        session.metadata["model_name"] = getattr(model, "model_name", type(model).__name__)
-        report = execute_agent(model, session, args.request, max_steps=args.max_steps)
-        print(f"Report: {report}")
-        print(f"Assessment: {session.metadata['assessment_status']} (demonstration only)")
+            app = create_worker_app(root, os.environ.get("MATLAB_WORKER_TOKEN", ""))
+            host = args.host
+        uvicorn.run(app, host=host, port=args.port, workers=1)
         return 0
-    except (AgentError, ValueError, OSError, httpx.HTTPError) as exc:
-        if session is not None:
-            session.fail(str(exc))
-            print(f"Run artifacts: {session.run_dir}", file=sys.stderr)
+    except (ValueError, OSError, httpx.HTTPError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        if session is not None:
-            session.fail("Interrupted by user")
         print("Interrupted.", file=sys.stderr)
         return 130

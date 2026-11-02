@@ -6,9 +6,13 @@ from playwright.sync_api import expect, sync_playwright
 from tests.agent_helpers import draft_data, make_agent_web
 from tests.helpers import serve_app
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("RUN_BROWSER_TESTS") != "1", reason="Browser tests are opt-in",
-)
+pytestmark = [
+    pytest.mark.browser,
+    pytest.mark.skipif(
+        os.environ.get("RUN_BROWSER_TESTS") != "1",
+        reason="Browser tests are opt-in",
+    ),
+]
 
 
 @pytest.mark.parametrize("message,display", [
@@ -67,7 +71,7 @@ def test_chat_hides_only_structured_user_closing_labels_and_keeps_source_text(
 
 
 @pytest.mark.parametrize("path,title", [
-    ("/", "Flight Agent"), ("/workbench", "MATLAB 分析工作台"),
+    ("/", "Flight Agent"), ("/workbench", "Flight Agent"),
 ])
 def test_browser_tab_title_and_local_favicon_render_correctly(tmp_path, path, title):
     app, runtime, calls, _ = make_agent_web(tmp_path, [])
@@ -109,7 +113,7 @@ def test_browser_tab_title_and_local_favicon_render_correctly(tmp_path, path, ti
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_matlab_workbench_return_link_restores_the_selected_agent_conversation(tmp_path, width):
+def test_generic_workbench_restores_the_selected_agent_conversation(tmp_path, width):
     app, runtime, calls, _ = make_agent_web(
         tmp_path, [{"action": "plan", "text": "Confirm analysis.", "plan": draft_data()}],
     )
@@ -134,15 +138,10 @@ def test_matlab_workbench_return_link_restores_the_selected_agent_conversation(t
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#messages")).to_contain_text("Analyze supplied arrays.")
             expect(page.locator("#conversation-status")).to_have_text("等待确认或补充")
-            page.locator(".environment > summary").click()
-            page.get_by_role("link", name="MATLAB分析工作台", exact=True).click()
+            page.goto(url + "/workbench")
             expect(page).to_have_url(url + "/workbench")
-            expect(page.get_by_role("heading", name="MATLAB 分析工作台")).to_be_visible()
-            back = page.get_by_role("link", name="返回 Flight Agent", exact=True)
-            expect(back).to_be_in_viewport()
-            assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-            back.click()
-            expect(page).to_have_url(url + "/")
+            expect(page).to_have_title("Flight Agent")
+            expect(page.locator('input[type="file"]')).to_have_count(0)
             expect(page.locator("#messages")).to_contain_text("Analyze supplied arrays.")
             expect(page.locator("#conversation-status")).to_have_text("等待确认或补充")
             expect(page.locator("#conversation-status")).to_be_visible()

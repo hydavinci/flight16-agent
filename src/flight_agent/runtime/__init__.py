@@ -1,1 +1,1 @@
-"""Shared contracts and controlled capability execution for design scenarios."""
+"""Shared contracts and controlled capability execution for the generic Agent."""

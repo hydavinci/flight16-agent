@@ -1,9 +1,11 @@
 import json
+import warnings
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
-from ..upload_engine import validate_png
-from ..upload_models import finite_json
+from PIL import Image
+
+from ..models import finite_json
 from .contracts import Artifact, relative_path
 from .projects import file_digest
 
@@ -18,6 +20,20 @@ MEDIA = {
     ".json": ("application/json", "record"),
     ".log": ("text/plain", "record"),
 }
+
+
+def validate_png(path: Path) -> None:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 2_000_000:
+        raise ValueError("PNG file missing, unsafe or exceeds the 2 MB limit")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Image.DecompressionBombWarning)
+        try:
+            with Image.open(path) as image:
+                if image.format != "PNG" or image.width * image.height > 16_000_000:
+                    raise ValueError("Invalid PNG or image dimensions exceed limit")
+                image.verify()
+        except (OSError, Image.DecompressionBombError, Image.DecompressionBombWarning) as exc:
+            raise ValueError(f"Invalid PNG image: {exc}") from exc
 
 
 def artifact_path(directory: Path, name: str) -> Path:

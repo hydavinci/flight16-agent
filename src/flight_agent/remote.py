@@ -1,28 +1,16 @@
 import os
 import time
-from collections.abc import Callable
-from pathlib import Path
 from typing import Self
 from urllib.parse import urlsplit
 
 import httpx
-
-from .upload_engine import validate_png
-from .upload_models import (
-    MAX_FIGURE,
-    MAX_LOG,
-    MAX_RESPONSE,
-    ExecutionOutput,
-    JobRecord,
-    UploadRequest,
-)
 
 
 class RemoteError(RuntimeError):
     pass
 
 
-class RemoteWorker:
+class RemoteClient:
     def __init__(self, url: str, token: str, client: httpx.Client | None = None):
         parts = urlsplit(url)
         if (
@@ -59,7 +47,8 @@ class RemoteWorker:
         path: str,
         deadline: float,
         payload: dict[str, object] | None = None,
-        limit: int = MAX_RESPONSE,
+        *,
+        limit: int = 8_000_000,
     ) -> bytes:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -86,57 +75,3 @@ class RemoteWorker:
                     raise RemoteError("Remote deadline exceeded; execution may still be active")
                 chunks.append(chunk)
             return b"".join(chunks)
-
-    def run(
-        self,
-        directory: Path,
-        request: UploadRequest,
-        on_submitted: Callable[[str], None],
-    ) -> ExecutionOutput:
-        client = self.client or httpx.Client(trust_env=False)
-        remote_id: str | None = None
-        deadline = time.monotonic() + request.timeout_seconds + 30
-        try:
-            record = JobRecord.model_validate_json(
-                self._request(client, "POST", "/jobs", deadline, request.model_dump())
-            )
-            remote_id = record.id
-            on_submitted(remote_id)
-            while record.status in ("queued", "running"):
-                time.sleep(0.25)
-                record = JobRecord.model_validate_json(
-                    self._request(client, "GET", f"/jobs/{remote_id}", deadline)
-                )
-                if record.id != remote_id:
-                    raise RemoteError("Worker returned a different job ID")
-            directory.mkdir(parents=True, exist_ok=True)
-            if len(record.log.encode("utf-8")) > MAX_LOG:
-                raise RemoteError("Worker log exceeds size limit")
-            (directory / "matlab.log").write_text(record.log, encoding="utf-8")
-            if record.status != "completed":
-                raise RemoteError(f"Worker {record.status}: {record.error or 'no error detail'}")
-            output = ExecutionOutput(
-                result=record.result,
-                matlab_version=record.matlab_version or "",
-                log=record.log,
-                figures=record.figures,
-            )
-            for name in output.figures:
-                content = self._request(
-                    client, "GET", f"/jobs/{remote_id}/artifacts/{name}", deadline, limit=MAX_FIGURE
-                )
-                path = directory / name
-                path.write_bytes(content)
-                validate_png(path)
-            (directory / "matlab.log").write_text(output.log, encoding="utf-8")
-            (directory / "output.json").write_text(output.model_dump_json(), encoding="utf-8")
-            return output
-        except (httpx.HTTPError, ValueError, RemoteError) as exc:
-            location = remote_id or "unknown (submission acknowledgement not received)"
-            raise RemoteError(
-                f"{exc}. Remote job: {location}. Execution was not automatically retried "
-                "or cancelled; check the worker before resubmitting."
-            ) from exc
-        finally:
-            if self.client is None:
-                client.close()

@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from flight_agent import directories, web
-from tests.test_worker import TOKEN
+from tests.helpers import TOKEN
 
 
 def native_client(project: Path, *, enabled: bool = True) -> TestClient:
@@ -207,7 +207,7 @@ def test_explicit_agent_resource_native_picker_needs_no_worker(project, monkeypa
     monkeypatch.setattr(web, "choose_native_directory", lambda path="", **kwargs: str(project))
     with native_client(project) as client:
         response = client.post(
-            "/api/directories/select", json={"target": "project", "location": "agent"},
+            "/api/directories/select", json={"target": "project", "location": "diagnostic_data"},
         )
     assert response.status_code == 200, response.text
     assert response.json()["path"] == str(project)

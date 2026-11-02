@@ -7,10 +7,12 @@ from pydantic import PrivateAttr
 
 from flight_agent.runtime.agent_contracts import AgentPlanDraft
 from flight_agent.runtime.capabilities import CapabilityRegistry
+from flight_agent.runtime.capability_metadata import CapabilityPlanning
 from flight_agent.runtime.requirements import CriterionSource, TaskRequirements
 from flight_agent.runtime.resources import ResourceReference
 from flight_agent.verification.adapters.evaluation import scalar_evaluation_capability
 from flight_agent.verification.contracts import ConversationMessage
+from flight_agent.verification.planning_context import context_byte_size
 from flight_agent.verification.store import ConversationStore, now
 from tests.agent_helpers import analysis_plan_data, gap_data, register_rmse, resource_data
 from tests.helpers import ScriptedModel, tool_message
@@ -590,10 +592,11 @@ def test_correction_does_not_truncate_request_to_fit_feedback(tmp_path, monkeypa
         tool_message("propose_agent", {"action": "clarify", "text": "Unused."}),
     ])
     planner.model = model
-    with pytest.raises(ValueError, match="大小限制"):
-        planner.propose(
-            "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
-        )
+    decision = planner.propose(
+        "Report RMSE.", conversation, catalog=tools.catalog(), resources={}, sources={}
+    )
+    assert decision.action == "clarify"
+    assert "大小限制" in decision.text and "未截断" in decision.text
     assert len(model._seen) == 1
     assert calls == []
 
@@ -631,8 +634,13 @@ def test_registered_schema_references_are_not_redacted_as_local_paths(tmp_path):
     catalog = tools.catalog()
     planner.propose("Report RMSE.", conversation, catalog=catalog, resources={}, sources={})
     payload = json.loads(model._seen[0][-1].content)
-    assert payload["catalog"][1]["input_schema"] == catalog[1]["input_schema"]
-    assert payload["catalog"][0]["output_schema"] == catalog[0]["output_schema"]
+    sent = {entry["name"]: entry for entry in payload["catalog"]}
+    registered = {entry["name"]: entry for entry in tools.catalog()}
+    assert (
+        sent["evaluate_criteria"]["input_schema"]
+        == registered["evaluate_criteria"]["input_schema"]
+    )
+    assert sent["offline_rmse"]["output_schema"] == registered["offline_rmse"]["output_schema"]
 
 
 def test_forged_user_source_version_is_refused_before_model_call(tmp_path):
@@ -758,7 +766,215 @@ def test_nested_metadata_credentials_are_not_forwarded_to_the_model(tmp_path):
         assert secret not in text
     payload = json.loads(model._seen[0][-1].content)
     assert payload["resources"][0]["metadata"]["unit"] == "m"
-    assert payload["catalog"][1]["input_schema"] == tools.catalog()[1]["input_schema"]
+    sent = {entry["name"]: entry for entry in payload["catalog"]}
+    registered = {entry["name"]: entry for entry in tools.catalog()}
+    assert (
+        sent["evaluate_criteria"]["input_schema"]
+        == registered["evaluate_criteria"]["input_schema"]
+    )
+    assert sent["offline_rmse"]["output_schema"] == registered["offline_rmse"]["output_schema"]
+
+
+def test_planner_exposes_numeric_metrics_without_exposing_or_mutating_context(tmp_path):
+    planner, _, conversation, tools, calls, model = setup(
+        tmp_path, {"action": "clarify", "text": "Provide arrays."},
+    )
+    observed = []
+    catalog = tools.catalog()
+    for entry in catalog:
+        entry["metadata"]["planning"] = CapabilityPlanning(
+            output_kinds=["metric"] if entry["name"] == "offline_rmse" else ["finding"],
+        ).model_dump(mode="json")
+    decision = planner.propose(
+        "Report RMSE.", conversation, catalog=catalog, resources={}, sources={},
+        observe=observed.append,
+    )
+    assert decision.action == "clarify"
+    payload = json.loads(model._seen[0][-1].content)
+    assert [entry["name"] for entry in payload["catalog"]] == ["offline_rmse"]
+    assert len(observed) == 1
+    metrics = observed[0].metrics
+    assert metrics.serialized_bytes == context_byte_size(payload)
+    assert metrics.selected_capability_count == 1
+    assert metrics.selected_source_excerpt_count == 0
+    assert metrics.correction_round_count == 0
+    assert metrics.planning_duration_seconds >= 0
+    assert observed[0].failure is None
+    assert "request" not in observed[0].model_dump()
+    assert calls == []
+
+
+@pytest.mark.parametrize("limit_delta,expected_calls", [(0, 1), (-1, 0)])
+def test_context_exact_utf8_boundary_is_allowed_but_one_byte_over_clarifies(
+    tmp_path, monkeypatch, limit_delta, expected_calls,
+):
+    planner, _, record, tools, calls, model = setup(
+        tmp_path, {"action": "clarify", "text": "提供输入。"}, "分析未知指标。",
+    )
+    observed = []
+    planner.propose(
+        "分析未知指标。", record, catalog=tools.catalog(), resources={}, sources={},
+        observe=observed.append,
+    )
+    size = observed[0].metrics.serialized_bytes
+    model._seen.clear()
+    monkeypatch.setattr(module(), "MAX_CONTEXT_BYTES", size + limit_delta)
+    result = planner.propose(
+        "分析未知指标。", record, catalog=tools.catalog(), resources={}, sources={},
+    )
+    assert result.action == "clarify"
+    assert len(model._seen) == expected_calls
+    assert calls == []
+
+
+def test_real_120000_byte_limit_rejects_context_without_cutting_last_requirement(tmp_path):
+    planner, store, record, tools, calls, model = setup(
+        tmp_path, {"action": "answer", "text": "Must not run."},
+    )
+    for index in range(30):
+        record.messages.append(ConversationMessage(
+            role="user", content=("中" * 3000) + f" final criterion {index}",
+            created_at=now(),
+        ))
+    before = record.model_dump(mode="json")
+    observed = []
+    result = planner.propose(
+        "Report RMSE.", record, catalog=tools.catalog(), resources={}, sources={},
+        observe=observed.append,
+    )
+    assert module().MAX_CONTEXT_BYTES == 120_000
+    assert result.action == "clarify" and result.plan is None
+    assert "120" in result.text and "未截断" in result.text
+    assert observed[0].metrics.serialized_bytes > 120_000
+    assert record.model_dump(mode="json") == before
+    assert "final criterion 29" in record.messages[-1].content
+    assert model._seen == [] and calls == []
+    assert store.get(record.id).task is None
+
+
+def test_actual_120000_byte_boundary_not_122880_is_enforced(tmp_path):
+    planner, _, record, tools, calls, model = setup(
+        tmp_path, {"action": "clarify", "text": "Supply arrays."},
+    )
+    catalog = tools.catalog()
+    observed = []
+    planner.propose(
+        "Report RMSE.", record, catalog=catalog, resources={}, sources={},
+        observe=observed.append,
+    )
+    catalog[0]["description"] += "x" * (120_000 - observed[0].metrics.serialized_bytes)
+    model._seen.clear()
+    observed.clear()
+    exact = planner.propose(
+        "Report RMSE.", record, catalog=catalog, resources={}, sources={},
+        observe=observed.append,
+    )
+    assert exact.action == "clarify"
+    assert observed[0].metrics.serialized_bytes == 120_000
+    assert len(model._seen) == 1
+    catalog[0]["description"] += "x"
+    model._seen.clear()
+    observed.clear()
+    over = planner.propose(
+        "Report RMSE.", record, catalog=catalog, resources={}, sources={},
+        observe=observed.append,
+    )
+    assert over.action == "clarify" and "未截断" in over.text
+    assert observed[0].metrics.serialized_bytes == 120_001
+    assert model._seen == [] and calls == []
+
+
+@pytest.mark.parametrize(("target_bytes", "expected_calls"), [(120_000, 2), (120_001, 1)])
+def test_correction_context_exact_utf8_boundary_allows_equality_only(
+    tmp_path, target_bytes, expected_calls,
+):
+    invalid = tool_message(
+        "propose_agent", {"action": "plan", "text": "Missing draft."},
+    )
+    corrected = tool_message(
+        "propose_agent", {"action": "clarify", "text": "Provide arrays."},
+    )
+    probe, _, probe_record, probe_tools, _, probe_model = setup(
+        tmp_path / "probe", {},
+    )
+    probe_model.responses = [invalid, corrected]
+    probe_observed = []
+    probe.propose(
+        "Report RMSE.", probe_record, catalog=probe_tools.catalog(),
+        resources={}, sources={}, observe=probe_observed.append,
+    )
+    probe_size = probe_observed[0].metrics.serialized_bytes
+    assert probe_size < 120_000
+    assert len(probe_model._seen) == 2
+
+    planner, _, record, tools, calls, model = setup(tmp_path / "boundary", {})
+    model.responses = [invalid, corrected]
+    catalog = tools.catalog()
+    selected = next(entry for entry in catalog if entry["name"] == "offline_rmse")
+    selected["description"] += "x" * (target_bytes - probe_size)
+    observed = []
+    result = planner.propose(
+        "Report RMSE.", record, catalog=catalog, resources={}, sources={},
+        observe=observed.append,
+    )
+    assert result.action == "clarify"
+    assert observed[0].metrics.serialized_bytes == target_bytes
+    assert observed[0].metrics.correction_round_count == expected_calls - 1
+    assert len(model._seen) == expected_calls
+    if target_bytes == 120_001:
+        assert "大小限制" in result.text and "未截断" in result.text
+    assert calls == []
+
+
+def test_selected_model_excerpts_do_not_replace_full_local_binding_inputs(tmp_path, monkeypatch):
+    from copy import deepcopy
+
+    planner, _, record, tools, calls, model = setup(
+        tmp_path, {"action": "plan", "text": "Confirm analysis.", "plan": draft()},
+    )
+    catalog = tools.catalog()
+    for entry in catalog:
+        entry["metadata"]["planning"] = {
+            "output_kinds": ["metric"] if entry["name"] == "offline_rmse" else ["finding"],
+            "depends_on": [], "dynamic_dependencies": False,
+        }
+    unrelated = deepcopy(catalog[0])
+    unrelated["name"] = "phase_analysis"
+    unrelated["metadata"]["metrics"] = [
+        {"id": "phase_margin", "label": "Phase margin", "unit": "deg"},
+    ]
+    catalog.append(unrelated)
+    resource = ResourceReference.model_validate(resource_data(
+        id="standard", kind="standard", location="agent", version="edition-1",
+        metadata={"planning_source_scopes": {
+            "standard#margin": {"metric_ids": ["phase_margin"], "capability_names": []},
+        }},
+    ))
+    excerpt = CriterionSource(
+        kind="standard_file", reference="standard#margin", quote="Phase margin >= 45 deg.",
+        sha256=resource.fingerprint, version=resource.version,
+    )
+    sources = {excerpt.reference: excerpt}
+    original_bind = module().bind_plan
+    bound_inputs = []
+
+    def capture_binding(proposal, full_resources, full_sources, full_catalog):
+        bound_inputs.append((full_resources, full_sources, full_catalog))
+        return original_bind(proposal, full_resources, full_sources, full_catalog)
+
+    monkeypatch.setattr(module(), "bind_plan", capture_binding)
+    result = planner.propose(
+        "Report RMSE.", record, catalog=catalog,
+        resources={resource.id: resource}, sources=sources,
+    )
+    assert result.action == "plan"
+    sent = json.loads(model._seen[0][-1].content)
+    assert [entry["name"] for entry in sent["catalog"]] == ["offline_rmse"]
+    assert sent["sources"] == []
+    assert len(bound_inputs) == 1
+    assert bound_inputs[0] == ({resource.id: resource}, sources, catalog)
+    assert sources[excerpt.reference] == excerpt
+    assert calls == []
 
 
 def test_redacted_source_roundtrip_restores_authenticated_quote_and_evaluation_inputs(tmp_path):

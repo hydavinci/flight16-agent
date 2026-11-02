@@ -17,6 +17,7 @@ from flight_agent.verification.matlab_projects import discover_matlab_project
 from tests import test_local_matlab as backend_tests
 from tests import test_local_matlab_adapters as adapter_tests
 from tests import test_local_matlab_planning as planning_tests
+from tests.snapshot_helpers import bind_request
 
 local_backend = backend_tests.local_backend
 local_request = backend_tests.local_request
@@ -90,12 +91,18 @@ def linear_request(local_request):
         "condition": "point_index",
         "source": selection_source("Selected.PointIndex records the selected point."),
     }]
-    return contracts.LocalMatlabRequest.model_validate({
+    request = contracts.LocalMatlabRequest.model_validate({
         "id": "c" * 32,
         "operation": "linearize",
         "inputs": inputs,
         "project": project.model_dump(mode="json"),
     })
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    return bind_request(
+        request,
+        ProjectSnapshotStore(Path(project.root).parent / "managed" / "snapshots"),
+    )
 
 
 def test_linearize_contract_is_explicit_and_preserves_old_request_rules(local_request):
@@ -146,11 +153,14 @@ def frequency_case(case):
             "metadata": {"project": project.model_dump(mode="json")},
         }
     )
+    with backend.snapshots.guard():
+        binding = backend.snapshots.ensure(project)
     context = replace(
         context,
         resources=(resource,),
         scope=context.scope.model_copy(update={"resources": [resource]}),
         _resource_roles={"project": resource},
+        _project_snapshots={resource.id: binding},
     )
     inputs = linear_inputs(project)
     output = CapabilityOutcome.model_validate(
@@ -165,6 +175,7 @@ def frequency_case(case):
         _resource_roles={},
         load_checkpoint=lambda: saved.get("checkpoint"),
         save_checkpoint=lambda value: saved.update(checkpoint=value),
+        work_directory=context.work_directory.parent / ("b" * 32),
     )
     backend.checkpoint = metric_context.load_checkpoint
     return metric_context, {
@@ -262,7 +273,7 @@ def test_frequency_lost_ack_reconciles_original_without_reexecution(
     monkeypatch.delenv("MATLAB_ALLOW_TRUSTED_PROJECTS")
     assert tools.reconcile("matlab_allmargin", inputs, context, context.scope) is not None
     assert [resume for _, resume in backend.requests] == [False, False, True]
-    directory = context.directory / f"calls/{context.call_id}/local-matlab"
+    directory = context.work_directory / "local-matlab"
     assert (directory / "engine-starts.txt").read_text() == "1"
 
 

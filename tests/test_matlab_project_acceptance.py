@@ -8,9 +8,10 @@ receipts, scalar evaluation and Word/JSON downloads are production code.
 import hashlib
 import json
 import os
+import shutil
 import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
@@ -173,7 +174,7 @@ def acceptance_draft(context, case):
 
 
 def acceptance_app(directory, monkeypatch, case, backend=None, mutate=None):
-    import flight_agent.web as web
+    import flight_agent.application as application
 
     planner = AgentPlanner(model=ScriptedModel(responses=[]))
     contexts = []
@@ -189,20 +190,20 @@ def acceptance_app(directory, monkeypatch, case, backend=None, mutate=None):
         )
 
     monkeypatch.setattr(planner, "_decision", decision)
-    monkeypatch.setattr(web, "AgentPlanner", lambda: planner)
+    monkeypatch.setattr(application, "AgentPlanner", lambda: planner)
     if backend is not None:
         monkeypatch.setattr(
             LocalMatlabBackend, "from_environment", classmethod(lambda cls: backend),
         )
     assembled = []
-    runtime_class = web.EngineeringRuntime
+    runtime_class = application.EngineeringRuntime
 
     def capture(*args, **kwargs):
         runtime = runtime_class(*args, **kwargs)
         assembled.append(runtime)
         return runtime
 
-    monkeypatch.setattr(web, "EngineeringRuntime", capture)
+    monkeypatch.setattr(application, "EngineeringRuntime", capture)
     app = create_web_app(directory)
     return app, assembled[0], contexts
 
@@ -276,7 +277,9 @@ class ControlledEngine:
         request = json.loads(Path(request_path).read_text())
         inputs = request["inputs"]
         mode = os.environ.get("TEST_ACCEPTANCE_MODE", "")
-        if mode == "unknown":
+        if mode == "unknown" or (
+            mode == "unknown_stepinfo" and name == "flight_agent_local_stepinfo"
+        ):
             os._exit(0)  # Test-only lost terminal receipt; never a verified success.
         if mode == "no_logs" and name == "flight_agent_run_project":
             raise RuntimeError("Missing explicitly selected logsout signal")
@@ -368,6 +371,7 @@ def offline_engine(tmp_path, monkeypatch):
 
     backend = OfflineBackend(os.sys.executable)
     monkeypatch.setattr(LocalMatlabBackend, "from_environment", classmethod(lambda cls: backend))
+    return backend
 
 
 @pytest.fixture
@@ -383,6 +387,192 @@ def completed_project_case(tmp_path, monkeypatch, offline_engine):
         payload, word = download_results(client, headers, done)
     assert discover_matlab_project(str(case.root)) == before
     return runtime.store.get(done["id"]), payload, word, contexts, case
+
+
+def test_injected_web_reuses_registered_backend_for_ui_catalog_and_execution(
+    tmp_path, monkeypatch, offline_engine,
+):
+    case = prepare_offline_case(tmp_path / "source")
+    _, runtime, _ = acceptance_app(tmp_path / "web", monkeypatch, case)
+    owner = runtime.local_matlab_backend
+    assert owner is offline_engine
+    assert owner.snapshots is runtime.executor.snapshots
+    assert not owner.snapshots.root.exists()
+
+    def forbidden(cls):
+        raise AssertionError("Injected runtime must not create an unused local backend")
+
+    monkeypatch.setattr(LocalMatlabBackend, "from_environment", classmethod(forbidden))
+    runtime.local_matlab_backend = None
+    readiness_calls = []
+    original_readiness = owner.readiness
+
+    def readiness():
+        readiness_calls.append(owner)
+        return original_readiness()
+
+    executions = []
+    original_execute = owner.execute
+
+    def execute(request, directory, *, resume=False):
+        executions.append((owner, request.operation, owner.snapshots))
+        return original_execute(request, directory, resume=resume)
+
+    monkeypatch.setattr(owner, "readiness", readiness)
+    monkeypatch.setattr(owner, "execute", execute)
+    app = create_web_app(tmp_path / "web", engineering_runtime=runtime)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        headers = {"X-Flight-Token": bootstrap["token"]}
+        catalog = client.get(f"{API}/capabilities", headers=headers).json()
+        local = next(item for item in catalog if item["name"] == "matlab_stepinfo")
+        assert bootstrap["local_matlab"]["state"] == local["availability"]["state"]
+        assert len(readiness_calls) >= 2
+        assert all(backend is owner for backend in readiness_calls)
+        assert not owner.snapshots.root.exists()
+        pending = propose_http(client, case)[1]
+        done = confirm_http(client, headers, pending)
+        assert done["status"] == "completed", done["error"]
+    assert executions
+    assert all(
+        backend is owner and snapshots is runtime.executor.snapshots
+        for backend, _, snapshots in executions
+    )
+
+
+def _injected_runtime(tmp_path, capabilities, snapshots, *, declared_backend=None):
+    from flight_agent.runtime.capabilities import CapabilityRegistry
+    from flight_agent.verification.agent_runtime import AgentContext, AgentExecutor
+    from flight_agent.verification.coordinator import EngineeringRuntime
+    from flight_agent.verification.resources import ResourceRegistry
+    from flight_agent.verification.store import ConversationStore
+
+    tools: CapabilityRegistry[AgentContext] = CapabilityRegistry(agent_mode=True)
+    for capability in capabilities:
+        tools.register(capability)
+    store = ConversationStore(tmp_path / "state")
+    resources = ResourceRegistry()
+    return EngineeringRuntime(
+        store,
+        AgentPlanner(model=ScriptedModel(responses=[])),
+        AgentExecutor(store, tools, resources, snapshots=snapshots),
+        resources,
+        local_matlab_backend=declared_backend,
+    )
+
+
+@pytest.mark.parametrize("registered_owner", [None, object()])
+def test_injected_local_capability_requires_registered_backend_owner(
+    tmp_path, registered_owner,
+):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    backend = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    capability = next(
+        capability
+        for capability in local_matlab_capabilities(backend)
+        if capability.name == "matlab_linearize"
+    )
+    runtime = _injected_runtime(
+        tmp_path,
+        [replace(capability, runtime_owner=registered_owner)],
+        snapshots,
+    )
+    with pytest.raises(ValueError, match="runtime owner|backend owner"):
+        create_web_app(tmp_path / "web", engineering_runtime=runtime)
+
+
+def test_injected_runtime_derives_backend_from_linearize_only_registry(
+    tmp_path, monkeypatch,
+):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    backend = LocalMatlabBackend(os.sys.executable)
+    capability = next(
+        capability
+        for capability in local_matlab_capabilities(backend)
+        if capability.name == "matlab_linearize"
+    )
+    runtime = _injected_runtime(tmp_path, [capability], snapshots)
+
+    def forbidden(cls):
+        raise AssertionError("Registered linearize owner must be used")
+
+    monkeypatch.setattr(LocalMatlabBackend, "from_environment", classmethod(forbidden))
+    app = create_web_app(tmp_path / "web", engineering_runtime=runtime)
+    assert backend.snapshots is snapshots
+    assert not snapshots.root.exists()
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        bootstrap = client.get("/api/bootstrap").json()
+        headers = {"X-Flight-Token": bootstrap["token"]}
+        catalog = client.get(f"{API}/capabilities", headers=headers).json()
+    assert bootstrap["local_matlab"]["state"] in {"available", "unavailable"}
+    assert [item["name"] for item in catalog] == ["matlab_linearize"]
+    assert not snapshots.root.exists()
+
+
+def test_injected_runtime_rejects_mixed_registered_local_backend_owners(tmp_path):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    first = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    second = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    first_capabilities = {
+        capability.name: capability for capability in local_matlab_capabilities(first)
+    }
+    second_capabilities = {
+        capability.name: capability for capability in local_matlab_capabilities(second)
+    }
+    runtime = _injected_runtime(
+        tmp_path,
+        [
+            first_capabilities["matlab_linearize"],
+            second_capabilities["matlab_stepinfo"],
+        ],
+        snapshots,
+    )
+    with pytest.raises(ValueError, match="same backend owner"):
+        create_web_app(tmp_path / "web", engineering_runtime=runtime)
+
+
+def test_injected_runtime_rejects_declared_registered_backend_mismatch(tmp_path):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    snapshots = ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    registered = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    declared = LocalMatlabBackend(os.sys.executable, snapshots=snapshots)
+    runtime = _injected_runtime(
+        tmp_path,
+        local_matlab_capabilities(registered),
+        snapshots,
+        declared_backend=declared,
+    )
+    with pytest.raises(ValueError, match="(?i)declared.*registered"):
+        create_web_app(tmp_path / "web", engineering_runtime=runtime)
+
+
+def test_injected_runtime_rejects_backend_snapshot_store_mismatch(tmp_path):
+    from flight_agent.verification.adapters.local_matlab import local_matlab_capabilities
+    from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+
+    backend = LocalMatlabBackend(
+        os.sys.executable,
+        snapshots=ProjectSnapshotStore(tmp_path / "backend" / "snapshots"),
+    )
+    executor_snapshots = ProjectSnapshotStore(tmp_path / "executor" / "snapshots")
+    runtime = _injected_runtime(
+        tmp_path,
+        local_matlab_capabilities(backend),
+        executor_snapshots,
+    )
+    with pytest.raises(ValueError, match="snapshot store"):
+        create_web_app(tmp_path / "web", engineering_runtime=runtime)
 
 
 def test_requested_case_delivers_real_dependency_evidence(completed_project_case):
@@ -546,11 +736,13 @@ def test_restart_unknown_original_call_reconciles_without_a_new_dispatch(
         assert done["status"] == "interrupted"
     task = runtime.store.get(done["id"]).task
     original = task.calls[0].id
-    requests = list(Path(task.result_directory).rglob("request.json"))
+    work = runtime.store.root / "work" / done["id"] / task.id
+    requests = list(work.rglob("request.json"))
     assert len(requests) == 1
     before = requests[0].read_bytes()
     # Reconstruct the actual Web/runtime against its persisted store, then resume over HTTP.
     monkeypatch.setenv("TEST_ACCEPTANCE_MODE", "")
+    offline_engine.snapshots = None
     app, restored, _ = acceptance_app(directory, monkeypatch, case)
     with TestClient(app, base_url="http://127.0.0.1") as client:
         headers = {"X-Flight-Token": client.get("/api/bootstrap").json()["token"]}
@@ -560,8 +752,122 @@ def test_restart_unknown_original_call_reconciles_without_a_new_dispatch(
     task = restored.store.get(resumed["id"]).task
     assert [call.id for call in task.calls] == [original]
     assert task.budget_state.calls == 1
-    assert list(Path(task.result_directory).rglob("request.json")) == requests
+    assert list(work.rglob("request.json")) == requests
     assert requests[0].read_bytes() == before
+
+
+def test_persisted_marker_free_metric_reconciles_original_directory_after_restart(
+    tmp_path, monkeypatch, offline_engine,
+):
+    from flight_agent.runtime.evidence import describe_evidence, publish_evidence
+    from flight_agent.verification.matlab_contracts import LocalMatlabRequest
+
+    monkeypatch.setenv("TEST_ACCEPTANCE_MODE", "unknown_stepinfo")
+    case = prepare_offline_case(tmp_path / "source")
+    directory = tmp_path / "web"
+    app, runtime, _ = acceptance_app(directory, monkeypatch, case)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers, pending = propose_http(client, case)
+        done = confirm_http(client, headers, pending)
+        assert done["status"] == "interrupted"
+
+    record = runtime.store.get(done["id"])
+    task = record.task
+    metric_call = task.calls[-1]
+    assert metric_call.status == "interrupted"
+    managed_call = (
+        runtime.store.root
+        / "work"
+        / record.id
+        / task.id
+        / "calls"
+        / metric_call.id
+    )
+    managed_backend = managed_call / "local-matlab"
+    request = LocalMatlabRequest.model_validate_json(
+        (managed_backend / "request.json").read_bytes()
+    )
+    assert request.operation == "stepinfo"
+    assert request.project is None and request.project_snapshot is None
+
+    legacy_call = Path(task.result_directory) / "calls" / metric_call.id
+    shutil.copytree(managed_call / "calls", legacy_call / "calls")
+    legacy_backend = legacy_call / "local-matlab"
+    historical = runtime.local_matlab_backend.execute(request, legacy_backend)
+    assert historical.execution_status == "unknown"
+    engine_start = (legacy_backend / "engine-starts.txt").read_bytes()
+    shutil.rmtree(managed_call)
+
+    checkpoint_name = task.checkpoints[metric_call.id]
+    checkpoint_path = Path(task.result_directory) / checkpoint_name
+    payload = json.loads(checkpoint_path.read_text())
+    assert payload["data"].pop("backend_directory").endswith("/local-matlab")
+    assert payload["data"]["request"] == request.model_dump(mode="json")
+    content = (
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    ).encode()
+    digest = hashlib.sha256(content).hexdigest()
+    historical_checkpoint_name = (
+        Path(checkpoint_name).parent / f"{digest}.json"
+    ).as_posix()
+    task_root = Path(task.result_directory)
+    publish_evidence(task_root, historical_checkpoint_name, content)
+    descriptor = describe_evidence(task_root, historical_checkpoint_name)
+    task.checkpoints[metric_call.id] = historical_checkpoint_name
+    task.checkpoint_sha256[metric_call.id] = descriptor.sha256
+    runtime.store.save(record)
+
+    tracked = [
+        historical_checkpoint_name,
+        f"calls/{metric_call.id}/local-matlab/request.json",
+        f"calls/{metric_call.id}/local-matlab/state.json",
+        f"calls/{metric_call.id}/local-matlab/result.json",
+    ]
+    before = {
+        name: (Path(task.result_directory) / name).read_bytes()
+        for name in tracked
+    }
+    state = json.loads(before[tracked[2]])
+    result = json.loads(before[tracked[3]])
+    assert state["request_sha256"] == fingerprint(request.model_dump(mode="json"))
+    assert result["request_sha256"] == state["request_sha256"]
+    assert state["result_sha256"] == hashlib.sha256(before[tracked[3]]).hexdigest()
+    snapshots = runtime.executor.snapshots
+    snapshot_inventory = sorted(
+        path.relative_to(snapshots.root).as_posix()
+        for path in snapshots.root.rglob("*")
+    )
+    shutil.rmtree(case.root)
+
+    monkeypatch.setenv("TEST_ACCEPTANCE_MODE", "")
+    offline_engine.snapshots = None
+    app, restored, _ = acceptance_app(directory, monkeypatch, case)
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        headers = {"X-Flight-Token": client.get("/api/bootstrap").json()["token"]}
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Historical reconciliation must not redispatch")
+
+        monkeypatch.setattr(restored.local_matlab_backend, "_spawn", forbidden)
+        response = client.post(f"{API}/{done['id']}/resume", headers=headers)
+        assert response.status_code == 202, response.text
+        resumed = wait_http(client, done["id"], headers, {"interrupted"})
+
+    restored_task = restored.store.get(resumed["id"]).task
+    assert [call.id for call in restored_task.calls] == [
+        call.id for call in task.calls
+    ]
+    assert restored_task.budget_state.calls == task.budget_state.calls
+    assert not managed_call.exists()
+    assert (legacy_backend / "engine-starts.txt").read_bytes() == engine_start
+    assert {
+        name: (Path(task.result_directory) / name).read_bytes()
+        for name in tracked
+    } == before
+    assert sorted(
+        path.relative_to(snapshots.root).as_posix()
+        for path in snapshots.root.rglob("*")
+    ) == snapshot_inventory
 
 
 def test_bootstrap_and_catalog_share_import_probe_without_caching_execution_permission(

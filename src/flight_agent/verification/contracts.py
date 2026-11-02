@@ -2,9 +2,9 @@ import re
 from pathlib import PurePosixPath
 from typing import Annotated, Literal, Self
 
-from pydantic import ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import Field, JsonValue, field_validator, model_validator
 
-from ..models import Contract, FiniteNumber, Nonempty
+from ..models import Contract, FiniteNumber, Nonempty, finite_json
 from ..runtime.agent_contracts import (
     AgentBaseline,
     AgentNode,
@@ -12,39 +12,18 @@ from ..runtime.agent_contracts import (
     InvocationRun,
     InvocationSpec,
 )
-from ..runtime.contracts import AnalysisRun, AnalysisSpec, Name, Version
-from ..runtime.intents import WorkflowRequest
+from ..runtime.contracts import MutableRecord as MutableRecord
+from ..runtime.contracts import Name
+from ..runtime.contracts import ToolCall as ToolCall
 from ..runtime.observations import CapabilityOutcome, OutputArtifact, TaskResult
 from ..runtime.observations import MetricValue as MetricValue
+from ..runtime.planning_contracts import PlanningTelemetry
 from ..runtime.requirements import CapabilityGap
-from ..runtime.tasks import GeneralBaseline, GeneralProposal
-from ..runtime.tasks import PlanNode as PlanNode
-from ..runtime.tasks import plan_ancestors as plan_ancestors
-from ..upload_models import finite_json
-from .diagnosis_contracts import (
-    DiagnosisBaseline,
-    DiagnosisPlanRevision,
-    DiagnosisProposal,
-    DiagnosisTermination,
-    DiagnosticRound,
-    Hypothesis,
-    HypothesisAssessment,
-    PendingAnalysis,
-)
-from .diagnostic_data import DiagnosticProject
 
 AnalysisKind = Literal["step_response", "stability_margins"]
-EvaluationStatus = Literal["pass", "fail", "undetermined"]
-SpecialValue = Literal["positive_infinity", "negative_infinity", "undefined"]
 Digest = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
 Identifier = Annotated[str, Field(pattern=r"^[a-f0-9]{32}$")]
 
-METRICS: dict[str, tuple[AnalysisKind, str, str]] = {
-    "overshoot": ("step_response", "<=", "%"),
-    "settling_time": ("step_response", "<=", "s"),
-    "gain_margin": ("stability_margins", ">=", "dB"),
-    "phase_margin": ("stability_margins", ">=", "deg"),
-}
 
 
 def relative_path(value: str) -> str:
@@ -166,47 +145,6 @@ class ProjectDescriptor(Contract):
     warnings: list[str] = []
 
 
-class Criterion(Contract):
-    metric: Nonempty
-    operator: Literal["<=", ">="]
-    threshold: FiniteNumber
-    unit: Nonempty
-
-    @model_validator(mode="after")
-    def supported_metric(self) -> Self:
-        definition = METRICS.get(self.metric)
-        if definition is None:
-            raise ValueError(f"Unsupported verification metric: {self.metric}")
-        if (self.operator, self.unit) != definition[1:]:
-            raise ValueError(f"{self.metric} requires {definition[1]} in {definition[2]}")
-        if self.metric in ("overshoot", "settling_time") and self.threshold < 0:
-            raise ValueError(f"{self.metric} threshold cannot be negative")
-        return self
-
-
-class EvaluationBaseline(Contract):
-    version: Annotated[int, Field(ge=1)]
-    project_fingerprint: Digest
-    trim_point: Annotated[int, Field(ge=1)]
-    analyses: Annotated[list[AnalysisKind], Field(min_length=1)]
-    criteria: Annotated[list[Criterion], Field(min_length=1)]
-    confirmed: bool = False
-    confirmed_at: str | None = None
-    steady_state: SteadyStatePolicy = SteadyStatePolicy()
-
-    @model_validator(mode="after")
-    def complete_criteria(self) -> Self:
-        if len(set(self.analyses)) != len(self.analyses):
-            raise ValueError("Analysis kinds must be unique")
-        metrics = [criterion.metric for criterion in self.criteria]
-        if len(set(metrics)) != len(metrics):
-            raise ValueError("Criteria must have unique metrics")
-        required = {name for name, definition in METRICS.items() if definition[0] in self.analyses}
-        if set(metrics) != required:
-            raise ValueError("Criteria must cover exactly the selected analyses: " + str(required))
-        return self
-
-
 class Artifact(FileDigest):
     media_type: Nonempty
     role: Literal["figure", "data", "report", "record"]
@@ -295,113 +233,19 @@ class InspectProjectRequest(Contract):
     root: Nonempty
 
 
-class MetricCheck(Contract):
-    analysis: AnalysisKind
-    metric: str
-    value: float | None
-    special: SpecialValue | None = None
-    value_unit: str | None
-    operator: str
-    threshold: float
-    unit: str
-    status: EvaluationStatus
-    reason: str
-    evidence: list[str]
-
-
-class Evaluation(Contract):
-    status: EvaluationStatus
-    baseline_version: int
-    checks: list[MetricCheck]
-    by_analysis: dict[AnalysisKind, EvaluationStatus]
-    warnings: list[str] = []
-
-
 NodeIdentifier = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")]
-ToolName = NodeIdentifier
-NodeStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
-
-
-class PlanProposal(Contract):
-    action: Literal["plan", "clarify", "explain"]
-    title: Annotated[str, Field(max_length=200)] = ""
-    analyses: list[AnalysisKind] = []
-    criteria: list[Criterion] = []
-    trim_point: Literal[1] = 1
-    grouping: Literal["combined", "separate"] = "combined"
-    rationale: Annotated[str, Field(max_length=2000)] = ""
-    question: Annotated[str, Field(max_length=2000)] = ""
-    nodes: Annotated[list[PlanNode], Field(max_length=8)] = []
-    tool_versions: dict[ToolName, Version] = {}
-
-    @model_validator(mode="after")
-    def executable_plan(self) -> Self:
-        if self.action != "plan":
-            if self.action == "clarify" and not self.question.strip():
-                raise ValueError("A clarification must contain a question")
-            if self.nodes or self.analyses or self.criteria:
-                raise ValueError("Only a plan can contain executable nodes and criteria")
-            return self
-        if not self.title.strip() or not self.rationale.strip():
-            raise ValueError("A plan requires a title and rationale")
-        EvaluationBaseline(
-            version=1,
-            project_fingerprint="0" * 64,
-            trim_point=self.trim_point,
-            analyses=self.analyses,
-            criteria=self.criteria,
-        )
-        plan_ancestors(self.nodes)
-        return self
-
-
-class EvidenceExplanation(Contract):
-    text: Annotated[str, Field(min_length=1, max_length=6000)]
-    evidence: Annotated[list[str], Field(min_length=1, max_length=4)]
-
-
-class MutableRecord(Contract):
-    model_config = ConfigDict(extra="forbid", frozen=False, validate_assignment=True)
-
-
-class ExecutionNode(MutableRecord):
-    id: NodeIdentifier
-    tool: ToolName
-    depends_on: list[str] = []
-    inputs: dict[str, JsonValue] = {}
-    status: NodeStatus = "pending"
-    error: str | None = None
-
-
-class ToolCall(MutableRecord):
-    id: Identifier
-    node_id: str
-    tool: ToolName
-    tool_version: Version | None = None
-    baseline_version: int
-    status: NodeStatus = "running"
-    started_at: str
-    finished_at: str | None = None
-    inputs: dict[str, JsonValue] = {}
-    output: dict[str, JsonValue] = {}
-    error: str | None = None
-
-
-class PlanVersion(Contract):
-    baseline_version: int
-    proposal: PlanProposal
-    nodes: list[ExecutionNode]
+NodeStatus = Literal["pending", "queued", "running", "completed", "failed", "interrupted"]
 
 
 class PendingDecision(Contract):
     kind: Literal[
-        "clarify", "capability_gap", "confirm_baseline", "confirm_replan", "resume", "retry",
+        "clarify", "capability_gap", "confirm_baseline", "resume", "retry",
     ]
     message: Nonempty
 
 
 class Decision(Contract):
-    action: Literal["confirm_baseline", "confirm_replan", "resume", "retry"]
+    action: Literal["confirm_baseline", "resume", "retry"]
     baseline_version: int
     created_at: Nonempty
     trusted: bool = False
@@ -413,85 +257,6 @@ class ConversationMessage(Contract):
     created_at: Nonempty
     response_kind: Literal["answer", "clarify", "capability_gap", "plan"] | None = None
     gaps: Annotated[list[CapabilityGap], Field(max_length=40)] = []
-
-
-class VerificationTask(MutableRecord):
-    scenario: Literal["d1"] = "d1"
-    id: Identifier
-    project: ProjectDescriptor
-    baseline: EvaluationBaseline
-    proposal: PlanProposal
-    baseline_history: list[EvaluationBaseline] = []
-    plan_history: list[PlanVersion] = []
-    nodes: list[ExecutionNode]
-    calls: list[ToolCall] = []
-    decisions: list[Decision] = []
-    analysis_runs: list[AnalysisRun] = []
-    evaluation_runs: list[AnalysisRun] = []
-    pending_specs: dict[AnalysisKind, AnalysisSpec] = {}
-    result: AnalysisResult | None = None
-    evaluation: Evaluation | None = None
-    artifacts: list[Artifact] = []
-    result_directory: Nonempty
-    output_root: str | None = None
-    stage: str = "awaiting_confirmation"
-    explanation: EvidenceExplanation | None = None
-    explanation_error: str | None = None
-    pending_request: AnalysisRunRequest | None = None
-    worker_run: RunRecord | None = None
-    replan_attempts: int = 0
-    failure_proposal: PlanProposal | None = None
-    replan_error: str | None = None
-
-
-class DiagnosisTask(MutableRecord):
-    scenario: Literal["d2"] = "d2"
-    id: Identifier
-    project: DiagnosticProject
-    baseline: DiagnosisBaseline
-    proposal: DiagnosisProposal
-    result_directory: Nonempty
-    output_root: str | None = None
-    stage: str = "awaiting_confirmation"
-    nodes: list[ExecutionNode] = []
-    calls: list[ToolCall] = []
-    decisions: list[Decision] = []
-    analysis_runs: list[AnalysisRun] = []
-    plan_revisions: list[DiagnosisPlanRevision] = []
-    rounds: list[DiagnosticRound] = []
-    assessments: list[HypothesisAssessment] = []
-    artifacts: list[Artifact] = []
-    input_snapshot: DiagnosticProject | None = None
-    pending_analysis: PendingAnalysis | None = None
-    termination: DiagnosisTermination | None = None
-    started_at: str | None = None
-    dispatch_count: Annotated[int, Field(strict=True, ge=0, le=40)] = 0
-    no_progress_rounds: Annotated[int, Field(strict=True, ge=0)] = 0
-
-    @property
-    def current_hypotheses(self) -> list[Hypothesis]:
-        for round_ in reversed(self.rounds):
-            if revision := round_.review.hypothesis_revision:
-                return revision.hypotheses
-        return self.baseline.hypotheses
-
-
-class GeneralTask(MutableRecord):
-    scenario: Literal["general"] = "general"
-    workflow: NodeIdentifier
-    id: Identifier
-    baseline: GeneralBaseline
-    proposal: GeneralProposal
-    result_directory: Nonempty
-    output_root: str | None = None
-    stage: str = "awaiting_confirmation"
-    nodes: list[ExecutionNode]
-    calls: list[ToolCall] = []
-    decisions: list[Decision] = []
-    analysis_runs: list[AnalysisRun] = []
-    artifacts: list[Artifact] = []
-    outputs: dict[str, dict[str, JsonValue]] = {}
-    started_at: str | None = None
 
 
 class AgentExecutionNode(AgentNode, MutableRecord):
@@ -530,13 +295,19 @@ class AgentTask(MutableRecord):
         return value
 
 
-LegacyTask = VerificationTask | DiagnosisTask | GeneralTask
-Task = LegacyTask | AgentTask
+Task = AgentTask
 
 
 ConversationStatus = Literal[
-    "planning", "waiting_for_user", "running", "completed", "failed", "interrupted"
+    "queued",
+    "planning",
+    "waiting_for_user",
+    "running",
+    "completed",
+    "failed",
+    "interrupted",
 ]
+ScheduledAction = Literal["message", "confirm", "resume", "retry"]
 
 
 class ConversationState(Contract):
@@ -546,7 +317,7 @@ class ConversationState(Contract):
 
 
 class Conversation(MutableRecord):
-    scenario: Literal["auto", "d1", "d2"] = "d1"
+    schema_version: Literal["2.0"] = "2.0"
     id: Identifier
     created_at: Nonempty
     updated_at: Nonempty
@@ -555,15 +326,16 @@ class Conversation(MutableRecord):
     resource_location: Name | None = None
     output_root: str | None = None
     output_root_reset: bool = False
-    task: Task | None = None
-    archived_tasks: list[Task] = []
+    task: AgentTask | None = None
+    archived_tasks: list[AgentTask] = []
     pending_decision: PendingDecision | None = None
     messages: list[ConversationMessage] = []
     error: str | None = None
     turn_origin: ConversationState | None = None
-    goal: Annotated[str, Field(max_length=4000)] = ""
-    active_workflow: NodeIdentifier | None = None
-    workflow_agenda: Annotated[list[WorkflowRequest], Field(max_length=6)] = []
+    queued_action: ScheduledAction | None = None
+    queued_action_committed: bool = False
+    queue_origin: ConversationState | None = None
+    planning_telemetry: PlanningTelemetry | None = None
 
     def restore_turn_origin(self) -> bool:
         if self.turn_origin is None:

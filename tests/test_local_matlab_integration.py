@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 
 from flight_agent.verification.local_matlab import LocalMatlabBackend
 from flight_agent.verification.matlab_projects import discover_matlab_project
+from flight_agent.verification.project_snapshots import ProjectSnapshotStore
+from tests.snapshot_helpers import bind_request
 from tests.test_matlab_project_acceptance import (
     PreparedCase,
     acceptance_app,
@@ -27,14 +29,16 @@ pytestmark = pytest.mark.matlab
 
 
 @pytest.fixture
-def actual_backend(monkeypatch):
+def actual_backend(monkeypatch, tmp_path):
     if os.environ.get("RUN_MATLAB_TESTS") != "1":
         pytest.skip("Actual MATLAB/Simulink is opt-in; no fake fallback")
     assert os.environ.get("MATLAB_ALLOW_TRUSTED_PROJECTS") == "1"
     monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[1] / "src"))
     monkeypatch.delenv("MATLAB_WORKER_URL", raising=False)
     monkeypatch.delenv("MATLAB_WORKER_TOKEN", raising=False)
-    return LocalMatlabBackend.from_environment()
+    return LocalMatlabBackend.from_environment(
+        snapshots=ProjectSnapshotStore(tmp_path / "managed" / "snapshots")
+    )
 
 
 @pytest.fixture
@@ -383,6 +387,7 @@ def test_actual_linearize_preparation_workspace_visibility(
         },
     })
     directory = tmp_path / "linearize"
+    request = bind_request(request, actual_backend.snapshots)
     result = actual_backend.execute(request, directory)
     assert result.valid and result.execution_status == "completed", result.diagnostics
     assert result.details["linearization"]["workspace_assertions"] == [
@@ -391,3 +396,49 @@ def test_actual_linearize_preparation_workspace_visibility(
     ]
     assert discover_matlab_project(str(root)) == project
     assert actual_backend.execute(request, directory, resume=True) == result
+
+    from flight_agent.runtime.evidence import publish_evidence, verify_evidence
+    from flight_agent.verification.matlab_contracts import AllmarginInput
+
+    published = []
+    for filename, artifact_id in (
+        ("linear-model.mat", "linear_model"),
+        ("metadata.json", "metadata"),
+    ):
+        artifact = next(item for item in result.artifacts if item.path == filename)
+        original = verify_evidence(directory, artifact)
+        relative = f"calls/{request.id}/published/{filename}"
+        publish_evidence(tmp_path, relative, original.read_bytes())
+        descriptor = artifact.model_copy(
+            update={
+                "id": artifact_id,
+                "node_id": "linearize",
+                "path": relative,
+            }
+        )
+        verify_evidence(tmp_path, descriptor)
+        published.append(descriptor)
+    margins_request = LocalMatlabRequest(
+        id="d" * 32,
+        operation="allmargin",
+        inputs=AllmarginInput(
+            linear_model=published[0],
+            conditions=conditions,
+        ),
+        input_evidence=published,
+    )
+    margins_directory = tmp_path / "margins"
+    margins = actual_backend.execute(margins_request, margins_directory)
+    assert margins.valid and margins.execution_status == "completed", margins.diagnostics
+    assert "metrics" in margins.details
+    assert {"linear-model.mat", "producer-metadata.json", "bode.png"} <= {
+        item.path for item in margins.artifacts
+    }
+    for artifact in margins.artifacts:
+        verify_evidence(margins_directory, artifact)
+    assert actual_backend.execute(
+        margins_request,
+        margins_directory,
+        resume=True,
+    ) == margins
+    assert discover_matlab_project(str(root)) == project

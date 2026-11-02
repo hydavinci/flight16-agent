@@ -6,7 +6,8 @@
 
 ## 项目说明
 
-Flight Agent 是一个通用工程分析 Agent，提供 Web 和 CLI 入口，当前内置飞控分析与离线诊断适配器。
+Flight Agent 只有一个通用 v2 工程分析 Agent，提供 Web 和 CLI 入口。
+Worker 工程与离线诊断数据都是注册资源，不是独立产品；没有 D1/D2 场景选择。
 它直接使用已有工程的入口和模型，不要求先改写成固定飞机算例。
 
 ```text
@@ -51,14 +52,21 @@ Python 版本还须满足 MATLAB 发行版的兼容要求。
 在项目根目录执行，以下命令使用 macOS/Linux shell：
 
 ```bash
-python3 -m venv .venv
+python3 -m pip install uv==0.12.6
+uv sync --extra dev
 source .venv/bin/activate
-python -m pip install -e .
-cp .env.example .env
+test -e .env || cp .env.example .env
 ```
 
-已有 `.env` 时不要覆盖。MATLAB 和 Engine 需要另行准备，
-安装方式见[环境准备](docs/usage.md#准备环境)。
+开发依赖使用已提交的 uv.lock；CI 使用 `uv sync --locked --extra dev`，
+锁文件过期时直接失败，不在 CI 中重新解析依赖。更新依赖时先运行 `uv lock`，
+检查 uv.lock 差异并重新运行完整软件验证，再一起提交 pyproject.toml 与 uv.lock。
+`uv sync` 默认精确同步，可能移除锁文件之外安装的 MATLAB Engine。
+不要在已有 Engine 的环境中直接执行该命令；真实 MATLAB 验收使用单独的、
+已许可且 Python 版本匹配的专用环境，按开发验证章节的 `--inexact` 流程运行。
+安装 Python 依赖不代表已安装 MATLAB、Engine、工具箱或许可证。
+
+已有 `.env` 时不会覆盖。MATLAB 和 Engine 的准备方式见[环境准备](docs/usage.md#准备环境)。
 
 ### 2. 配置模型与计算环境
 
@@ -145,7 +153,7 @@ flight-agent web --port 8000
 
 ## 项目框架
 
-技术栈为 **LangChain + MATLAB Engine for Python + FastAPI**；
+技术栈为 **LangChain Core/OpenAI 客户端 + MATLAB Engine for Python + FastAPI**；
 前端使用原生 HTML/CSS/JavaScript，无需 Node 构建。
 
 请求从 Web/CLI 进入会话协调与规划层，经注册能力和执行内核调度计算，
@@ -155,11 +163,14 @@ flight-agent web --port 8000
 
 | 模块 | 职责 |
 |---|---|
-| `web.py`、`cli.py` | Web 与命令行入口 |
+| `web.py`、`cli.py` | Web 组合、安全边界与命令行入口 |
+| `application.py` | 运行时、计算后端和后台调度器装配 |
+| `web_routes/` | 页面、配置、元数据、工件与错误映射 |
+| `verification/routes.py` | 通用会话提交、确认、恢复、重试和状态投影 |
 | `runtime/` | 需求契约、能力注册、预算和证据 |
 | `verification/` | 会话、规划、执行、资源及计算适配器 |
 | `matlab_support/` | 受控 MATLAB 桥接函数 |
-| `static/` | 三栏 Agent 页面和兼容上传工作台 |
+| `static/` | 原生 ES modules 组成的三栏通用 Agent 工作台 |
 
 完整执行链路、模块职责、源码树和扩展方式见[项目架构](docs/architecture.md)。
 
@@ -188,6 +199,11 @@ runs/verification/<conversation_id>/tasks/<task_id>/
 指定输出根目录后，成果位于其下的 `flight-agent-<task_id>/`。
 会话记录仍保存在默认位置，旧任务和交付不会被新需求覆盖。
 
+v2 会话元数据和执行状态保存在
+`runs/verification/conversations.sqlite3`，证据文件仍保存在任务成果目录。
+首次升级前须停止旧服务；备份、硬切换、续接与回滚边界见
+[SQLite 会话存储](docs/sqlite-conversation-store.md)。
+
 字段约束、请求示例、报告内容和文件清单见[输入与输出参考](docs/inputs-outputs.md)。
 
 ## 详细文档
@@ -198,22 +214,42 @@ runs/verification/<conversation_id>/tasks/<task_id>/
 | [项目架构](docs/architecture.md) | 系统分层、能力边界、源码、扩展和开发验证 |
 | [输入与输出](docs/inputs-outputs.md) | 表单/API、判据、预算、结果字段与成果目录 |
 
-Worker 工程准备见 [D1 技术参考](docs/d1-agent.md)；
-离线诊断数据格式见 [D2 技术参考](docs/d2-agent.md)。
-单文件上传工作台保留在 `/workbench`，不与工程目录入口混用。
+Worker 工程准备见 [Simulink Worker 参考](docs/simulink-worker.md)；
+离线诊断数据格式见[离线诊断参考](docs/offline-diagnostics.md)。
+`/` 与 `/workbench` 展示同一个通用工作台，不支持旧上传或固定演示。
+
+## CLI 与历史清理
+
+支持 `doctor`、`web`、`worker`、`directory-task propose/confirm/status/resume`
+和 `cleanup-legacy`；不提供旧 `analyze`、场景、工作流目录或恢复提案入口。
+确认当前基线、权限与预算后才执行，执行状态未知时只对账原调用，不盲目重发。
+
+v1 历史记录不再读取、执行、恢复或投影为兼容视图。先预览，再显式删除：
+
+```bash
+flight-agent cleanup-legacy --project-root /absolute/path/to/flight-agent
+flight-agent cleanup-legacy --project-root /absolute/path/to/flight-agent --apply
+```
+
+默认仅报告 `v1/v2/unknown`，只有 `--apply` 才删除正面识别的 v1 会话目录。
+v2、未知记录、外部交付目录与源工程保留；源路径无法严格解析或位于候选目录内时跳过删除。
+详见[历史清理](docs/usage.md#历史清理)。
 
 ## 开发与验证
 
 ```bash
-python -m pip install -e '.[dev]'
-python -m pytest -q
-python -m ruff check .
-python -m mypy src
+uv sync --extra dev
+uv lock --check
+RUN_BROWSER_TESTS=0 RUN_MATLAB_TESTS=0 \
+uv run --no-sync python -m pytest -m "not matlab and not browser" -q
+uv run --no-sync python -m ruff check .
+uv run --no-sync python -m mypy src
+uv run --no-sync python -m build --no-isolation
 ```
 
-默认测试不需要真实 MATLAB，也不调用真实模型。
+默认软件测试不需要真实 MATLAB、浏览器或真实模型。
 浏览器与 MATLAB 集成的运行方法见[开发验证](docs/architecture.md#开发与验证)。
-仓库自带的是软件演示，不包含真实 F-16 模型或审核过的航空标准。
+合成测试夹具不是真实工程验收；仓库不包含真实 F-16 模型或审核过的航空标准。
 
 ## 许可证
 

@@ -1,22 +1,36 @@
 import logging
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from pathlib import Path
+from collections.abc import Callable
+from contextlib import nullcontext
+from threading import Condition
 from typing import Literal, Self
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from ..jobs import BusyError, JobManager
-from ..runtime.evidence import verify_evidence
-from ..runtime.intents import Scenario
-from ..runtime.observations import OutputArtifact
-from .artifacts import verify_artifact
-from .compat import LegacyRuntimeAdapter
-from .contracts import AgentTask, Conversation, ConversationMessage, PendingDecision
-from .coordinator import EngineeringRuntime
-from .runtime import VerificationRuntime
+from ..copilot_diagnostics import CopilotError
+from ..runtime.scheduling import (
+    ExecutionTurnScheduler,
+    PlanningScheduler,
+    SchedulerClosed,
+    Submission,
+)
+from ..web_routes.errors import request_errors
+from .contracts import (
+    Conversation,
+    ConversationMessage,
+    ConversationState,
+)
+from .coordinator import (
+    ConversationActive,
+    EngineeringRuntime,
+    PlanningFailure,
+    PlanningSuperseded,
+)
+from .scheduling_recovery import (
+    conservative_failure_transition,
+    conservative_pending_decision,
+    has_unresolved_scheduling,
+)
 from .store import now
 from .views import ConversationView, to_conversation_view
 
@@ -31,7 +45,6 @@ class MessageRequest(BaseModel):
     project_root: str | None = Field(default=None, max_length=4096)
     output_root: str | None = Field(default=None, max_length=4096)
     location: str | None = Field(default=None, min_length=1, max_length=128)
-    scenario: Scenario | None = None
 
     @field_validator("message", "analysis_request", "evaluation_criteria")
     @classmethod
@@ -77,128 +90,287 @@ class ConfirmationRequest(BaseModel):
 
 class ConversationManager:
     def __init__(
-        self, runtime: EngineeringRuntime | VerificationRuntime, jobs: JobManager,
-    ):
-        self.runtime = (
-            LegacyRuntimeAdapter(runtime) if isinstance(runtime, VerificationRuntime) else runtime
-        )
-        self.jobs = jobs
+        self,
+        runtime: EngineeringRuntime,
+        planning: PlanningScheduler,
+        execution: ExecutionTurnScheduler,
+    ) -> None:
+        self.runtime = runtime
+        self.planning = planning
+        self.execution = execution
+        self._close_condition = Condition()
+        self._admission_stopped = False
+        self._draining = False
+        self._closed = False
 
-    def _fail(self, conversation_id: str, error: Exception) -> None:
-        logger.exception("Conversation %s failed", conversation_id)
-        record = self.runtime.store.get(conversation_id)
-        message = str(error)[:4000] or "Conversation operation failed"
-        if record.restore_turn_origin():
-            record.messages.append(ConversationMessage(
-                role="assistant", content="Follow-up request failed: " + message, created_at=now(),
-            ))
-            self.runtime.store.save(record)
+    def close(self) -> None:
+        with self._close_condition:
+            if self._closed:
+                return
+            if not self._admission_stopped:
+                self.planning.stop_accepting()
+                self.execution.stop_accepting()
+                self._admission_stopped = True
+        if self.planning.is_worker_thread() or self.execution.is_worker_thread():
             return
-        record.pending_decision = PendingDecision(
-            kind=(
-                record.pending_decision.kind
-                if record.pending_decision
-                else "resume"
-                if record.status != "planning" and record.task and record.task.baseline.confirmed
-                else "clarify"
-            ),
-            message=message,
+        with self._close_condition:
+            while self._draining and not self._closed:
+                self._close_condition.wait()
+            if self._closed:
+                return
+            self._draining = True
+        try:
+            self.planning.close()
+            self.execution.close()
+        except BaseException:
+            with self._close_condition:
+                self._draining = False
+                self._close_condition.notify_all()
+            raise
+        with self._close_condition:
+            self._closed = True
+            self._draining = False
+            self._close_condition.notify_all()
+
+    def _fail(
+        self,
+        conversation_id: str,
+        error: Exception,
+        *,
+        restore_unstarted: bool = True,
+    ) -> None:
+        logger.exception("Conversation %s failed", conversation_id)
+        with self.runtime.locks.hold(conversation_id):
+            record = self.runtime.store.get(conversation_id)
+            message = str(error)[:4000] or "Conversation operation failed"
+            action = record.queued_action
+            origin = record.queue_origin
+            committed = (
+                record.queued_action_committed
+                and action in ("confirm", "resume", "retry")
+            )
+            record.queued_action = None
+            record.queued_action_committed = False
+            record.queue_origin = None
+            if committed:
+                unresolved = has_unresolved_scheduling(record)
+                failed = record.task is not None and any(
+                    node.status == "failed" for node in record.task.nodes
+                )
+                confirmed = (
+                    record.task is not None
+                    and record.task.baseline.confirmed
+                )
+                record.status = (
+                    "interrupted"
+                    if unresolved or confirmed and not failed
+                    else "failed"
+                )
+                record.error = message
+                record.pending_decision = conservative_pending_decision(
+                    record,
+                    message,
+                    unresolved=unresolved,
+                )
+            else:
+                may_restore = (
+                    restore_unstarted
+                    or action not in ("confirm", "resume", "retry")
+                )
+                restored = record.restore_turn_origin() if may_restore else False
+                if (
+                    may_restore
+                    and not restored
+                    and origin is not None
+                    and (action != "message" or len(record.messages) > 1)
+                ):
+                    record.status = origin.status
+                    record.pending_decision = origin.pending_decision
+                    record.error = origin.error
+                    restored = True
+                if restored:
+                    record.messages.append(
+                        ConversationMessage(
+                            role="assistant",
+                            content="Request failed: " + message,
+                            created_at=now(),
+                        )
+                    )
+                else:
+                    record.status, record.pending_decision = (
+                        conservative_failure_transition(record, message)
+                    )
+                    record.error = message
+            record.turn_origin = None
+            self.runtime.store.save(record)
+
+    def _run(
+        self,
+        conversation_id: str,
+        operation: Callable[[], Conversation],
+        *,
+        lock_operation: bool = True,
+    ) -> None:
+        lock = (
+            self.runtime.locks.hold(conversation_id)
+            if lock_operation
+            else nullcontext()
         )
-        record.status = "failed"
-        record.error = record.pending_decision.message
-        self.runtime.store.save(record)
+        with lock:
+            try:
+                operation()
+            except PlanningSuperseded:
+                logger.exception(
+                    "Conversation %s planning result was superseded",
+                    conversation_id,
+                )
+            except PlanningFailure as exc:
+                state = "finalized" if exc.finalized else "stale"
+                if isinstance(exc.cause, CopilotError):
+                    logger.error(
+                        "Copilot planning failed for conversation %s "
+                        "reservation_state=%s category=%s exit_code=%s",
+                        conversation_id,
+                        state,
+                        exc.cause.diagnostics.category,
+                        exc.cause.diagnostics.exit_code,
+                        exc_info=False,
+                    )
+                else:
+                    logger.exception(
+                        "Conversation %s planning failed with %s reservation state",
+                        conversation_id,
+                        state,
+                    )
+            except Exception as exc:
+                self._fail(conversation_id, exc, restore_unstarted=False)
 
-    def _run(self, conversation_id: str, operation: Callable[[], Conversation]) -> None:
+    def _schedule(
+        self,
+        record: Conversation,
+        reservation: Submission,
+        operation: Callable[[], Conversation],
+        *,
+        lock_operation: bool = True,
+    ) -> Conversation:
+        response = record.model_copy(deep=True)
         try:
-            operation()
-        except Exception as exc:
-            # Background failures must be visible in the durable record and the server log.
-            self._fail(conversation_id, exc)
-        finally:
-            self.jobs.slot.release()
-
-    def _dispatch(self, record: Conversation, operation: Callable[[], Conversation]) -> None:
-        self.jobs.pool.submit(self._run, record.id, operation)
-
-    def _schedule(self, record: Conversation, operation: Callable[[], Conversation]) -> None:
-        try:
-            self._dispatch(record, operation)
+            reservation.submit(
+                lambda: self._run(
+                    record.id,
+                    operation,
+                    lock_operation=lock_operation,
+                )
+            )
         except RuntimeError as exc:
             self._fail(record.id, exc)
-            raise HTTPException(
-                status_code=503, detail="Unable to schedule conversation: " + str(exc)
+            raise SchedulerClosed(
+                "Unable to publish reserved conversation work"
             ) from exc
+        return response
 
     def submit(self, conversation_id: str | None, request: MessageRequest) -> Conversation:
-        if not self.jobs.slot.acquire(blocking=False):
-            raise BusyError("Another task is running; wait for it to finish")
-        dispatched = False
-        try:
-            record = self.runtime.queue_message(
-                conversation_id,
-                request.canonical_message(),
-                request.project_root,
-                output_root=request.output_root,
-                location=request.location,
-                scenario=request.scenario,
-            )
-            if record.status == "planning":
-                self._schedule(record, lambda: self.runtime.continue_submission(record.id))
-                dispatched = True
-            return record
-        finally:
-            if not dispatched:
-                self.jobs.slot.release()
+        if conversation_id is not None:
+            current = self.runtime.store.get(conversation_id)
+            if current.status in ("queued", "planning", "running"):
+                raise ConversationActive(
+                    "This conversation already has an admitted turn"
+                )
+        with self.planning.reserve() as reservation:
+            if conversation_id is None:
+                record = self.runtime.queue_message(
+                    None,
+                    request.canonical_message(),
+                    request.project_root,
+                    output_root=request.output_root,
+                    location=request.location,
+                )
+                identifier = record.id
+            else:
+                identifier = conversation_id
+                record = None
+            with self.runtime.locks.hold(identifier):
+                if record is None:
+                    record = self.runtime.queue_message(
+                        identifier,
+                        request.canonical_message(),
+                        request.project_root,
+                        output_root=request.output_root,
+                        location=request.location,
+                    )
+                if record.status != "queued" or record.queued_action != "message":
+                    return record.model_copy(deep=True)
+                return self._schedule(
+                    record,
+                    reservation,
+                    lambda: self.runtime.continue_submission(
+                        identifier,
+                        _managed=True,
+                    ),
+                    lock_operation=False,
+                )
+
+    def _decision(
+        self,
+        conversation_id: str,
+        action: Literal["confirm", "resume", "retry"],
+        request: ConfirmationRequest | None,
+    ) -> Conversation:
+        return self.runtime.continue_decision(
+            conversation_id,
+            action,
+            version=request.version if request is not None else None,
+            trusted=request.trusted if request is not None else False,
+        )
 
     def decide(
         self,
         conversation_id: str,
-        action: Literal["confirm", "resume", "retry", "replan"],
+        action: Literal["confirm", "resume", "retry"],
         request: ConfirmationRequest | None = None,
     ) -> Conversation:
-        if not self.jobs.slot.acquire(blocking=False):
-            raise BusyError("Another task is running; wait for it to finish")
-        dispatched = False
-        try:
-            record = self.runtime.store.get(conversation_id)
-            operation = self.runtime.prepare_decision(
-                conversation_id, action,
-                version=request.version if request is not None else None,
-                trusted=request.trusted if request is not None else False,
+        current = self.runtime.store.get(conversation_id)
+        if current.status in ("queued", "planning", "running"):
+            raise ConversationActive(
+                "This conversation already has an admitted turn"
             )
-            if operation is None:
-                return record
-            record.status = "running"
-            record.error = None
-            self.runtime.store.save(record)
-            self._schedule(record, operation)
-            dispatched = True
-            return record
-        finally:
-            if not dispatched:
-                self.jobs.slot.release()
+        with self.execution.reserve() as reservation:
+            with self.runtime.locks.hold(conversation_id):
+                record = self.runtime.store.get(conversation_id)
+                if record.status in ("queued", "planning", "running"):
+                    raise ConversationActive(
+                        "This conversation already has an admitted turn"
+                    )
+                operation = self.runtime.prepare_decision(
+                    conversation_id,
+                    action,
+                    version=request.version if request is not None else None,
+                    trusted=request.trusted if request is not None else False,
+                )
+                if operation is None:
+                    return record.model_copy(deep=True)
+                record.queue_origin = ConversationState(
+                    status=record.status,
+                    pending_decision=record.pending_decision,
+                    error=record.error,
+                )
+                record.queued_action = action
+                record.queued_action_committed = False
+                record.status = "queued"
+                self.runtime.store.save(record)
+                return self._schedule(
+                    record,
+                    reservation,
+                    lambda: self._decision(conversation_id, action, request),
+                )
 
 
 def verification_router(
-    runtime: EngineeringRuntime | VerificationRuntime, jobs: JobManager,
+    manager: ConversationManager,
     authorize: Callable[[Request], None],
 ) -> APIRouter:
+    runtime = manager.runtime
     router = APIRouter(prefix="/api/conversations", dependencies=[Depends(authorize)])
-    manager = ConversationManager(runtime, jobs)
-
-    @contextmanager
-    def request_errors() -> Iterator[None]:
-        try:
-            yield
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Unknown conversation or task") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except OSError as exc:
-            logger.exception("Conversation storage is unavailable")
-            raise HTTPException(
-                status_code=503, detail="Conversation storage is unavailable"
-            ) from exc
 
     @router.get("")
     def recent() -> list[dict[str, str | None]]:
@@ -207,14 +379,11 @@ def verification_router(
                 {
                     "id": record.id,
                     "status": record.status,
-                    "scenario": record.scenario,
                     "project_root": record.project_root,
                     "output_root": record.output_root,
                     "updated_at": record.updated_at,
                     "title": (
                         record.task.baseline.title
-                        if isinstance(record.task, AgentTask)
-                        else record.task.proposal.title
                         if record.task
                         else record.messages[0].content[:100]
                         if record.messages
@@ -230,14 +399,6 @@ def verification_router(
         with request_errors():
             return manager.submit(None, request)
         raise AssertionError("Unreachable")
-
-    @router.get("/workflows")
-    def workflows() -> list[dict[str, object]]:
-        return manager.runtime.workflow_catalog()
-
-    @router.get("/capabilities")
-    def capabilities() -> list[dict[str, object]]:
-        return manager.runtime.capability_catalog()
 
     @router.get("/{conversation_id}")
     def status(conversation_id: str) -> Conversation:
@@ -273,33 +434,6 @@ def verification_router(
     def retry(conversation_id: str, request: ConfirmationRequest) -> Conversation:
         with request_errors():
             return manager.decide(conversation_id, "retry", request)
-        raise AssertionError("Unreachable")
-
-    @router.post("/{conversation_id}/replan", status_code=202)
-    def replan(conversation_id: str, request: ConfirmationRequest) -> Conversation:
-        with request_errors():
-            return manager.decide(conversation_id, "replan", request)
-        raise AssertionError("Unreachable")
-
-    @router.get("/{conversation_id}/tasks/{task_id}/artifacts/{name:path}")
-    def artifact(conversation_id: str, task_id: str, name: str) -> FileResponse:
-        with request_errors():
-            record = runtime.store.get(conversation_id)
-            tasks = ([record.task] if record.task else []) + record.archived_tasks
-            task = next((task for task in tasks if task.id == task_id), None)
-            if task is None:
-                raise KeyError("Unknown task")
-            item = next((artifact for artifact in task.artifacts if artifact.path == name), None)
-            if item is None:
-                raise HTTPException(status_code=404, detail="Unknown artifact")
-            directory = runtime.store.task_directory(conversation_id, task_id, task.output_root)
-            if str(directory) != task.result_directory:
-                raise ValueError("Task result directory does not match its persisted identity")
-            if isinstance(item, OutputArtifact):
-                path = verify_evidence(directory, item)
-                return FileResponse(path, filename=Path(name).name)
-            path = verify_artifact(directory, item)
-            return FileResponse(path, media_type=item.media_type, filename=Path(name).name)
         raise AssertionError("Unreachable")
 
     return router

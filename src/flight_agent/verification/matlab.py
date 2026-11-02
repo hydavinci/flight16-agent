@@ -7,8 +7,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from ..json_io import write_json
 from ..matlab import MatlabError, _stop_worker
-from ..session import _write_json
 from .artifacts import describe_artifact
 from .contracts import AnalysisResult, AnalysisRunRequest
 from .projects import ProjectInspector, snapshot_project
@@ -34,8 +34,8 @@ def execute_project(
     if on_progress:
         on_progress("preparing")
     snapshot_project(project, directory / "project")
-    _write_json(directory / "request.json", request.model_dump())
-    _write_json(directory / "project.json", project.model_dump())
+    write_json(directory / "request.json", request.model_dump())
+    write_json(directory / "project.json", project.model_dump())
     log_path = directory / "matlab.log"
     output_path = directory / "analysis.json"
     environment = {
@@ -119,7 +119,7 @@ def execute_project(
         )
         if ProjectInspector().inspect(project.root).fingerprint != project.fingerprint:
             raise ValueError("Source project changed during execution; results require review")
-        _write_json(output_path, result.model_dump())
+        write_json(output_path, result.model_dump())
         return result
     except (ValueError, OSError) as exc:
         raise MatlabError(f"Invalid MATLAB verification output: {exc}") from exc

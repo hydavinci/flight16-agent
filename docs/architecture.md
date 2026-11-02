@@ -5,6 +5,8 @@
 本项目把“理解需求”“执行计算”“评价结果”分开。
 大模型提出受约束的方案，已注册工具产生证据，程序按已确认判据评价并交付。
 这种分层支持扩展新能力，但不代表已经能执行任意 MATLAB 分析。
+只有一个通用 v2 运行时，没有 D1/D2 场景选择。
+Worker 工程与离线诊断数据都是注册资源，不是独立产品。
 
 [能力与资源](#注册能力与资源) · [执行机制](#方案授权与证据) · [源码目录](#源码目录) · [开发验证](#开发与验证)
 
@@ -12,7 +14,7 @@
 
 | 层次 | 主要职责 | 代码位置 |
 |---|---|---|
-| 入口与展示 | Web、CLI、请求校验、下载 | `web.py`、`cli.py`、`static/` |
+| 入口与展示 | Web 组合、CLI、请求校验、下载 | `web.py`、`application.py`、`web_routes/`、`cli.py` |
 | 会话协调 | 需求、任务归档、确认与恢复 | `verification/coordinator.py`、`store.py` |
 | 规划与契约 | 类型化方案、来源和资源绑定 | `agent_planner.py`、`runtime/` |
 | 执行与证据 | 依赖图、权限、预算、回执与复用 | `agent_runtime.py`、`runtime/evidence.py` |
@@ -21,6 +23,18 @@
 
 表内相对模块名以 `src/flight_agent/` 或对应的 `verification/` 目录为基准，
 完整分布见下方源码树。前端是原生 HTML/CSS/JavaScript，无需 Node 构建。
+
+`create_web_app` 保持公开入口、`scheduler_settings` 参数和 HTTP 路径，仅负责 Web 组合。
+`application.py` 负责默认运行时装配；测试可按对象身份注入 `EngineeringRuntime`，
+也可通过 `conversation_manager` 注入带 planning/execution 调度器的
+`ConversationManager`。外部注入的 manager 和 store 由调用者管理；默认 manager
+在应用退出时排空并关闭其调度器。store 没有虚构的 close 生命周期，退出后仍可读取。
+`app.state.conversation_manager` 保持可用。
+
+所有路由继续经过同源、Host、令牌、请求体大小和严格 schema 校验。
+下载继续核对任务目录身份、工件登记和 SHA-256，不暴露任意文件目录。
+前端由浏览器直接加载原生 ES modules，不需要 Node、npm、打包器或编译。
+模块 URL 使用显式白名单和 JavaScript MIME；CSP 不增加 `unsafe-inline` 或 `unsafe-eval`。
 
 桌面三栏独立滚动，左右默认宽度为 260/340px，最小为 200/240px，对话区至少 480px。
 方向键每次调整 10px，Shift 加方向键为 50px；Enter 或双击恢复默认。
@@ -58,9 +72,11 @@ Web 启动时装配 `CapabilityRegistry(agent_mode=True)`、`ResourceRegistry`�
 `EngineeringRuntime`、`AgentPlanner` 和 `AgentExecutor`。
 本机后端直接使用兼容 Python 子进程与 MATLAB Engine；远程后端通过 `RemoteSimulinkBackend`。
 
-目录 Agent 的版本化状态保存在本地文件，不依赖 LangGraph checkpoint。
-旧固定算例 CLI 使用 LangChain/LangGraph 工具循环，两条路径不能混为一谈。
-服务没有 Redis、Celery 或业务数据库；目录任务与兼容上传任务共享单服务执行槽。
+通用 Agent 的版本化状态保存在本地 SQLite WAL 数据库；不使用 LangGraph 或顶层 LangChain 运行时。
+结构化模型传输保留 `langchain-core`、`langchain-openai`、`langsmith` 和 `openai`。
+服务没有 Redis 或 Celery。进程内规划和执行调度器提供有界队列与分 lane 并发；
+本机 MATLAB 默认仍为单槽。入队、恢复和结果发布都通过 SQLite 状态与会话预留核对，
+过期规划不能覆盖更新后的会话。
 
 ## 注册能力与资源
 
@@ -128,8 +144,9 @@ Engine 探测、启动、许可、仿真和指标有效性是不同检查，不�
 有状态能力保存原调用检查点，恢复时核对规格与回执。
 缺少可核验回执时明确停止；新需求也不能绕过尚未对账的旧调用。
 
-失败阶段保留已有证据，未完成阶段不伪造结果。旧 v1 任务按原契约执行和恢复，
-只读投影到统一视图；缺少历史来源或适配器版本时标记未记录，不补造。
+失败阶段保留已有证据，未完成阶段不伪造结果。
+v1 历史不再读取、执行、恢复或投影；旧上传/demo 与恢复提案入口不受支持。
+已有 v2 状态继续保留确认、调用身份、哈希、检查点与交付，不生成兼容任务。
 
 ## 大模型调用边界
 
@@ -153,6 +170,54 @@ Copilot 适配在空临时目录运行，仅允许加载技能，禁止其文件
 不传递 MATLAB/LLM API 凭据，也不让 CLI 直接执行工程。
 数据范围与使用配置见[使用指南](usage.md#配置大模型)。
 
+## Planning context and provider telemetry
+
+Planning normalizes a closed subset of metric requests and selects candidates from
+registered output, metric, resource-role, and dependency metadata. Unknown intent,
+unknown dependency metadata, unresolved dependencies, or selected dynamic
+dependencies retain the full catalog. Missing resources and unavailable relevant
+backends remain visible for clarification or a capability gap. Selection is
+deterministic and conservative.
+
+Selection metadata is catalog-only and excluded from execution snapshots, so it
+does not rewrite confirmed baseline fingerprints or change capability versions.
+Source selection keeps complete authorized excerpts. Only explicitly scoped,
+unrelated non-user excerpts may be omitted from model context; unclassified
+sources and all user-message sources are retained. The complete authorized
+sources, resource references, project declarations, and catalog remain local for
+binding and validation. Selection grants no permission or execution authority.
+
+The logical redacted request context is limited to exactly 120,000 UTF-8 bytes
+before lossless catalog-schema packing; equality is accepted and 120,001 bytes is
+rejected. The same limit applies to the initial request and structural correction.
+Neither round can silently truncate requirements, quotations, or history to fit.
+An oversized context returns clarification without dispatch.
+
+Conversation `planning_telemetry` contains
+`metrics.serialized_bytes`, `metrics.selected_capability_count`,
+`metrics.selected_source_excerpt_count`,
+`metrics.planning_duration_seconds`, and `metrics.correction_round_count`.
+An optional `failure` contains exactly `category`, `redacted_request_id`,
+`exit_code`, `elapsed_seconds`, `response_bytes`, and a fixed bounded `summary`.
+Provider request IDs are represented by `sha256:` followed by the first 16 hex
+characters of their SHA256 digest, never their original values. The six terminal categories are
+`authentication`, `authorization`, `transport`, `timeout`, `invalid_response`,
+and `process_failure`.
+
+No assembled prompt, response body, credentials, environment dump, or raw stderr
+is stored in telemetry. Original user messages and source documents remain under
+their existing local retention rules; telemetry does not copy them. Managed
+provider-failure logs use only allowlisted category and exit-code data without an
+exception chain. A provider failure is not a capability gap and does not erase
+the previous confirmed task.
+
+Telemetry is persisted with the conversation in SQLite, survives restart, and is
+returned by the authenticated conversation API. Plan-producing success persists
+its telemetry as well as answer and clarification outcomes. Planning releases the
+outer conversation-manager lock during inference, then publishes only if its
+reservation is still current; a superseded reservation cannot publish stale
+messages, task state, or telemetry.
+
 ## 扩展一个能力
 
 可信应用启动代码注册 `Capability(...)`，声明稳定名称与版本、严格输入模型、
@@ -162,11 +227,9 @@ Copilot 适配在空临时目录运行，仅允许加载技能，禁止其文件
 
 将注册表、资源表和会话存储注入 `EngineeringRuntime`，即可复用确认、执行、展示和交付链路。
 不需要在新能力中引入 F16、配平点或固定三节点假设。
-最小装配例子见 [D1 技术参考](d1-agent.md)。插件是可信 Python 代码，不是可由模型动态安装的脚本。
-
-若只扩展上传计算，保持 `params/result` 契约即可；要参与判定，还须适配观测与判据。
-替换固定 CLI 算例则需同步 `models.py`、`matlab_worker.py`、入口快照、规则、知识与真实参考测试，
-不能仅修改阈值就视为完成工程接入。
+装配使用 `plugins.register_builtin_plugins`，分别注入 Worker 后端与诊断 reviewer。
+插件是可信 Python 代码，不是可由模型动态安装的脚本。
+资源准备见 [Simulink Worker 参考](simulink-worker.md)与[离线诊断参考](offline-diagnostics.md)。
 
 ## 源码目录
 
@@ -176,7 +239,14 @@ Copilot 适配在空临时目录运行，仅允许加载技能，禁止其文件
 ```text
 src/flight_agent/
 |-- cli.py                       # 命令行入口
-|-- web.py                       # Web 装配、页面与 API
+|-- web.py                       # Web 组合、同源/令牌校验、安全响应头与生命周期
+|-- application.py               # 运行时、计算后端与后台调度器装配和注入
+|-- web_routes/
+|   |-- pages.py                 # 页面和显式静态资源白名单
+|   |-- configuration.py         # bootstrap 与目录配置
+|   |-- metadata.py              # 能力与资源元数据
+|   |-- artifacts.py             # 哈希校验后的工件下载
+|   `-- errors.py                # HTTP 错误映射
 |-- worker.py                    # Worker 服务与共享执行槽
 |-- config.py                    # 模型配置与 API 客户端
 |-- copilot.py                   # Copilot CLI 传输
@@ -191,14 +261,16 @@ src/flight_agent/
 |   |-- loop.py                  # 有界执行驱动
 |   |-- budget.py                # 预算计算
 |   |-- evidence.py              # 工件、摘要与不可变回执
-|   `-- tasks.py / workflows.py / intents.py
+|   |-- scheduling.py            # 有界规划队列与分 lane 执行调度
+|   `-- tasks.py                 # 通用依赖图节点与祖先校验
 |-- verification/
 |   |-- coordinator.py           # 会话与任务协调
 |   |-- agent_planner.py         # 通用规划与来源校验
 |   |-- agent_runtime.py         # 依赖执行、复用和对账
 |   |-- routes.py                # 会话 API
-|   |-- views.py                 # 新旧任务只读视图
-|   |-- store.py                 # 会话与任务目录
+|   |-- views.py                 # v2 当前与归档任务只读视图
+|   |-- store.py                 # 会话存储接口与兼容入口
+|   |-- sqlite_store.py          # SQLite WAL 会话、归档与导出
 |   |-- intake.py                # 目录识别、冲突与路径约束
 |   |-- plugins.py               # 生产能力装配
 |   |-- resources.py             # 资源适配器注册
@@ -214,17 +286,13 @@ src/flight_agent/
 |   |   `-- delivery.py          # JSON/Word 交付
 |   |-- diagnostic_data.py       # 数据清单与快照
 |   |-- diagnostic_engine.py / diagnostic_signals.py
-|   |-- diagnosis.py / diagnosis_contracts.py / diagnosis_reports.py
+|   |-- diagnosis_contracts.py / diagnostic_planner.py
 |   |-- projects.py / backend.py / worker.py / matlab.py
-|   `-- runtime.py / planner.py / compat.py
+|   `-- legacy_cleanup.py        # 原始记录分类与显式清理，不执行旧任务
 |-- remote.py                    # 远端提交、轮询与下载
-|-- jobs.py                      # 兼容上传任务调度
-|-- matlab.py / matlab_worker.py # 固定 CLI 算例
-|-- upload_engine.py             # 单文件上传执行
-|-- agent.py                     # 兼容工具循环
-|-- session.py                   # 兼容分析结果持久化
-|-- models.py / upload_models.py # 兼容输入输出契约
-|-- rules.py / knowledge.py      # 规则比较与知识检索
+|-- background.py                # Future 与后台执行槽生命周期
+|-- matlab.py                    # Engine 探测与进程组清理
+|-- models.py                    # 共用严格契约与有限数值
 |-- service.py                   # HTTP 校验、鉴权与文件访问
 |-- directories.py               # 目录选择
 |-- matlab_support/
@@ -234,70 +302,135 @@ src/flight_agent/
 |   |-- flight_agent_local_allmargin.m
 |   |-- flight_agent_step_metrics.m
 |   |-- flight_agent_margin_metrics.m
-|   |-- flight_agent_verify.m
-|   `-- flight_agent_execute_upload.m
+|   `-- flight_agent_verify.m
 `-- static/
-    |-- agent.html / agent.css / agent.js
-    |-- index.html / style.css / app.js
+    |-- agent.html / agent.css
+    |-- agent.js                 # 稳定 URL 的原生 ES module 入口
+    |-- api.js                   # API 传输与令牌头
+    |-- state.js                 # 单一会话/UI 状态
+    |-- render.js                # 会话、进度与控件的文本 DOM 渲染
+    |-- task-evidence.js         # 基线、授权、评价、证据与工件下载
+    |-- resize-preferences.js    # 三栏调整、键盘交互与本地偏好
+    |-- bootstrap.js             # 初始化、事件、轮询、历史、目录与请求时序
     `-- favicon.svg
 ```
 
-其他目录：`matlab/` 放固定算例，`examples/` 放示例输入和合成诊断数据，
-`rules/` 放版本化判据，`knowledge/` 放 Markdown 依据，`tests/` 放各层回归。
+其他目录：`examples/` 放合成诊断数据，`tests/` 放各层回归。
 `.env.example` 是配置模板，`pyproject.toml` 管理依赖、打包和开发工具。
 
 ## 开发与验证
 
-在项目根目录激活虚拟环境后执行：
+在项目根目录执行锁定的软件 gate：
 
 ```bash
-python -m pip install -e '.[dev]'
-python -m pytest -q
-python -m ruff check .
-python -m mypy src
-python -m build
+uv sync --extra dev
+uv lock --check
+RUN_BROWSER_TESTS=0 RUN_MATLAB_TESTS=0 \
+uv run --no-sync python -m pytest -m "not matlab and not browser" -q
+uv run --no-sync python -m ruff check .
+uv run --no-sync python -m mypy src
+uv run --no-sync python -m build --no-isolation
 ```
 
 默认测试不需要真实 MATLAB，也不请求真实模型；测试替身只在 `tests/`。
 浏览器回归需先安装 Playwright Chromium：
 
 ```bash
-python -m playwright install chromium --only-shell
-RUN_BROWSER_TESTS=1 python -m pytest \
-  tests/test_agent_browser.py tests/test_verification_browser.py \
-  tests/test_diagnosis_browser.py tests/test_general_browser.py \
-  tests/test_matlab_project_browser.py tests/test_agent_layout_browser.py \
-  tests/test_agent_column_resize_browser.py tests/test_web_browser.py -v
+uv run --no-sync python -m playwright install chromium --only-shell
+RUN_BROWSER_TESTS=1 RUN_MATLAB_TESTS=0 \
+uv run --no-sync python -m pytest -m "browser and not matlab" -q
 ```
 
-在已安装匹配 Engine 和许可证的环境中，可显式运行真实集成：
+Linux CI 使用 `playwright install --with-deps chromium --only-shell`。
+测试通过 `serve_app` 启动各自的临时本地应用，不要求单独常驻开发服务器。
+
+真实 MATLAB 验收使用管理员预先配置的专用兼容环境。变量必须由运行环境提供，
+不能把下面的变量名当成可直接粘贴的示例路径：
 
 ```bash
-RUN_MATLAB_TESTS=1 python -m pytest \
-  tests/test_matlab.py tests/test_verification_matlab.py tests/test_uploads.py -m matlab -v
-
+test -n "$MATLAB_ACCEPTANCE_ENV"
+test -f "$MATLAB_ACCEPTANCE_ENV/pyvenv.cfg"
+test -x "$MATLAB_ACCEPTANCE_ENV/bin/python"
+export UV_PROJECT_ENVIRONMENT="$MATLAB_ACCEPTANCE_ENV"
+export MATLAB_PYTHON_EXECUTABLE="$MATLAB_ACCEPTANCE_ENV/bin/python"
+"$MATLAB_PYTHON_EXECUTABLE" -c 'import matlab.engine; print(matlab.engine.__file__)'
+uv sync --locked --extra dev --inexact --python "$MATLAB_PYTHON_EXECUTABLE"
 RUN_MATLAB_TESTS=1 MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
-MATLAB_PYTHON_EXECUTABLE=/absolute/path/to/compatible/python \
-/absolute/path/to/compatible/python -m pytest \
-  tests/test_local_matlab.py tests/test_local_matlab_integration.py -m matlab -v
+uv run --no-sync python -m pytest \
+  tests/test_verification_matlab.py tests/test_local_matlab.py \
+  tests/test_local_matlab_integration.py -m matlab -v -s
 ```
 
-本机集成包含解析响应、真正非线性闭环、不同初始化工作区、5%/2% 调节带、错误与报告下载。
-独立参考与容差见 [D1 技术参考](d1-agent.md)。这些测试准备夹具，不让生产 Agent 生成缺少的模型。
+`MATLAB_ACCEPTANCE_ENV` 须预装匹配发行版的 Engine，并拥有 MATLAB、Simulink、
+Control System Toolbox 和 Simulink Control Design 许可。`--inexact` 只用于保留
+专用环境中的非锁定 Engine，不用于常规软件 CI。真实 MATLAB 不回退到 fake Engine；
+未显式启用的 matlab 测试会跳过，跳过不代表验收通过。记录中须保存 MATLAB 发行版、
+解释器、测试结果与失败原因。
+
+GitHub CI 的 software job 使用 Python 3.11/3.12 矩阵；browser job 单独运行 Chromium。
+licensed MATLAB job 仅允许从默认分支手动勾选 `run_matlab`，使用
+`[self-hosted, matlab]` 与受审批保护的 `matlab-acceptance` 环境；
+仓库变量 `MATLAB_ACCEPTANCE_ENV` 指向该 runner 的专用环境。PR 不触发真实 MATLAB。
+hosted jobs 只缓存 uv 下载；不缓存虚拟环境、浏览器、MATLAB、Engine 或证据产物，
+licensed MATLAB job 禁用 uv 缓存。
+
+本分支的真实 MATLAB 验收未运行；opt-in licensed gate 仍等待受保护环境、
+self-hosted runner、专用 Engine 环境、所需工具箱和许可证基础设施。
+
+本机集成包含解析响应、真正非线性闭环、不同初始化工作区、5%/2% 调节带、错误、
+报告下载、线性化与 `allmargin` 证据链。
+独立参考与容差见 [Simulink Worker 参考](simulink-worker.md)。
+这些测试准备夹具，不让生产 Agent 生成缺少的模型。
 如需用 `--basetemp` 保留产物，只能指定新的专用目录，因为 pytest 会清空该目录。
 
 软件回归不等于目标工程验收。真实服务、平台依赖、独立数值参考和业务流程仍须分别核对；
 没有标注故障案例，也不能声称已验证诊断准确率。
 
 Python 包包含静态资源和受控 MATLAB 支持函数，不包含 MATLAB、用户工程、
-固定演示入口、知识或规则文件。完整部署需保留项目目录，并正确设置 `--project-root`。
+知识或规则文件。完整部署需正确设置 `--project-root`。
 
-### 当前范围与原始需求
+## CLI 与历史清理
 
-| 原始需求 | 已覆盖 | 仍需验收或实现 |
-|---|---|---|
-| D1 功能流程 v0.5 | 发现、规划、确认、执行、追问、交付、恢复 | 目标平台与模型服务的独立业务验收 |
-| D1 案例 v0.3 | Worker 配平点 1 的时域与裕度链路 | 真实工程参考与逐项容差对照 |
-| Demo Roadmap | D1 软件闭环、有界 D2 证据循环 | 主动补跑 Simulink、真实故障案例、D3–D6 |
+支持 `doctor`、`web`、`worker`、`directory-task propose/confirm/status/resume`
+和 `cleanup-legacy`；不提供场景、工作流目录或恢复提案接口。
+`cleanup-legacy --project-root ...` 默认 dry-run，仅报告原始记录分类。
+显式 `--apply` 才删除正面识别为 v1 的会话目录，保留 v2、未知记录和外部成果。
+源路径必须通过 `Path.resolve(strict=True)` 严格解析；无法解析或包含于待删目录时跳过。
+清理器不依赖任何旧任务契约；详见[历史清理](usage.md#历史清理)。
 
-D3–D6 只保留部分设计版本和效果契约，不是已实现的优化、拓扑编辑或候选采纳工作流。
+## Confirmed Local Project Snapshots
+
+Static discovery is read-only. Exact-version trusted confirmation revalidates the
+selected source fingerprint, verifies or atomically publishes a canonical
+content-addressed snapshot, and commits its identity and manifest with the task.
+The immutable object lives under the conversation store's `snapshots/objects`.
+The original resource reference remains provenance; it is not rewritten into an
+execution path.
+
+New local project execution and linearization copy verified immutable bytes into
+managed `work/<conversation>/<task>/calls/<call>/local-matlab/project` directories.
+stepinfo and allmargin use independently copied, verified direct-dependency
+artifacts, with the originating snapshot lineage in their invocation receipts.
+MATLAB never runs in the immutable object. New backend working files,
+`request.json`, and `state.json` do not live in an external delivery directory.
+Authenticated Agent checkpoints and immutable receipts retain their established
+evidence-store location and digest checks.
+
+Every use, including cache reuse and new-style reconciliation, verifies the full
+manifest and file digests. Source changes after confirmation do not redirect
+execution. A later source version requires a new proposal and confirmation.
+Tampered managed objects fail closed and are never silently repaired.
+The confirmed baseline is the single holder of the full manifest. New invocation
+specifications record only each resource's snapshot ID and source fingerprint;
+verification resolves that compact lineage back to the baseline before checking
+the managed object. Historical invocation receipts that embedded the full
+manifest are normalized to the same lineage identity and remain immutable.
+
+Cleanup uses a cross-process lifecycle guard and the complete SQLite reference
+index. Current and archived persisted task baselines retain snapshots regardless
+of terminal status, preserving retained evidence. Cleanup is explicit and dry-run
+by default; it never traverses sources, Worker locators, delivery roots, or work
+directories. Exact publication and quarantine names left by interrupted snapshot
+operations are eligible only after the same containment, identity, manifest, and
+inventory checks; retained or unsafe residues remain untouched. Read-only
+permissions are not a security sandbox.

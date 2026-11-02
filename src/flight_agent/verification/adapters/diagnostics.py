@@ -2,16 +2,28 @@ import json
 from typing import Self
 
 from openai import APIError
-from pydantic import model_validator
+from pydantic import JsonValue, model_validator
 
 from ...runtime.agent_contracts import AgentNode, AgentPlan
 from ...runtime.capabilities import Capability
-from ...runtime.capability_metadata import CapabilityMetadata, ResourceRequirement
-from ...runtime.contracts import Name, Version
+from ...runtime.capability_metadata import (
+    CapabilityMetadata,
+    CapabilityPlanning,
+    ResourceRequirement,
+)
+from ...runtime.contracts import EvidenceFile, Name, Version
+from ...runtime.evidence import verify_evidence
 from ...runtime.observations import CapabilityOutcome, Finding, OutputArtifact, ResultTable
 from ...runtime.resources import AgentContract, ResourceReference
+from ...runtime.scheduling_contracts import SchedulingMetadata
 from ..agent_runtime import AgentContext, ExecutionUncertain
-from ..diagnosis_contracts import DiagnosisBaseline, DiagnosisProposal, HypothesisAssessment
+from ..contracts import Artifact
+from ..diagnosis_contracts import (
+    DiagnosisBaseline,
+    DiagnosisProposal,
+    DiagnosticRunState,
+    HypothesisAssessment,
+)
 from ..diagnostic_data import (
     DiagnosticManifest,
     DiagnosticProject,
@@ -19,7 +31,7 @@ from ..diagnostic_data import (
     inspect_diagnostic_project,
 )
 from ..diagnostic_engine import DiagnosticEngine
-from ..planner import VerificationPlanner
+from ..diagnostic_planner import DiagnosticReviewer
 
 
 class DiagnosisInput(AgentContract):
@@ -70,8 +82,43 @@ def _validate_plan(plan: AgentPlan, node: AgentNode) -> None:
     _manifest(resource)
 
 
+def _decode_checkpoint(data: JsonValue, inputs: DiagnosisInput) -> DiagnosticRunState:
+    # Called only after AgentContext authenticates the original v2 call and checkpoint digest.
+    if not isinstance(data, dict) or "schema_version" in data:
+        return DiagnosticRunState.model_validate(data)
+    if (
+        data.get("scenario") != "d2"
+        or DiagnosisProposal.model_validate(data.get("proposal")) != inputs.proposal
+        or any(
+            name not in data or data[name] != expected
+            for name, expected in (
+                ("output_root", None), ("stage", "awaiting_confirmation"), ("decisions", []),
+            )
+        )
+    ):
+        raise ValueError("Prior diagnostic checkpoint differs from its confirmed invocation")
+    normalized = dict(data)
+    for name in ("scenario", "proposal", "output_root", "stage", "decisions"):
+        normalized.pop(name)
+    nodes = data.get("nodes")
+    artifacts = data.get("artifacts")
+    if not isinstance(nodes, list) or not isinstance(artifacts, list):
+        raise ValueError("Prior diagnostic checkpoint state is malformed")
+    normalized_nodes: list[JsonValue] = []
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("depends_on") != []:
+            raise ValueError("Prior diagnostic checkpoint has unexpected dependencies")
+        normalized_nodes.append({key: value for key, value in node.items() if key != "depends_on"})
+    normalized["nodes"] = normalized_nodes
+    normalized["artifacts"] = [
+        Artifact.model_validate(item).model_dump(include=set(EvidenceFile.model_fields))
+        for item in artifacts
+    ]
+    return DiagnosticRunState.model_validate(normalized)
+
+
 def diagnostic_capability(
-    planner: VerificationPlanner,
+    planner: DiagnosticReviewer,
 ) -> Capability[AgentContext, DiagnosisInput, CapabilityOutcome]:
     def execute(
         context: AgentContext,
@@ -79,8 +126,6 @@ def diagnostic_capability(
         *,
         resume: bool,
     ) -> CapabilityOutcome:
-        from ..contracts import DiagnosisTask
-
         context.scope.authorize("read_only")
         resource = context.resource("diagnostic_data")
         if resource not in context.scope.resources:
@@ -91,7 +136,7 @@ def diagnostic_capability(
         if resume:
             if saved is None or "task" not in saved:
                 raise ExecutionUncertain("Original diagnostic checkpoint is missing")
-            original = DiagnosisTask.model_validate(saved["task"])
+            original = _decode_checkpoint(saved["task"], inputs)
             project = original.project
             if (
                 project.root != resource.locator
@@ -119,7 +164,7 @@ def diagnostic_capability(
             budget=inputs.proposal.budget,
             confirmed=True,
         )
-        plan = engine._plan(
+        plan = engine.plan(
             baseline,
             project,
             inputs.proposal.analyses,
@@ -127,14 +172,13 @@ def diagnostic_capability(
             1,
             [],
         )
-        task = DiagnosisTask(
+        task = DiagnosticRunState(
             id=context.call_id,
             project=project,
             baseline=baseline,
-            proposal=inputs.proposal,
             result_directory=str(directory),
             plan_revisions=[plan],
-            nodes=engine._nodes(plan),
+            nodes=engine.nodes(plan),
             assessments=[
                 HypothesisAssessment(
                     hypothesis_id=item.id,
@@ -151,17 +195,17 @@ def diagnostic_capability(
                     "id",
                     "project",
                     "baseline",
-                    "proposal",
                     "result_directory",
-                    "output_root",
                 )
             ) or original.plan_revisions[:1] != [plan]:
                 raise ValueError("Diagnostic checkpoint differs from its confirmed invocation")
+            for artifact in original.artifacts:
+                verify_evidence(directory, artifact)
             task = original
             if task.termination and task.termination.reason == "unknown_execution":
                 task.termination = None
 
-        def checkpoint(current: DiagnosisTask) -> None:
+        def checkpoint(current: DiagnosticRunState) -> None:
             context.save_checkpoint({"task": current.model_dump(mode="json")})
 
         checkpoint(task)
@@ -245,10 +289,12 @@ def diagnostic_capability(
         input_model=DiagnosisInput,
         output_model=CapabilityOutcome,
         effect="read_only",
+        scheduling=SchedulingMetadata("read_only"),
         operation=lambda context, inputs: execute(context, inputs, resume=False),
         reconcile=lambda context, inputs: execute(context, inputs, resume=True),
         validate_plan=_validate_plan,
         metadata=CapabilityMetadata(
+            planning=CapabilityPlanning(output_kinds=["finding", "table", "artifact"]),
             resources=[
                 ResourceRequirement(
                     role="diagnostic_data",

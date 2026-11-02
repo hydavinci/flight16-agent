@@ -158,7 +158,7 @@ def local_draft(context):
 def local_planning_case(tmp_path, monkeypatch):
     import sys
 
-    import flight_agent.web as web
+    import flight_agent.application as application
     from tests.helpers import ScriptedModel
 
     def forbidden(*args, **kwargs):
@@ -187,16 +187,16 @@ def local_planning_case(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(planner, "_decision", decision)
-    monkeypatch.setattr(web, "AgentPlanner", lambda: planner)
+    monkeypatch.setattr(application, "AgentPlanner", lambda: planner)
     assembled = []
-    original = web.EngineeringRuntime
+    original = application.EngineeringRuntime
 
     def capture(*args, **kwargs):
         runtime = original(*args, **kwargs)
         assembled.append(runtime)
         return runtime
 
-    monkeypatch.setattr(web, "EngineeringRuntime", capture)
+    monkeypatch.setattr(application, "EngineeringRuntime", capture)
     app = create_web_app(tmp_path)
     runtime = assembled[0]
     # Keep registration failures as behavior failures rather than fixture errors.
@@ -709,8 +709,9 @@ def test_source_selection_correction_respects_context_limit(
         documented_selection_case, monkeypatch,
         [too_large, accept_proposed_selection],
     )
-    with pytest.raises(ValueError, match="大小限制"):
-        submit(documented_selection_case)
+    record = submit(documented_selection_case)
+    assert record.messages[-1].response_kind == "clarify"
+    assert "大小限制" in record.messages[-1].content
     assert len(calls) == 1
     assert documented_selection_case[1].store.recent()[0].task is None
     assert documented_selection_case[3].requests == []
@@ -1248,7 +1249,7 @@ def test_optional_existing_manifest_is_explicit_local_configuration(local_planni
     assert facts["explicit_configuration"]["value"] == configuration
     assert facts["explicit_configuration"]["path"] == "flight-agent.project.json"
     assert record.task.baseline.nodes[0].inputs["model"] == "plant.slx"
-    assert not backend.requests and runtime.legacy.backend is None
+    assert not backend.requests
 
 
 def _configured_draft(context):

@@ -1,6 +1,6 @@
 from typing import Annotated, Literal, Self
 
-from pydantic import Field, JsonValue, model_validator
+from pydantic import Field, JsonValue, StrictBool, model_validator
 
 from .contracts import Effect, Name, Version
 from .resources import AgentContract, Text
@@ -37,6 +37,23 @@ class Availability(AgentContract):
         return self
 
 
+OutputKind = Literal["metric", "finding", "table", "artifact"]
+
+
+class CapabilityPlanning(AgentContract):
+    output_kinds: Annotated[list[OutputKind], Field(min_length=1, max_length=4)]
+    depends_on: Annotated[list[Name], Field(max_length=80)] = []
+    dynamic_dependencies: StrictBool = False
+
+    @model_validator(mode="after")
+    def unique_selection_declarations(self) -> Self:
+        if len(set(self.output_kinds)) != len(self.output_kinds):
+            raise ValueError("Planning output kinds must be unique")
+        if len(set(self.depends_on)) != len(self.depends_on):
+            raise ValueError("Planning dependencies must be unique")
+        return self
+
+
 class CapabilityMetadata(AgentContract):
     metrics: Annotated[list[MetricDefinition], Field(max_length=200)] = []
     resources: Annotated[list[ResourceRequirement], Field(max_length=40)] = []
@@ -44,6 +61,7 @@ class CapabilityMetadata(AgentContract):
     validity_policy: dict[str, JsonValue] = {}
     planning_notes: Annotated[str, Field(max_length=6000)] = ""
     cacheable: bool = False
+    planning: CapabilityPlanning | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def unique_declarations(self) -> Self:

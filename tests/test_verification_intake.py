@@ -1,10 +1,47 @@
 import json
 
 import pytest
+from pydantic import Field
 
-from tests.helpers import tool_message
-from tests.test_verification_runtime import proposal, runtime_fixture
+from flight_agent.runtime.resources import ResourceReference
+from flight_agent.verification.resources import ResourceAdapter
+from tests.agent_helpers import draft_data, make_agent_web
+from tests.helpers import ScriptedModel, tool_message
 from tests.verification_helpers import verification_module
+
+
+class RecordingModel(ScriptedModel):
+    seen: list = Field(default_factory=list)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self.seen.append([message.content for message in messages])
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+@pytest.fixture
+def intake_runtime(tmp_path):
+    _, runtime, calls, _ = make_agent_web(tmp_path, [])
+    root = tmp_path / "source"
+    root.mkdir()
+    runtime.resources.register(ResourceAdapter(
+        name="input_data", kind="signal_data", location="test-host",
+        inspect=lambda locator: ResourceReference(
+            id="input", kind="signal_data", location="test-host",
+            locator=locator, fingerprint="a" * 64,
+        ),
+        verify=lambda _: None,
+        browse=lambda _: pytest.fail("Intake must not browse resources"),
+    ))
+    model = RecordingModel(responses=[tool_message(
+        "propose_agent", {"action": "plan", "text": "Confirm analysis.", "plan": draft_data()},
+    )])
+    runtime.planner.model = model
+    return runtime, calls, model, root
+
+
+def submit(runtime, *args, **kwargs):
+    record = runtime.queue_message(*args, **kwargs)
+    return runtime.continue_submission(record.id) if record.status == "queued" else record
 
 
 @pytest.mark.parametrize(
@@ -65,46 +102,55 @@ def test_ordinary_project_questions_are_not_misread_as_directory_assignments(mes
     ],
 )
 def test_ambiguous_directories_clarify_before_inspection_or_model(
-    tmp_path, monkeypatch, message, project_field, output_field
+    intake_runtime, monkeypatch, message, project_field, output_field
 ):
-    runtime, backend, model, _ = runtime_fixture(tmp_path)
+    runtime, calls, model, _ = intake_runtime
 
-    def unexpected_inspection(root):
+    def unexpected_inspection(*args):
         pytest.fail("Ambiguous paths must be clarified before project inspection")
 
-    monkeypatch.setattr(backend, "inspect", unexpected_inspection)
-    record = runtime.submit(None, message, project_field, output_root=output_field)
+    monkeypatch.setattr(runtime.resources, "inspect", unexpected_inspection)
+    record = submit(runtime, None, message, project_field, output_root=output_field)
     assert record.task is None
     assert record.pending_decision.kind == "clarify"
     assert record.pending_decision.message
     assert not model.seen
-    assert not backend.calls
+    assert not calls
 
 
-def test_missing_directory_accepts_a_bare_path_in_the_next_turn(tmp_path):
-    runtime, backend, model, root = runtime_fixture(tmp_path)
-    first = runtime.submit(None, "Verify pitch step response.")
+def test_missing_directory_accepts_a_bare_path_in_the_next_turn(intake_runtime):
+    runtime, calls, model, root = intake_runtime
+    model.responses.insert(0, tool_message(
+        "propose_agent", {"action": "clarify", "text": "Provide the project directory."},
+    ))
+    first = submit(runtime, None, "Verify pitch step response.")
     assert first.pending_decision.kind == "clarify"
-    assert not model.seen
-    planned = runtime.submit(first.id, str(root))
+    assert len(model.seen) == 1
+    planned = submit(runtime, first.id, str(root))
     assert planned.project_root == str(root)
     assert planned.pending_decision.kind == "confirm_baseline"
-    assert len(model.seen) == 1
+    assert len(model.seen) == 2
     assert "Verify pitch step response." in json.dumps(model.seen)
     assert str(root) not in json.dumps(model.seen)
-    assert not backend.calls
+    assert not calls
 
 
-def test_chat_only_paths_are_not_sent_to_model_even_with_spaces(tmp_path):
-    runtime, backend, model, root = runtime_fixture(tmp_path)
+def test_chat_only_paths_are_not_sent_to_model_even_with_spaces(tmp_path, intake_runtime):
+    runtime, calls, model, root = intake_runtime
+    root = root.rename(tmp_path / "private model")
+    draft = draft_data()
+    draft["allowed_effects"].append("write_delivery")
+    model.responses = [tool_message(
+        "propose_agent", {"action": "plan", "text": "Confirm evidence storage.", "plan": draft},
+    )]
     output = tmp_path / "private results"
-    planned = runtime.submit(None, f'工程目录：“{root}”；输出目录：“{output}”。验证阶跃。')
+    planned = submit(runtime, None, f'工程目录：“{root}”；输出目录：“{output}”。验证阶跃。')
     assert planned.pending_decision.kind == "confirm_baseline"
     assert planned.output_root == str(output)
     assert str(output) not in json.dumps(model.seen)
     assert "private results" not in json.dumps(model.seen)
     assert str(root) not in json.dumps(model.seen)
-    assert not backend.calls
+    assert not calls
 
 
 @pytest.mark.parametrize(
@@ -117,16 +163,15 @@ def test_chat_only_paths_are_not_sent_to_model_even_with_spaces(tmp_path):
         """Worker failed: 'cannot open "/private/unshared-project with spaces/diagnostic.mat"'.""",
     ],
 )
-def test_quoted_diagnostics_redact_paths_in_requests_and_history(tmp_path, diagnostic):
-    runtime, backend, model, root = runtime_fixture(tmp_path)
-    model.responses = [
-        tool_message("propose_verification", proposal()),
-        tool_message("propose_verification", {"action": "clarify", "question": "Repair output?"}),
-    ]
-    planned = runtime.submit(None, "Verify step. " + diagnostic, str(root))
+def test_quoted_diagnostics_redact_paths_in_requests_and_history(intake_runtime, diagnostic):
+    runtime, calls, model, root = intake_runtime
+    model.responses.append(tool_message(
+        "propose_agent", {"action": "clarify", "text": "Repair output?"},
+    ))
+    planned = submit(runtime, None, "Verify step. " + diagnostic, str(root))
     assert planned.project_root == str(root)
     assert planned.pending_decision.kind == "confirm_baseline"
-    runtime.submit(planned.id, "Explain the earlier diagnostic.")
+    submit(runtime, planned.id, "Explain the earlier diagnostic.")
     assert len(model.seen) == 2
     for messages in model.seen:
         sent = json.dumps(messages)
@@ -134,4 +179,4 @@ def test_quoted_diagnostics_redact_paths_in_requests_and_history(tmp_path, diagn
         assert "unshared-project" not in sent
         assert "diagnostic.mat" not in sent
         assert str(root) not in sent
-    assert not backend.calls
+    assert not calls

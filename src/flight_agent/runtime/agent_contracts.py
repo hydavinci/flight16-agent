@@ -3,10 +3,12 @@ from typing import TYPE_CHECKING, Annotated, Literal, Self
 from pydantic import (
     Field,
     JsonValue,
+    SerializerFunctionWrapHandler,
     StrictBool,
     StrictInt,
     StrictStr,
     field_validator,
+    model_serializer,
     model_validator,
 )
 from pydantic_core import PydanticCustomError
@@ -23,6 +25,7 @@ from .contracts import (
     finite_mapping,
 )
 from .observations import CapabilityOutcome, OutputArtifact
+from .project_snapshots import ProjectSnapshot
 from .requirements import CapabilityGap, TaskRequirements
 from .resources import AgentContract, ResourceReference, Text
 from .tasks import PlanNode, plan_ancestors
@@ -175,6 +178,16 @@ class AgentBaseline(AgentPlan):
     confirmed: StrictBool = False
     confirmed_at: str | None = None
     capability_snapshots: dict[Name, CapabilitySnapshot] = {}
+    project_snapshots: dict[Name, ProjectSnapshot] = {}
+
+    @model_serializer(mode="wrap")
+    def stable_snapshot_serialization(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        result: dict[str, object] = handler(self)
+        if not self.project_snapshots:
+            result.pop("project_snapshots", None)
+        return result
 
     @model_validator(mode="after")
     def confirmation_record(self) -> Self:
