@@ -1,13 +1,26 @@
 import os
 import time
 from typing import Self
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
+from pydantic import TypeAdapter
+
+from .workbench_contracts import (
+    MAX_WORKBENCH_FIGURE_BYTES,
+    WorkbenchRunRecord,
+    WorkbenchRunRequest,
+)
 
 
 class RemoteError(RuntimeError):
     pass
+
+
+class RemoteHTTPError(RemoteError):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
 
 
 class RemoteClient:
@@ -62,7 +75,8 @@ class RemoteClient:
             follow_redirects=False,
         ) as response:
             if not response.is_success:
-                raise RemoteError(
+                raise RemoteHTTPError(
+                    response.status_code,
                     f"Worker returned HTTP {response.status_code}; submission not retried"
                 )
             chunks: list[bytes] = []
@@ -75,3 +89,51 @@ class RemoteClient:
                     raise RemoteError("Remote deadline exceeded; execution may still be active")
                 chunks.append(chunk)
             return b"".join(chunks)
+
+    def _workbench_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object] | None = None,
+        *,
+        limit: int = 8_000_000,
+    ) -> bytes:
+        client = self.client or httpx.Client(trust_env=False)
+        try:
+            return self._request(
+                client,
+                method,
+                path,
+                time.monotonic() + 30,
+                payload,
+                limit=limit,
+            )
+        finally:
+            if self.client is None:
+                client.close()
+
+    def submit_workbench(self, request: WorkbenchRunRequest) -> WorkbenchRunRecord:
+        return WorkbenchRunRecord.model_validate_json(
+            self._workbench_request(
+                "POST",
+                "/workbench/runs",
+                request.model_dump(mode="json"),
+            )
+        )
+
+    def recent_workbench(self) -> list[WorkbenchRunRecord]:
+        return TypeAdapter(list[WorkbenchRunRecord]).validate_json(
+            self._workbench_request("GET", "/workbench/runs")
+        )
+
+    def workbench_status(self, run_id: str) -> WorkbenchRunRecord:
+        return WorkbenchRunRecord.model_validate_json(
+            self._workbench_request("GET", f"/workbench/runs/{run_id}")
+        )
+
+    def workbench_artifact(self, run_id: str, path: str) -> bytes:
+        return self._workbench_request(
+            "GET",
+            f"/workbench/runs/{run_id}/artifacts/{quote(path, safe='/')}",
+            limit=MAX_WORKBENCH_FIGURE_BYTES,
+        )

@@ -18,6 +18,7 @@ from .web_routes.artifacts import artifact_router
 from .web_routes.configuration import configuration_router
 from .web_routes.metadata import metadata_router
 from .web_routes.pages import pages_router
+from .web_routes.workbench import workbench_router
 
 
 def create_web_app(
@@ -82,6 +83,7 @@ def create_web_app(
     app.state.services = services
     app.state.conversation_manager = manager
     app.include_router(pages_router(Path(__file__).parent / "static"))
+    app.include_router(workbench_router(token, authorize, root / "examples"))
     app.include_router(
         configuration_router(
             services,
