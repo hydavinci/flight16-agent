@@ -28,7 +28,7 @@ from ..workbench_contracts import (
 )
 from .intake import safe_directory
 
-_RECEIPT_BYTES = MAX_WORKBENCH_RESULT_BYTES + 100_000
+_RECEIPT_BYTES = MAX_WORKBENCH_RESULT_BYTES
 _ENVIRONMENT_PREFIXES = (
     "LLM_",
     "OPENAI_",

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
@@ -596,6 +597,117 @@ def test_cleanup_reports_unterminated_worker_after_bounded_waits(monkeypatch):
     assert "did not exit" in result.error
     assert "Check" in result.error
     assert process.communicate.call_args_list == [call(timeout=2), call(timeout=2)]
+
+
+def test_windows_cleanup_terminates_and_verifies_entire_process_tree(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    processes = {43210: 1, 43211: 43210, 43212: 43211}
+    terminated = []
+
+    monkeypatch.setattr(module, "_windows_processes", lambda: dict(processes))
+
+    def terminate(pid):
+        terminated.append(pid)
+        processes.pop(pid)
+        return None
+
+    monkeypatch.setattr(module, "_windows_terminate_pid", terminate)
+    assert module._stop_windows_tree(43210) is None
+    assert terminated == [43212, 43211, 43210]
+
+
+def test_windows_cleanup_reports_process_tree_that_cannot_be_verified(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    monkeypatch.setattr(
+        module,
+        "_windows_processes",
+        lambda: {43210: 1, 43211: 43210},
+    )
+    monkeypatch.setattr(
+        module,
+        "_windows_terminate_pid",
+        lambda pid: "access denied" if pid == 43211 else None,
+    )
+    error = module._stop_windows_tree(43210)
+    assert error is not None
+    assert "43211" in error
+    assert "access denied" in error
+    assert "still running" in error
+
+
+def test_windows_cleanup_converts_termination_timeout_to_uncertainty(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    monkeypatch.setattr(
+        module,
+        "_windows_processes",
+        lambda: {43210: 1},
+    )
+
+    def timeout(pid):
+        raise subprocess.TimeoutExpired(["taskkill.exe"], 5)
+
+    monkeypatch.setattr(module, "_windows_terminate_pid", timeout)
+    error = module._stop_windows_tree(43210)
+    assert error is not None
+    assert "43210" in error
+    assert "timed out" in error
+
+
+def test_windows_cleanup_final_verification_detects_late_descendant(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    snapshots = iter(
+        [
+            {43210: 1},
+            {43210: 1},
+            {43210: 1},
+            {43211: 43210},
+        ]
+    )
+    monkeypatch.setattr(module, "_windows_processes", lambda: next(snapshots))
+    monkeypatch.setattr(module, "_windows_terminate_pid", lambda pid: None)
+
+    error = module._stop_windows_tree(43210)
+
+    assert error is not None
+    assert "43211" in error
+    assert "still running" in error
+
+
+def test_stop_worker_uses_verified_windows_tree_cleanup(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("stdout", "stderr")
+    stop_tree = Mock(return_value=None)
+    monkeypatch.setattr(module, "_stop_windows_tree", stop_tree)
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    result = module._stop_worker(process)
+
+    assert result.error is None
+    assert (result.stdout, result.stderr) == ("stdout", "stderr")
+    stop_tree.assert_called_once_with(43210)
+    process.terminate.assert_not_called()
+    process.kill.assert_not_called()
+
+
+def test_stop_worker_reports_unverified_windows_tree_cleanup(monkeypatch):
+    module = importlib.import_module("flight_agent.matlab")
+    process = Mock(spec=subprocess.Popen)
+    process.pid = 43210
+    process.communicate.return_value = ("stdout", "stderr")
+    monkeypatch.setattr(
+        module,
+        "_stop_windows_tree",
+        Mock(return_value="child 43211 is still running"),
+    )
+    monkeypatch.setattr(module, "os", SimpleNamespace(name="nt"))
+
+    result = module._stop_worker(process)
+
+    assert result.error is not None
+    assert "cleanup incomplete" in result.error
+    assert "child 43211 is still running" in result.error
 
 
 def test_uncertain_owned_cleanup_is_durable_not_reconciled_to_success(

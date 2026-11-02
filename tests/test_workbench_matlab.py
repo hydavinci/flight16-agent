@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,7 +7,10 @@ import pytest
 
 from flight_agent.matlab import MatlabError
 from flight_agent.verification.workbench_matlab import execute_workbench
-from flight_agent.workbench_contracts import WorkbenchRunRequest
+from flight_agent.workbench_contracts import (
+    MAX_WORKBENCH_RESULT_BYTES,
+    WorkbenchRunRequest,
+)
 
 
 def workbench_request(kind: str = "script", timeout_seconds: int = 15) -> WorkbenchRunRequest:
@@ -92,6 +96,21 @@ def test_workbench_accepts_json_null_result(tmp_path, fake_engine, monkeypatch):
     monkeypatch.setenv("TEST_ENGINE_MODE", "workbench_null")
     receipt, _, _ = execute_workbench(tmp_path / "run", workbench_request())
     assert receipt.result is None
+
+
+def test_workbench_rejects_complete_receipt_over_exact_four_mb(
+    tmp_path, fake_engine, monkeypatch
+):
+    directory = tmp_path / "run"
+    monkeypatch.setenv("TEST_ENGINE_MODE", "workbench_oversized_receipt")
+
+    with pytest.raises(MatlabError, match="receipt exceeds"):
+        execute_workbench(directory, workbench_request())
+
+    receipt = directory / "receipt.json"
+    assert receipt.stat().st_size > MAX_WORKBENCH_RESULT_BYTES
+    result = json.loads(receipt.read_text())["result"]
+    assert len(json.dumps(result, separators=(",", ":")).encode()) <= MAX_WORKBENCH_RESULT_BYTES
 
 
 def test_workbench_cleanup_uncertainty_never_becomes_success(

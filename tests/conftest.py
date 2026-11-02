@@ -75,6 +75,8 @@ def _workbench(self, run_dir, filename, kind, parameters_json, request_sha256, m
         receipt["result"] = None
     if mode == "workbench_oversized_result":
         receipt["result"] = "x" * 4_000_001
+    if mode == "workbench_oversized_receipt":
+        receipt["result"] = "x" * 3_999_900
     if mode == "workbench_receipt_symlink":
         target = directory / "unsafe-receipt.json"
         target.write_text(json.dumps(receipt))
