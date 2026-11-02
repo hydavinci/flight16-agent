@@ -16,6 +16,24 @@ pytestmark = [
 ]
 
 
+def test_browser_assertions_allow_slow_ci_updates():
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.set_content('<p id="status">waiting</p>')
+            page.evaluate(
+                """() => {
+                    setTimeout(() => {
+                        document.querySelector("#status").textContent = "ready";
+                    }, 5500);
+                }"""
+            )
+            expect(page.locator("#status")).to_have_text("ready")
+        finally:
+            browser.close()
+
+
 def test_importing_bootstrap_alone_has_no_network_or_handler_side_effects(tmp_path):
     app, _, calls, _ = make_agent_web(tmp_path, [])
     with serve_app(app) as url, sync_playwright() as playwright:
