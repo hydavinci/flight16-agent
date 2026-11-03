@@ -32,7 +32,9 @@ def test_web_rejects_removed_workbench_surface(tmp_path, method, path):
 def test_web_exposes_only_agent_page_and_assets(tmp_path):
     app, _, _, _ = make_agent_web(tmp_path, [])
     with TestClient(app, base_url="http://127.0.0.1") as client:
-        assert "<title>Flight Agent</title>" in client.get("/").text
+        homepage = client.get("/").text
+        assert "<title>Flight Agent</title>" in homepage
+        assert "/workbench" not in homepage
         for name in ("agent.js", "agent.css", "favicon.svg"):
             assert client.get(f"/static/{name}").status_code == 200
         for name in (
