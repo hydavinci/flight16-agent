@@ -32,7 +32,6 @@ Python 负责授权、证据校验、判据比较与报告生成。
 |---|---|---|
 | 本机工程 | 已有入口/模型、`stepinfo`、线性化与 `allmargin` | Agent/Web 主机 |
 | Worker 工程 | 已准备工程的阶跃响应、开环稳定裕度 | MATLAB Worker |
-| 单文件工作台 | 可信 `.m` 脚本/函数、JSON 结果、日志与 PNG 图 | MATLAB Worker |
 | 离线诊断 | 已登记 JSON 数据的只读分析 | Agent/Web 主机 |
 
 本机工程无需启动 Worker。知识问答不要求工程目录，也不触发 MATLAB 计算。

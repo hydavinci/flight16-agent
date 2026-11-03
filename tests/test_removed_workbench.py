@@ -16,6 +16,8 @@ REMOVED_PATHS = (
     "src/flight_agent/verification/workbench_store.py",
     "src/flight_agent/verification/workbench_matlab.py",
     "src/flight_agent/verification/workbench_worker.py",
+    "docs/superpowers/specs/2026-11-02-matlab-single-file-workbench-design.md",
+    "docs/superpowers/plans/2026-11-02-matlab-single-file-workbench.md",
 )
 
 
@@ -25,12 +27,15 @@ def test_workbench_source_and_resources_are_removed():
 
 
 def test_user_documentation_has_no_workbench_surface():
-    for relative in ("README.md", "docs/usage.md", "docs/architecture.md"):
-        text = (ROOT / relative).read_text("utf-8").lower()
+    user_docs = [ROOT / "README.md", *(ROOT / "docs").glob("*.md")]
+    for path in user_docs:
+        relative = path.relative_to(ROOT)
+        text = path.read_text("utf-8").lower()
         assert "/workbench" not in text, relative
         assert "matlab-workbench" not in text, relative
         assert "web_script.m" not in text, relative
         assert "web_function.m" not in text, relative
+        assert "单文件工作台" not in text, relative
 
 
 def test_package_data_has_no_workbench_examples():
