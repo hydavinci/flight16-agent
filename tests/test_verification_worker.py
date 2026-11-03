@@ -24,7 +24,7 @@ def test_worker_keeps_removed_jobs_endpoint_unavailable(tmp_path, monkeypatch, u
         ).status_code == 404
 
 
-def test_worker_health_reports_project_and_single_file_execution(tmp_path, monkeypatch):
+def test_worker_health_reports_project_execution_only(tmp_path, monkeypatch):
     from flight_agent.matlab import engine_available
 
     monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
@@ -35,8 +35,30 @@ def test_worker_health_reports_project_and_single_file_execution(tmp_path, monke
             "engine_package": engine_available(),
             "trusted_code_only": True,
             "project_execution": True,
-            "single_file_execution": True,
         }
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/workbench/runs"),
+        ("POST", "/workbench/runs"),
+        ("GET", "/workbench/runs/" + "a" * 32),
+        (
+            "GET",
+            "/workbench/runs/"
+            + "a" * 32
+            + "/artifacts/figure-1.png",
+        ),
+    ],
+)
+def test_worker_rejects_removed_workbench_routes(
+    tmp_path, monkeypatch, method, path
+):
+    monkeypatch.setenv("MATLAB_ALLOW_TRUSTED_PROJECTS", "1")
+    with TestClient(worker().create_worker_app(tmp_path, TOKEN)) as client:
+        response = client.request(method, path, headers=HEADERS, json={})
+        assert response.status_code == 404
 
 
 def test_worker_requires_projects_even_with_old_upload_setting(tmp_path, monkeypatch):

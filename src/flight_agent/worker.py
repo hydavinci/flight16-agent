@@ -11,7 +11,6 @@ from .service import (
     bearer_guard,
     install_validation_handler,
 )
-from .verification.workbench_worker import workbench_routes
 from .verification.worker import project_routes
 
 
@@ -38,7 +37,6 @@ def create_worker_app(root: Path, token: str) -> FastAPI:
     app.add_middleware(BodyLimitMiddleware)
     install_validation_handler(app)
     app.include_router(project_routes(root, runner))
-    app.include_router(workbench_routes(root, runner))
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -49,7 +47,6 @@ def create_worker_app(root: Path, token: str) -> FastAPI:
             "engine_package": engine_available(),
             "trusted_code_only": True,
             "project_execution": True,
-            "single_file_execution": True,
         }
 
     return app
