@@ -548,7 +548,7 @@ quotas. Run one Web process per writable state root. A remote limit does not
 override the remote Worker's independent capacity.
 
 Queued requests return HTTP 202 and remain visible as `queued`; the CLI and
-workbench continue polling. Full admission capacity returns HTTP 429 with
+Web client continue polling. Full admission capacity returns HTTP 429 with
 `detail.code=scheduler_capacity` and `Retry-After: 1`, without creating a
 conversation or appending a message. Shutdown refuses new work with HTTP 503
 and drains admitted work so all thread-owned SQLite contexts have exited. No cancellation

@@ -31,6 +31,7 @@ def test_user_documentation_has_no_workbench_surface():
     for path in user_docs:
         relative = path.relative_to(ROOT)
         text = path.read_text("utf-8").lower()
+        assert "workbench" not in text, relative
         assert "/workbench" not in text, relative
         assert "matlab-workbench" not in text, relative
         assert "web_script.m" not in text, relative
