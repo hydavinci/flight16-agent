@@ -344,9 +344,6 @@ condition: bench
 指标摘要最多显示 6 位有效数字，完整精度、条件和来源在详情中。
 聊天仅在显示时去除结构化输入的结束标记，服务器原文和报告来源不变。
 
-`/` 是通用 Agent 首页；`/workbench` 是独立的单文件 MATLAB 工作台。
-工作台只调用已配置的 Worker，不在 Web 进程或 Agent 主机启动 MATLAB，也没有本机回退。
-
 同一桌面 macOS 可启用系统目录选择器：
 
 ```bash
@@ -358,7 +355,7 @@ flight-agent web --native-directory-picker --port 8000
 
 ## 使用 Worker
 
-使用 `simulink_project` 注册资源或 `/workbench` 单文件执行时需要 Worker。
+使用 `simulink_project` 注册资源时需要 Worker。
 Worker 可以与 Web 同机，也可以部署在另一台有 MATLAB 的计算机器上。
 远程路径不会自动上传工程。
 
@@ -402,34 +399,6 @@ ssh -N -L 9001:127.0.0.1:9001 USER@MATLAB_HOST
 
 目录执行有 Windows 进程清理路径，但尚未在 Windows 实机验收。
 原生依赖必须匹配执行平台。
-
-### 单文件工作台启动与信任边界
-
-如果 Worker 的专用 MATLAB Engine 环境是 `.venv-matlab`，Web 环境是 `.venv`，
-可从项目根目录运行：
-
-```bash
-MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
-MATLAB_WORKER_TOKEN='0123456789abcdef0123456789abcdef' \
-.venv-matlab/bin/flight-agent worker --port 9001
-
-MATLAB_WORKER_URL='http://127.0.0.1:9001' \
-MATLAB_WORKER_TOKEN='0123456789abcdef0123456789abcdef' \
-.venv/bin/flight-agent web --native-directory-picker --port 8000
-```
-
-示例令牌须替换为两端共享的随机私密值。访问 `/workbench` 后，可载入仓库中的
-`examples/web_script.m` 或 `examples/web_function.m`；前者读取 `params` 并赋值
-`result`，后者声明 `function result = web_function(params)`。两者都会创建图形。
-
-单文件源码是用户授权的可信代码，以 Worker 服务账户的文件、网络和进程权限执行，
-不是容器或安全沙箱。`MATLAB_ALLOW_TRUSTED_PROJECTS=1` 是部署级显式许可，
-不能证明任意上传代码安全。Worker 未配置或不可用时，页面明确失败；Web 不会改在本机执行。
-
-Worker 将请求、状态、执行日志、回执和图表保存在
-`runs/workbench-worker/<run-id>/`。Web 不复制或拥有这些运行记录。完成、失败或服务重启
-都不会自动删除它们；管理员应按组织的保留、备份和安全删除策略停止相关服务后清理。
-不要把运行目录提交到 Git 或作为未经审查的支持附件。
 
 ## 离线诊断
 

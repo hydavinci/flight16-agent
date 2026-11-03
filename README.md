@@ -103,28 +103,6 @@ flight-agent web --port 8000
 “Engine 可用”仅说明导入探测通过，不等于许可证或仿真已经验证。
 修改环境配置或更新后端代码后，需要重启服务。
 
-### 4. 启动单文件 MATLAB 工作台
-
-`/` 是通用 Agent 首页；`/workbench` 是独立的单文件 MATLAB 页面。
-工作台只把请求发送给 MATLAB Worker，不在 Web 进程执行，也没有本机回退。
-在两个终端中按以下方式启动：
-
-```bash
-MATLAB_ALLOW_TRUSTED_PROJECTS=1 \
-MATLAB_WORKER_TOKEN='0123456789abcdef0123456789abcdef' \
-.venv-matlab/bin/flight-agent worker --port 9001
-
-MATLAB_WORKER_URL='http://127.0.0.1:9001' \
-MATLAB_WORKER_TOKEN='0123456789abcdef0123456789abcdef' \
-.venv/bin/flight-agent web --native-directory-picker --port 8000
-```
-
-示例令牌仅用于说明；实际部署应在两端配置同一个随机私密令牌。
-打开 `http://127.0.0.1:8000/workbench`，可载入 `web_script.m` 或
-`web_function.m`。上传代码以 Worker 服务账户权限运行，不是沙箱；只运行已审查、
-明确可信的源码。运行请求、状态、日志和图表保留在 Worker 文件系统的
-`runs/workbench-worker/`，直到管理员按部署保留策略清理。
-
 ## 使用示例
 
 ### 填写需求
@@ -239,7 +217,6 @@ v2 会话元数据和执行状态保存在
 
 Worker 工程准备见 [Simulink Worker 参考](docs/simulink-worker.md)；
 离线诊断数据格式见[离线诊断参考](docs/offline-diagnostics.md)。
-`/` 是通用 Agent 首页；`/workbench` 是 Worker-only 单文件 MATLAB 工作台。
 
 ## CLI 与历史清理
 
