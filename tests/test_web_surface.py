@@ -5,20 +5,43 @@ from flight_agent.web_routes.pages import STATIC_ASSETS
 from tests.agent_helpers import make_agent_web
 
 
-def test_web_exposes_separate_agent_and_matlab_workbench_pages(tmp_path):
-    app, _, _, _ = make_agent_web(
-        tmp_path, [{"action": "answer", "text": "No execution."}],
-    )
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/workbench"),
+        ("GET", "/api/workbench/bootstrap"),
+        ("GET", "/api/workbench/examples/web_script.m"),
+        ("GET", "/api/workbench/runs"),
+        ("POST", "/api/workbench/runs"),
+        ("GET", "/api/workbench/runs/" + "a" * 32),
+        (
+            "GET",
+            "/api/workbench/runs/"
+            + "a" * 32
+            + "/artifacts/figure-1.png",
+        ),
+    ],
+)
+def test_web_rejects_removed_workbench_surface(tmp_path, method, path):
+    app, _, _, _ = make_agent_web(tmp_path, [])
     with TestClient(app, base_url="http://127.0.0.1") as client:
-        index = client.get("/")
-        workbench = client.get("/workbench")
-        assert index.status_code == workbench.status_code == 200
-        assert workbench.content != index.content
+        response = client.request(method, path, json={})
+        assert response.status_code == 404
+
+
+def test_web_exposes_only_agent_page_and_assets(tmp_path):
+    app, _, _, _ = make_agent_web(tmp_path, [])
+    with TestClient(app, base_url="http://127.0.0.1") as client:
+        assert "<title>Flight Agent</title>" in client.get("/").text
         for name in ("agent.js", "agent.css", "favicon.svg"):
             assert client.get(f"/static/{name}").status_code == 200
-        assert "matlab-workbench.js" in STATIC_ASSETS
-        assert "matlab-workbench.css" in STATIC_ASSETS
-        assert client.get("/static/matlab-workbench.html").status_code == 404
+        for name in (
+            "matlab-workbench.js",
+            "matlab-workbench.css",
+            "matlab-workbench.html",
+        ):
+            assert name not in STATIC_ASSETS
+            assert client.get(f"/static/{name}").status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -42,15 +65,6 @@ def test_web_rejects_removed_upload_surface(tmp_path, method, path):
         token = client.get("/api/bootstrap").json()["token"]
         response = client.request(method, path, headers={"x-flight-token": token}, json={})
         assert response.status_code == 404
-
-
-def test_legacy_jobs_api_remains_absent_with_workbench_enabled(tmp_path):
-    app, _, _, _ = make_agent_web(tmp_path, [])
-    with TestClient(app, base_url="http://127.0.0.1") as client:
-        token = client.get("/api/workbench/bootstrap").json()["token"]
-        assert client.get(
-            "/api/jobs", headers={"x-flight-token": token}
-        ).status_code == 404
 
 
 def test_default_web_needs_no_demo_assets_or_upload_store(tmp_path):

@@ -6,17 +6,7 @@ from tests.agent_helpers import make_agent_web
 PREFIX = "flight_agent.web_routes."
 EXPECTED = {
     ("GET", "/"): PREFIX + "pages",
-    ("GET", "/workbench"): PREFIX + "pages",
     ("GET", "/static/{name}"): PREFIX + "pages",
-    ("GET", "/api/workbench/bootstrap"): PREFIX + "workbench",
-    ("GET", "/api/workbench/examples/{name}"): PREFIX + "workbench",
-    ("GET", "/api/workbench/runs"): PREFIX + "workbench",
-    ("POST", "/api/workbench/runs"): PREFIX + "workbench",
-    ("GET", "/api/workbench/runs/{run_id}"): PREFIX + "workbench",
-    (
-        "GET",
-        "/api/workbench/runs/{run_id}/artifacts/{name:path}",
-    ): PREFIX + "workbench",
     ("GET", "/api/bootstrap"): PREFIX + "configuration",
     ("GET", "/api/directories"): PREFIX + "configuration",
     ("POST", "/api/directories/select"): PREFIX + "configuration",

@@ -70,10 +70,7 @@ def test_chat_hides_only_structured_user_closing_labels_and_keeps_source_text(
             browser.close()
 
 
-@pytest.mark.parametrize("path,title", [
-    ("/", "Flight Agent"), ("/workbench", "MATLAB 分析工作台"),
-])
-def test_browser_tab_title_and_local_favicon_render_correctly(tmp_path, path, title):
+def test_browser_tab_title_and_local_favicon_render_correctly(tmp_path):
     app, runtime, calls, _ = make_agent_web(tmp_path, [])
     with serve_app(app) as url, sync_playwright() as playwright:
         browser = playwright.chromium.launch()
@@ -82,8 +79,8 @@ def test_browser_tab_title_and_local_favicon_render_correctly(tmp_path, path, ti
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
         try:
-            page.goto(url + path)
-            expect(page).to_have_title(title)
+            page.goto(url)
+            expect(page).to_have_title("Flight Agent")
             icon = page.locator('head link[rel="icon"]')
             expect(icon).to_have_count(1)
             assert icon.evaluate("(link) => new URL(link.href).origin === location.origin")
@@ -113,7 +110,7 @@ def test_browser_tab_title_and_local_favicon_render_correctly(tmp_path, path, ti
 
 
 @pytest.mark.parametrize("width", [1440, 390])
-def test_agent_conversation_stays_on_homepage_and_workbench_is_dedicated(tmp_path, width):
+def test_agent_conversation_stays_on_homepage(tmp_path, width):
     app, runtime, calls, _ = make_agent_web(
         tmp_path, [{"action": "plan", "text": "Confirm analysis.", "plan": draft_data()}],
     )
@@ -138,13 +135,6 @@ def test_agent_conversation_stays_on_homepage_and_workbench_is_dedicated(tmp_pat
             page.locator(f'#conversation-history button[data-id="{saved.id}"]').click()
             expect(page.locator("#messages")).to_contain_text("Analyze supplied arrays.")
             expect(page.locator("#conversation-status")).to_have_text("等待确认或补充")
-            page.goto(url + "/workbench")
-            expect(page).to_have_url(url + "/workbench")
-            expect(page).to_have_title("MATLAB 分析工作台")
-            expect(page.locator('input[type="file"]')).to_have_count(1)
-            expect(page.locator("#messages")).to_have_count(0)
-            expect(page.locator("#conversation-status")).to_have_count(0)
-            expect(page.locator("#history-panel")).to_have_count(0)
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
             assert len(runtime.store.recent()) == 1
             assert calls == []

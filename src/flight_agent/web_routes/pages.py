@@ -12,8 +12,6 @@ STATIC_ASSETS = {
     "resize-preferences.js": "text/javascript",
     "bootstrap.js": "text/javascript",
     "agent.css": "text/css",
-    "matlab-workbench.js": "text/javascript",
-    "matlab-workbench.css": "text/css",
     "favicon.svg": "image/svg+xml",
 }
 
@@ -24,10 +22,6 @@ def pages_router(static: Path) -> APIRouter:
     @router.get("/")
     def index() -> FileResponse:
         return FileResponse(static / "agent.html", media_type="text/html")
-
-    @router.get("/workbench")
-    def workbench() -> FileResponse:
-        return FileResponse(static / "matlab-workbench.html", media_type="text/html")
 
     @router.get("/static/{name}")
     def asset(name: str) -> FileResponse:
